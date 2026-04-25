@@ -1,1 +1,2 @@
-web: python manage.py migrate && gunicorn junglyst_backend.wsgi
+release: python manage.py migrate
+web: gunicorn junglyst_backend.wsgi
