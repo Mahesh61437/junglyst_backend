@@ -47,6 +47,13 @@ class ProductListView(generics.ListAPIView):
     search_fields = ('name', 'description', 'tags__name')
     ordering_fields = ('created_at', 'rating')
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        seller_slug = self.request.query_params.get('seller_slug')
+        if seller_slug:
+            queryset = queryset.filter(seller__seller_profile__slug=seller_slug)
+        return queryset
+
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Product.objects.all()
     serializer_class = ProductSerializer

@@ -219,8 +219,11 @@ class ProductSerializer(serializers.ModelSerializer):
                 v_data.pop('created_at', None)
                 
                 if v_id and v_id in existing_variants:
-                    # Update existing
-                    ProductVariant.objects.filter(id=v_id).update(**v_data)
+                    # Update existing - Use get + save to trigger model logic
+                    v_obj = existing_variants[v_id]
+                    for attr, value in v_data.items():
+                        setattr(v_obj, attr, value)
+                    v_obj.save()
                     incoming_variant_ids.append(v_id)
                 else:
                     # Create new
