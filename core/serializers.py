@@ -10,14 +10,22 @@ User = get_user_model()
 
 class UserSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
+    seller_profile = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location')
+        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile')
         read_only_fields = ('id', 'is_verified_seller')
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
+
+    def get_seller_profile(self, obj):
+        from sellers.serializers import SellerProfileSerializer
+        try:
+            return SellerProfileSerializer(obj.seller_profile).data
+        except:
+            return None
 
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)
