@@ -6,13 +6,27 @@ from decouple import config
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Environment Check
+RAILWAY_ENV = config('RAILWAY_ENVIRONMENT_NAME', default='')
+IS_PRODUCTION = RAILWAY_ENV == 'production'
+
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config('SECRET_KEY', default='django-insecure-default-key-for-dev-only')
+SECRET_KEY = config('SECRET_KEY', default='django-insecure-8e692pepdm++i+^8&ejp#ozjyb8%r6&+-e8x4239o=tw1lz0g^')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = config('DEBUG', default=True, cast=bool)
+# Debug is False in production unless explicitly set to True in env
+DEBUG = config('DEBUG', default=not IS_PRODUCTION, cast=bool)
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*', cast=lambda v: [s.strip() for s in v.split(',')])
+if IS_PRODUCTION:
+    ALLOWED_HOSTS += [
+        '.railway.app',
+        '.up.railway.app',
+        'junglyst.com',
+        'www.junglyst.com',
+        'api.junglyst.com'
+    ]
+
 CSRF_TRUSTED_ORIGINS = [
     "https://*.railway.app",
     "https://*.up.railway.app",
@@ -21,6 +35,22 @@ CSRF_TRUSTED_ORIGINS = [
 ]
 # Add dynamic hosts from ALLOWED_HOSTS if any
 CSRF_TRUSTED_ORIGINS += [f"https://{host}" for host in ALLOWED_HOSTS if host != '*' and f"https://{host}" not in CSRF_TRUSTED_ORIGINS]
+
+# Production Security Headers
+if IS_PRODUCTION:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_BROWSER_XSS_FILTER = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_HSTS_SECONDS = 31536000  # 1 year
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    
+    # Handle SuspiciousOperation when behind a proxy
+    USE_X_FORWARDED_HOST = True
+    USE_X_FORWARDED_PORT = True
 
 # Application definition
 INSTALLED_APPS = [
@@ -182,7 +212,18 @@ SIMPLE_JWT = {
 }
 
 # CORS Configuration
-CORS_ALLOW_ALL_ORIGINS = True
+if IS_PRODUCTION:
+    CORS_ALLOW_ALL_ORIGINS = False
+    CORS_ALLOWED_ORIGIN_REGEXES = [
+        r"^https://.*\.railway\.app$",
+        r"^https://.*\.up\.railway\.app$",
+        r"^https://junglyst\.com$",
+        r"^https://.*\.junglyst\.com$",
+        r"^http://localhost:3000$", # Keep local dev access if needed
+    ]
+else:
+    CORS_ALLOW_ALL_ORIGINS = True
+
 CORS_ALLOW_CREDENTIALS = True
 
 # Internationalization
