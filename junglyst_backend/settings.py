@@ -39,6 +39,8 @@ INSTALLED_APPS = [
     'notifications',
     'sellers',
     'analytics',
+    'django_celery_results',
+    'django_celery_beat',
 ]
 
 MIDDLEWARE = [
@@ -92,8 +94,21 @@ else:
         }
     }
 
-# Caching with Redis
+# Caching
 REDIS_URL = config('REDIS_URL', default=None)
+REDISHOST = config('REDISHOST', default=None)
+REDISPORT = config('REDISPORT', default='6379')
+REDISUSER = config('REDISUSER', default='')
+REDIS_PASSWORD = config('REDIS_PASSWORD', default='')
+
+if REDISHOST and not REDIS_URL:
+    if REDISUSER and REDIS_PASSWORD:
+        REDIS_URL = f"redis://{REDISUSER}:{REDIS_PASSWORD}@{REDISHOST}:{REDISPORT}/0"
+    elif REDIS_PASSWORD:
+        REDIS_URL = f"redis://:{REDIS_PASSWORD}@{REDISHOST}:{REDISPORT}/0"
+    else:
+        REDIS_URL = f"redis://{REDISHOST}:{REDISPORT}/0"
+
 if REDIS_URL:
     CACHES = {
         "default": {
@@ -168,6 +183,25 @@ LANGUAGE_CODE = 'en-us'
 TIME_ZONE = 'Asia/Kolkata'
 USE_I18N = True
 USE_TZ = True
+
+# Celery Configuration
+CELERY_BROKER_URL = REDIS_URL if REDIS_URL else 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'django-db'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# Sample Periodic Tasks
+CELERY_BEAT_SCHEDULE = {
+    'sync-shipment-statuses': {
+        'task': 'shipping.tasks.sync_all_shipment_statuses',
+        'schedule': 3600.0,  # every hour
+    },
+}
 
 # Static & Media Files
 STATIC_URL = 'static/'

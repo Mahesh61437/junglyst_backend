@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from .models import Order, OrderItem
+from shipping.serializers import ShipmentSerializer
 
 class OrderItemSerializer(serializers.ModelSerializer):
     class Meta:
@@ -8,6 +9,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
+    shipments = ShipmentSerializer(many=True, read_only=True)
     
     class Meta:
         model = Order

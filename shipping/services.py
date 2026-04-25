@@ -45,3 +45,62 @@ class NimbuspostService:
         if response.status_code == 200:
             return response.json()
         return None
+
+    @classmethod
+    def create_shipment(cls, shipment_data):
+        token = cls.get_token()
+        if not token:
+            return None
+        
+        url = f"{cls.BASE_URL}/shipments"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.post(url, json=shipment_data, headers=headers)
+        return response.json() if response.status_code == 200 else None
+
+    @classmethod
+    def generate_label(cls, shipment_id):
+        token = cls.get_token()
+        if not token:
+            return None
+        
+        url = f"{cls.BASE_URL}/shipments/label"
+        params = {"shipment_id": shipment_id}
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            # Nimbuspost often returns a URL to the PDF label
+            return data.get('data', {}).get('label_url')
+        return None
+
+    @classmethod
+    def schedule_pickup(cls, shipment_id, pickup_date):
+        token = cls.get_token()
+        if not token:
+            return None
+        
+        url = f"{cls.BASE_URL}/shipments/pickup"
+        payload = {
+            "shipment_id": shipment_id,
+            "pickup_date": pickup_date
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.post(url, json=payload, headers=headers)
+        return response.json() if response.status_code == 200 else None
+
+    @classmethod
+    def track_shipment(cls, awb_number):
+        token = cls.get_token()
+        if not token:
+            return None
+        
+        url = f"{cls.BASE_URL}/shipments/track/{awb_number}"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        return None
