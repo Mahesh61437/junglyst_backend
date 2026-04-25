@@ -3,15 +3,30 @@ from firebase_admin import credentials, storage
 import uuid
 import os
 import time
+import json
 from django.conf import settings
 
 # Initialize Firebase Admin once
 if not firebase_admin._apps:
-    service_account_path = os.path.join(settings.BASE_DIR, 'firebase_service_account.json')
-    cred = credentials.Certificate(service_account_path)
-    # The user specifically asked for bucket "Junglyst"
-    # However, usually it's bucket-name.appspot.com
-    # I'll check settings first, but override if needed
+    service_account_info = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
+    
+    try:
+        if service_account_info:
+            # Load from environment variable (preferred for production/Railway)
+            cred_dict = json.loads(service_account_info)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+        else:
+            # Fallback to local file for development
+            service_account_path = os.path.join(settings.BASE_DIR, 'firebase_service_account.json')
+            if os.path.exists(service_account_path):
+                cred = credentials.Certificate(service_account_path)
+                firebase_admin.initialize_app(cred)
+            else:
+                print("WARNING: Firebase service account credentials not found. Image uploads will fail.")
+    except Exception as e:
+        print(f"CRITICAL: Failed to initialize Firebase Admin: {str(e)}")
+
 def upload_to_firebase(file_obj, user_id, type_prefix="asset"):
     """
     Uploads a file to Firebase Storage with a professional folder structure.
