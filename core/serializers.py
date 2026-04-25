@@ -94,6 +94,7 @@ class ProductSerializer(serializers.ModelSerializer):
     category_id = serializers.IntegerField(write_only=True, required=False)
     sub_category_id = serializers.IntegerField(write_only=True, required=False)
     image = serializers.SerializerMethodField()
+    category = serializers.SerializerMethodField()
     
     # Helper fields for the first variant (read-only for compatibility)
     price = serializers.SerializerMethodField()
@@ -311,4 +312,9 @@ class ProductSerializer(serializers.ModelSerializer):
         first_image = obj.images.first()
         if first_image:
             return first_image.image_url
+        return None
+    def get_category(self, obj):
+        first_cat = obj.categories.first()
+        if first_cat:
+            return first_cat.name
         return None
