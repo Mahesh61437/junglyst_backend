@@ -1,7 +1,11 @@
 from django.test import TestCase
 from django.contrib.auth import get_user_model
 from django.utils.text import slugify
+from rest_framework.test import APITestCase
+from rest_framework import status
 from .models import Category, Product, ProductVariant, Tag
+from sellers.models import SellerProfile
+from .serializers import ProductSerializer
 
 User = get_user_model()
 
@@ -26,11 +30,6 @@ class ProductModelTest(TestCase):
             description='A beautiful monstera',
             seller=self.user
         )
-        # Verify slug auto-generation in serializer or model? 
-        # (Our serializer handles it, but let's check if the model allows manual or if we need to test serializer)
-        # Based on our serializer code, it sets the slug before saving.
-        
-        # Let's test the serializer logic indirectly by testing the creation flow or just manual slug for now
         product.slug = slugify(product.name)
         product.save()
         self.assertEqual(product.slug, 'monstera-deliciosa')
@@ -49,14 +48,9 @@ class ProductModelTest(TestCase):
             commission_rate=20.00,
             stock=10
         )
-        # Final Price = Base + GST(12%) + Commission(20%)
-        # 1000 + 120 + 200 = 1320
         self.assertEqual(float(variant.price), 1320.00)
 
     def test_unique_slug_generation(self):
-        # This tests the logic we added to the ProductSerializer.create
-        from .serializers import ProductSerializer
-        
         data = {
             'name': 'Duplicate Plant',
             'description': 'Description',
@@ -64,13 +58,11 @@ class ProductModelTest(TestCase):
             'variants': [{'name': 'V1', 'base_price': 100, 'stock': 5}]
         }
         
-        # Create first
         serializer1 = ProductSerializer(data=data)
         serializer1.is_valid(raise_exception=True)
         p1 = serializer1.save(seller=self.user)
         self.assertEqual(p1.slug, 'duplicate-plant')
         
-        # Create second with same name
         serializer2 = ProductSerializer(data=data)
         serializer2.is_valid(raise_exception=True)
         p2 = serializer2.save(seller=self.user)
@@ -81,3 +73,58 @@ class CategoryModelTest(TestCase):
         cat = Category.objects.create(name='New Cat', slug='new-cat')
         self.assertEqual(float(cat.commission_rate), 20.00)
         self.assertEqual(float(cat.gst_percentage), 0.00)
+
+class AuthTests(APITestCase):
+    def setUp(self):
+        User.objects.create_user(email='base@test.com', username='baseuser', password='password123')
+
+    def test_user_registration(self):
+        url = '/api/core/register/'
+        data = {
+            'email': 'newgrower@junglyst.com',
+            'username': 'newgrower',
+            'password': 'GrowerPassword123!',
+            'role': 'grower'
+        }
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(User.objects.count(), 2) 
+        self.assertEqual(User.objects.get(email='newgrower@junglyst.com').role, 'grower')
+
+    def test_user_login(self):
+        url = '/api/core/login/'
+        data = {'email': 'base@test.com', 'password': 'password123'}
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('access', response.data)
+
+class SellerDashboardTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            email='seller@test.com', 
+            username='selleruser', 
+            password='password123', 
+            role='grower'
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def test_get_dashboard(self):
+        url = '/api/sellers/dashboard/'
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('metrics', response.data)
+        self.assertIn('profile', response.data)
+
+    def test_update_profile(self):
+        url = '/api/sellers/dashboard/'
+        data = {
+            'store_name': 'The Orchid Sanctuary',
+            'expertise': 'Orchid Specialist',
+            'brand_color': '#FF5733'
+        }
+        response = self.client.post(url, data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        profile = SellerProfile.objects.get(user=self.user)
+        self.assertEqual(profile.store_name, 'The Orchid Sanctuary')
+        self.assertEqual(profile.brand_color, '#FF5733')
