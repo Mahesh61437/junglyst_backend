@@ -70,12 +70,16 @@ class TagSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ProductVariantSerializer(serializers.ModelSerializer):
+    id = serializers.UUIDField(required=False)
+    
     class Meta:
         model = ProductVariant
         fields = '__all__'
-        read_only_fields = ['product', 'price']
+        read_only_fields = ['product'] # price is now allowed to be passed but we can handle it in model save if needed
 
 class ProductImageSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False)
+    
     class Meta:
         model = ProductImage
         fields = '__all__'
@@ -201,38 +205,63 @@ class ProductSerializer(serializers.ModelSerializer):
                 pass
 
         # Handle variants
-        if variants_data:
-            existing_variant_ids = [v.id for v in instance.variants.all()]
-            incoming_variant_ids = [v_data.get('id') for v_data in variants_data if v_data.get('id')]
+        if variants_data is not None:
+            # Convert existing IDs to strings for comparison
+            existing_variants = {str(v.id): v for v in instance.variants.all()}
+            incoming_variant_ids = []
             
-            # Simple approach: deactivate or delete missing variants if needed
-            # For now, we update existing or create new
             for v_data in variants_data:
-                v_id = v_data.get('id')
-                if v_id and v_id in existing_variant_ids:
-                    ProductVariant.objects.filter(id=v_id, product=instance).update(**v_data)
+                # Sanitize v_data
+                v_id = str(v_data.pop('id')) if v_data.get('id') else None
+                v_data.pop('product', None) # Remove if exists
+                v_data.pop('is_deleted', None)
+                v_data.pop('deleted_at', None)
+                v_data.pop('created_at', None)
+                
+                if v_id and v_id in existing_variants:
+                    # Update existing
+                    ProductVariant.objects.filter(id=v_id).update(**v_data)
+                    incoming_variant_ids.append(v_id)
                 else:
-                    ProductVariant.objects.create(product=instance, **v_data)
+                    # Create new
+                    new_v = ProductVariant.objects.create(product=instance, **v_data)
+                    incoming_variant_ids.append(str(new_v.id))
+            
+            # Delete (soft-delete) variants that were not in the incoming data
+            for v_id, v_obj in existing_variants.items():
+                if v_id not in incoming_variant_ids:
+                    v_obj.delete() # Soft delete if model supports it
 
         # Handle images
-        if images_data:
-            # Clear old images for this simple update or match by ID
-            # instance.images.all().delete() 
+        if images_data is not None:
+            existing_images = {img.id: img for img in instance.images.all()}
+            incoming_image_ids = []
+            
             for img_data in images_data:
-                img_id = img_data.get('id')
+                img_id = img_data.pop('id', None)
                 variant_id = img_data.pop('variant_id', None)
+                img_data.pop('product', None)
+                img_data.pop('is_deleted', None)
+                img_data.pop('deleted_at', None)
+                img_data.pop('created_at', None)
                 
                 target_variant = None
                 if variant_id:
                     try:
-                        target_variant = ProductVariant.objects.get(id=variant_id, product=instance)
+                        target_variant = ProductVariant.objects.get(id=variant_id)
                     except (ProductVariant.DoesNotExist, ValueError):
                         pass
 
-                if img_id:
-                    ProductImage.objects.filter(id=img_id, product=instance).update(variant=target_variant, **img_data)
+                if img_id and img_id in existing_images:
+                    ProductImage.objects.filter(id=img_id).update(variant=target_variant, **img_data)
+                    incoming_image_ids.append(img_id)
                 else:
                     ProductImage.objects.create(product=instance, variant=target_variant, **img_data)
+            
+            # Remove images not in request
+            for img_id, img_obj in existing_images.items():
+                if img_id not in incoming_image_ids:
+                    img_obj.delete()
 
         return instance
 
