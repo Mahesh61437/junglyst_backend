@@ -13,7 +13,14 @@ SECRET_KEY = config('SECRET_KEY', default='django-insecure-default-key-for-dev-o
 DEBUG = config('DEBUG', default=True, cast=bool)
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*', cast=lambda v: [s.strip() for s in v.split(',')])
-CSRF_TRUSTED_ORIGINS = [f"https://{host}" for host in ALLOWED_HOSTS if host != '*']
+CSRF_TRUSTED_ORIGINS = [
+    "https://*.railway.app",
+    "https://*.up.railway.app",
+    "https://junglyst.com",
+    "https://*.junglyst.com",
+]
+# Add dynamic hosts from ALLOWED_HOSTS if any
+CSRF_TRUSTED_ORIGINS += [f"https://{host}" for host in ALLOWED_HOSTS if host != '*' and f"https://{host}" not in CSRF_TRUSTED_ORIGINS]
 
 # Application definition
 INSTALLED_APPS = [
