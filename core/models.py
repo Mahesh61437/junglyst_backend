@@ -71,6 +71,24 @@ class Category(SoftDeleteModel):
     def __str__(self):
         return self.name
 
+class SubCategory(SoftDeleteModel):
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='subcategories')
+    name = models.CharField(max_length=100)
+    slug = models.SlugField(unique=True)
+    description = models.TextField(blank=True, null=True)
+    image_url = models.URLField(max_length=1000, blank=True, null=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "Subcategories"
+        unique_together = ('category', 'name')
+        ordering = ['name']
+
+    def __str__(self):
+        return f"{self.category.name} > {self.name}"
+
 class Tag(SoftDeleteModel):
     name = models.CharField(max_length=50, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -86,7 +104,8 @@ class Product(SoftDeleteModel):
     description = models.TextField()
     
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='products')
-    categories = models.ManyToManyField(Category, related_name='products')
+    categories = models.ManyToManyField(Category, related_name='products', blank=True)
+    sub_category = models.ForeignKey(SubCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
     tags = models.ManyToManyField(Tag, related_name='products', blank=True)
     
     scientific_name = models.CharField(max_length=255, blank=True, null=True)

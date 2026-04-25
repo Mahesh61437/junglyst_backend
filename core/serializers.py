@@ -3,7 +3,7 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from core.models import (
-    Category, Tag, Product, ProductVariant, ProductImage
+    Category, SubCategory, Tag, Product, ProductVariant, ProductImage
 )
 
 User = get_user_model()
@@ -39,10 +39,17 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         data['user'] = UserSerializer(self.user).data
         return data
 
+class SubCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SubCategory
+        fields = ('id', 'name', 'slug', 'description', 'image_url')
+
 class CategorySerializer(serializers.ModelSerializer):
+    subcategories = SubCategorySerializer(many=True, read_only=True)
+    
     class Meta:
         model = Category
-        fields = ('id', 'name', 'slug', 'description', 'image_url', 'gst_percentage', 'commission_rate')
+        fields = ('id', 'name', 'slug', 'description', 'image_url', 'gst_percentage', 'commission_rate', 'subcategories')
 
 class TagSerializer(serializers.ModelSerializer):
     class Meta:
@@ -66,7 +73,9 @@ class ProductSerializer(serializers.ModelSerializer):
     images = ProductImageSerializer(many=True, required=False)
     seller = UserSerializer(read_only=True)
     categories = CategorySerializer(many=True, read_only=True)
+    sub_category = SubCategorySerializer(read_only=True)
     category_id = serializers.IntegerField(write_only=True, required=False)
+    sub_category_id = serializers.IntegerField(write_only=True, required=False)
     
     # Helper fields for the first variant (read-only for compatibility)
     price = serializers.SerializerMethodField()
@@ -88,6 +97,7 @@ class ProductSerializer(serializers.ModelSerializer):
         variants_data = validated_data.pop('variants', [])
         images_data = validated_data.pop('images', [])
         category_id = validated_data.pop('category_id', None)
+        sub_category_id = validated_data.pop('sub_category_id', None)
         
         # Auto-slugify
         name = validated_data.get('name')
@@ -107,6 +117,16 @@ class ProductSerializer(serializers.ModelSerializer):
                 category = Category.objects.get(id=category_id)
                 product.categories.add(category)
             except Category.DoesNotExist:
+                pass
+        
+        if sub_category_id:
+            try:
+                sub_cat = SubCategory.objects.get(id=sub_category_id)
+                product.sub_category = sub_cat
+                # Automatically add the parent category as well
+                product.categories.add(sub_cat.category)
+                product.save()
+            except SubCategory.DoesNotExist:
                 pass
 
         # Create variants and keep track of them for image mapping
@@ -141,6 +161,7 @@ class ProductSerializer(serializers.ModelSerializer):
         variants_data = validated_data.pop('variants', [])
         images_data = validated_data.pop('images', [])
         category_id = validated_data.pop('category_id', None)
+        sub_category_id = validated_data.pop('sub_category_id', None)
 
         # Update core fields
         for attr, value in validated_data.items():
@@ -153,6 +174,17 @@ class ProductSerializer(serializers.ModelSerializer):
                 category = Category.objects.get(id=category_id)
                 instance.categories.add(category)
             except Category.DoesNotExist:
+                pass
+
+        if sub_category_id:
+            try:
+                sub_cat = SubCategory.objects.get(id=sub_category_id)
+                instance.sub_category = sub_cat
+                # Ensure parent category is in categories
+                if sub_cat.category not in instance.categories.all():
+                    instance.categories.add(sub_cat.category)
+                instance.save()
+            except SubCategory.DoesNotExist:
                 pass
 
         # Handle variants

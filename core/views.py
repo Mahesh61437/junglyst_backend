@@ -5,10 +5,10 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, ProductVariant, ProductImage
+from .models import Product, Category, SubCategory, ProductVariant, ProductImage
 from .serializers import (
     RegisterSerializer, CustomTokenObtainPairSerializer, UserSerializer,
-    ProductSerializer, CategorySerializer
+    ProductSerializer, CategorySerializer, SubCategorySerializer
 )
 from .storage import upload_to_firebase
 
@@ -43,7 +43,7 @@ class ProductListView(generics.ListAPIView):
     serializer_class = ProductSerializer
     permission_classes = (permissions.AllowAny,)
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
-    filterset_fields = ('categories', 'seller', 'is_active', 'is_rare')
+    filterset_fields = ('categories', 'sub_category', 'seller', 'is_active', 'is_rare')
     search_fields = ('name', 'description', 'tags__name')
     ordering_fields = ('created_at', 'rating')
 
@@ -84,6 +84,13 @@ class CategoryListView(generics.ListAPIView):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
     permission_classes = (permissions.AllowAny,)
+
+class SubCategoryListView(generics.ListAPIView):
+    queryset = SubCategory.objects.all()
+    serializer_class = SubCategorySerializer
+    permission_classes = (permissions.AllowAny,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_fields = ('category',)
 
 class ImageUploadView(generics.GenericAPIView):
     permission_classes = (permissions.IsAuthenticated,)
