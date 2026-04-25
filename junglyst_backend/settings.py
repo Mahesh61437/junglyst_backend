@@ -22,9 +22,7 @@ if IS_PRODUCTION:
     ALLOWED_HOSTS += [
         '.railway.app',
         '.up.railway.app',
-        'junglyst.com',
-        'www.junglyst.com',
-        'api.junglyst.com'
+        '.junglyst.com',
     ]
 
 CSRF_TRUSTED_ORIGINS = [
