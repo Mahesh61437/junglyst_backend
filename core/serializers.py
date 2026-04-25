@@ -9,10 +9,15 @@ from core.models import (
 User = get_user_model()
 
 class UserSerializer(serializers.ModelSerializer):
+    full_name = serializers.SerializerMethodField()
+    
     class Meta:
         model = User
-        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest')
+        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location')
         read_only_fields = ('id', 'is_verified_seller')
+
+    def get_full_name(self, obj):
+        return obj.get_full_name() or obj.username
 
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)

@@ -37,6 +37,9 @@ class User(AbstractUser, SoftDeleteModel):
     is_guest = models.BooleanField(default=False)
     is_verified_seller = models.BooleanField(default=False)
     
+    avatar_url = models.URLField(max_length=1000, null=True, blank=True)
+    location = models.CharField(max_length=255, null=True, blank=True, default='Kerala, India')
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
