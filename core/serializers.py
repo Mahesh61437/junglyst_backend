@@ -93,6 +93,7 @@ class ProductSerializer(serializers.ModelSerializer):
     sub_category = SubCategorySerializer(read_only=True)
     category_id = serializers.IntegerField(write_only=True, required=False)
     sub_category_id = serializers.IntegerField(write_only=True, required=False)
+    image = serializers.SerializerMethodField()
     
     # Helper fields for the first variant (read-only for compatibility)
     price = serializers.SerializerMethodField()
@@ -306,3 +307,8 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_height(self, obj):
         v = self.get_variant(obj)
         return v.height if v else 0
+    def get_image(self, obj):
+        first_image = obj.images.first()
+        if first_image:
+            return first_image.image_url
+        return None
