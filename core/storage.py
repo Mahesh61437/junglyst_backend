@@ -30,11 +30,17 @@ if not firebase_admin._apps:
 def upload_to_firebase(file_obj, user_id, type_prefix="asset"):
     """
     Uploads a file to Firebase Storage with a professional folder structure.
-    Bucket: Junglyst
     Structure: sellers/{user_id}/{type_prefix}/{filename}_{timestamp}.{ext}
     """
-    # Use the specifically requested bucket name
-    bucket = storage.bucket("Junglyst")
+    # Environment-aware bucket selection
+    env = os.environ.get('DJANGO_ENV', 'LOCAL').upper()
+    bucket_name = "junglyst" if env == 'PROD' else "junglyst_dev"
+    
+    try:
+        bucket = storage.bucket(bucket_name)
+    except Exception:
+        # Fallback to default bucket if specified in config, else use junglyst_dev
+        bucket = storage.bucket()
     
     # Extract extension and clean type prefix
     ext = file_obj.name.split('.')[-1]
