@@ -1,1 +1,1 @@
-web: gunicorn junglyst_backend.wsgi
+web: python manage.py migrate && gunicorn junglyst_backend.wsgi
