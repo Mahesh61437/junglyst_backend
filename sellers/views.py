@@ -4,6 +4,7 @@ from django.db.models import Sum
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
 from .models import SellerProfile
+from .serializers import SellerProfileSerializer
 from django.utils.text import slugify
 
 class GrowerDashboardView(generics.GenericAPIView):
@@ -148,7 +149,17 @@ class SellerStoreView(generics.RetrieveAPIView):
                 "location_city": profile.location_city,
                 "rating": str(profile.rating),
                 "total_sales": str(profile.total_sales),
-                "created_at": profile.created_at
+                "created_at": profile.created_at,
+                "expertise_tags": profile.expertise_tags,
+                "infrastructure_details": profile.infrastructure_details,
+                "experience_years": profile.experience_years,
+                "identity_verified": profile.identity_verified
             })
         except SellerProfile.DoesNotExist:
             return Response({"error": "Store not found"}, status=404)
+
+class SellerProfileListView(generics.ListAPIView):
+    queryset = SellerProfile.objects.filter(is_active=True).order_by('-rating')
+    serializer_class = SellerProfileSerializer
+    permission_classes = (permissions.AllowAny,)
+    pagination_class = None # Return all for the directory page
