@@ -29,10 +29,12 @@ class UserSerializer(serializers.ModelSerializer):
 
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)
+    first_name = serializers.CharField(required=False, allow_blank=True)
+    last_name = serializers.CharField(required=False, allow_blank=True)
     
     class Meta:
         model = User
-        fields = ('email', 'username', 'password', 'phone', 'role')
+        fields = ('email', 'username', 'password', 'phone', 'role', 'first_name', 'last_name')
 
     def create(self, validated_data):
         user = User.objects.create_user(
@@ -40,7 +42,9 @@ class RegisterSerializer(serializers.ModelSerializer):
             username=validated_data['username'],
             password=validated_data['password'],
             phone=validated_data.get('phone'),
-            role=validated_data.get('role', 'collector')
+            role=validated_data.get('role', 'collector'),
+            first_name=validated_data.get('first_name', ''),
+            last_name=validated_data.get('last_name', '')
         )
         return user
 
@@ -177,12 +181,14 @@ class ProductSerializer(serializers.ModelSerializer):
         return product
 
     def update(self, instance, validated_data):
-        variants_data = validated_data.pop('variants', [])
-        images_data = validated_data.pop('images', [])
+        # Use sentinel to distinguish "not sent" (partial PATCH) from "sent as empty list"
+        _missing = object()
+        variants_data = validated_data.pop('variants', _missing)
+        images_data = validated_data.pop('images', _missing)
         category_id = validated_data.pop('category_id', None)
         sub_category_id = validated_data.pop('sub_category_id', None)
 
-        # Update core fields
+        # Update core fields (e.g. is_active from archive PATCH)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
@@ -206,42 +212,38 @@ class ProductSerializer(serializers.ModelSerializer):
             except SubCategory.DoesNotExist:
                 pass
 
-        # Handle variants
-        if variants_data is not None:
-            # Convert existing IDs to strings for comparison
+        # Handle variants — only modify when variants were explicitly sent in the request
+        if variants_data is not _missing:
             existing_variants = {str(v.id): v for v in instance.variants.all()}
             incoming_variant_ids = []
-            
+
             for v_data in variants_data:
-                # Sanitize v_data
                 v_id = str(v_data.pop('id')) if v_data.get('id') else None
-                v_data.pop('product', None) # Remove if exists
+                v_data.pop('product', None)
                 v_data.pop('is_deleted', None)
                 v_data.pop('deleted_at', None)
                 v_data.pop('created_at', None)
-                
+
                 if v_id and v_id in existing_variants:
-                    # Update existing - Use get + save to trigger model logic
                     v_obj = existing_variants[v_id]
                     for attr, value in v_data.items():
                         setattr(v_obj, attr, value)
                     v_obj.save()
                     incoming_variant_ids.append(v_id)
                 else:
-                    # Create new
                     new_v = ProductVariant.objects.create(product=instance, **v_data)
                     incoming_variant_ids.append(str(new_v.id))
-            
-            # Delete (soft-delete) variants that were not in the incoming data
+
+            # Only delete variants that were explicitly omitted from a full update
             for v_id, v_obj in existing_variants.items():
                 if v_id not in incoming_variant_ids:
-                    v_obj.delete() # Soft delete if model supports it
+                    v_obj.delete()
 
-        # Handle images
-        if images_data is not None:
+        # Handle images — only modify when images were explicitly sent in the request
+        if images_data is not _missing:
             existing_images = {img.id: img for img in instance.images.all()}
             incoming_image_ids = []
-            
+
             for img_data in images_data:
                 img_id = img_data.pop('id', None)
                 variant_id = img_data.pop('variant_id', None)
@@ -249,7 +251,7 @@ class ProductSerializer(serializers.ModelSerializer):
                 img_data.pop('is_deleted', None)
                 img_data.pop('deleted_at', None)
                 img_data.pop('created_at', None)
-                
+
                 target_variant = None
                 if variant_id:
                     try:
@@ -262,8 +264,8 @@ class ProductSerializer(serializers.ModelSerializer):
                     incoming_image_ids.append(img_id)
                 else:
                     ProductImage.objects.create(product=instance, variant=target_variant, **img_data)
-            
-            # Remove images not in request
+
+            # Only remove images that were explicitly omitted from a full update
             for img_id, img_obj in existing_images.items():
                 if img_id not in incoming_image_ids:
                     img_obj.delete()

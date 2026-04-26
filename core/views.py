@@ -52,6 +52,19 @@ class ProductListView(generics.ListAPIView):
         seller_slug = self.request.query_params.get('seller_slug')
         if seller_slug:
             queryset = queryset.filter(seller__seller_profile__slug=seller_slug)
+
+        # Only show active products unless the seller is explicitly filtering their own
+        # (sellers pass seller=<their_id> param from the dashboard)
+        seller_id = self.request.query_params.get('seller')
+        is_active_param = self.request.query_params.get('is_active')
+        if seller_id and is_active_param is None:
+            # Seller viewing their own products: show everything (active + archived)
+            pass
+        else:
+            # Public marketplace: only show active products by default
+            if is_active_param is None:
+                queryset = queryset.filter(is_active=True)
+
         return queryset
 
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
@@ -70,13 +83,22 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
         product = self.get_object()
         if self.request.user != product.seller and self.request.user.role != 'admin':
             raise permissions.PermissionDenied("You do not have permission to edit this specimen.")
-        serializer.save()
+        instance = serializer.save()
+        # When archiving: zero out all variant stocks (keep images & prices intact)
+        if not instance.is_active:
+            instance.variants.all().update(stock=0)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
     def perform_destroy(self, instance):
         if self.request.user != instance.seller and self.request.user.role != 'admin':
             raise permissions.PermissionDenied("You do not have permission to archive this specimen.")
         instance.is_active = False
+        instance.variants.all().update(stock=0)
         instance.save()
+
 
 class GrowerProductCreateView(generics.CreateAPIView):
     permission_classes = (permissions.IsAuthenticated,)
