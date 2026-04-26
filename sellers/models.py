@@ -29,6 +29,12 @@ class SellerProfile(models.Model):
     location_city = models.CharField(max_length=100, blank=True, null=True)
     location_pincode = models.CharField(max_length=10, blank=True, null=True)
     
+    # Authenticity & Skill Showcase
+    expertise_tags = models.JSONField(default=list, blank=True) # e.g. ["Aquascaping", "Tissue Culture"]
+    infrastructure_details = models.TextField(blank=True, null=True) # e.g. "Sterile Lab, 4000sqft Greenhouse"
+    experience_years = models.PositiveIntegerField(default=0)
+    identity_verified = models.BooleanField(default=False)
+    
     total_sales = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     rating = models.DecimalField(max_digits=3, decimal_places=1, default=5.0)
     
