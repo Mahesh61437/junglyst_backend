@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from django.db.models import Sum
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
-from .models import SellerProfile
+from .models import SellerProfile, AllowedSeller
 from .serializers import SellerProfileSerializer
 from django.utils.text import slugify
 
@@ -95,7 +95,16 @@ class GrowerDashboardView(generics.GenericAPIView):
 
     def post(self, request):
         seller = request.user
-        # Allow collectors to upgrade during onboarding
+        
+        # Check if the user is allowed to become a seller
+        is_allowed = AllowedSeller.objects.filter(email=seller.email, is_active=True).exists() or \
+                     (hasattr(seller, 'mobile') and AllowedSeller.objects.filter(phone=seller.mobile, is_active=True).exists())
+        
+        if not is_allowed and seller.role != 'admin':
+            return Response({
+                "error": "Access denied. Your credentials are not in our master curator registry. Please contact admin for invitation."
+            }, status=403)
+
         if seller.role not in ['grower', 'admin', 'collector']:
             return Response({"error": "Access denied"}, status=403)
             
@@ -153,13 +162,48 @@ class SellerStoreView(generics.RetrieveAPIView):
                 "expertise_tags": profile.expertise_tags,
                 "infrastructure_details": profile.infrastructure_details,
                 "experience_years": profile.experience_years,
-                "identity_verified": profile.identity_verified
+                "identity_verified": profile.identity_verified,
+                "tagline": profile.tagline
             })
         except SellerProfile.DoesNotExist:
             return Response({"error": "Store not found"}, status=404)
 
 class SellerProfileListView(generics.ListAPIView):
-    queryset = SellerProfile.objects.filter(is_active=True).order_by('-rating')
     serializer_class = SellerProfileSerializer
     permission_classes = (permissions.AllowAny,)
-    pagination_class = None # Return all for the directory page
+    pagination_class = None 
+
+    def get_queryset(self):
+        queryset = SellerProfile.objects.filter(is_active=True).order_by('sort_order', '-rating')
+        featured = self.request.query_params.get('featured')
+        if featured == 'true':
+            queryset = queryset.filter(is_featured=True)
+        return queryset
+
+class AllowedSellerListCreateView(generics.ListCreateAPIView):
+    permission_classes = (permissions.IsAdminUser,)
+    queryset = AllowedSeller.objects.all().order_by('-created_at')
+    
+    def get_serializer_class(self):
+        from rest_framework import serializers
+        class AllowedSellerSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = AllowedSeller
+                fields = '__all__'
+        return AllowedSellerSerializer
+
+class AllowedSellerDestroyView(generics.DestroyAPIView):
+    permission_classes = (permissions.IsAdminUser,)
+    queryset = AllowedSeller.objects.all()
+
+class CheckSellerApprovalView(generics.GenericAPIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request):
+        seller = request.user
+        is_allowed = AllowedSeller.objects.filter(email=seller.email, is_active=True).exists() or \
+                     (hasattr(seller, 'mobile') and AllowedSeller.objects.filter(phone=seller.mobile, is_active=True).exists())
+        
+        return Response({
+            "is_approved": is_allowed or seller.role == 'admin'
+        })

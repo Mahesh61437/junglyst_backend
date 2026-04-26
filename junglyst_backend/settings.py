@@ -52,6 +52,7 @@ if IS_PRODUCTION:
 
 # Application definition
 INSTALLED_APPS = [
+    'jazzmin',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -77,6 +78,45 @@ INSTALLED_APPS = [
     'django_celery_results',
     'django_celery_beat',
 ]
+
+JAZZMIN_SETTINGS = {
+    "site_title": "Junglyst Admin",
+    "site_header": "Junglyst",
+    "site_brand": "Junglyst Curator",
+    "site_brand_link": "admin:index",
+    "site_logo": None,
+    "welcome_sign": "Welcome to the Junglyst Master Registry",
+    "copyright": "Junglyst Botanical Sanctuary",
+    "search_model": ["sellers.SellerProfile", "core.Product"],
+    "user_avatar": None,
+    "topmenu_links": [
+        {"name": "Home",  "url": "admin:index", "permissions": ["auth.view_user"]},
+        {"name": "View Site", "url": "http://localhost:5173", "new_window": True},
+        {"model": "sellers.SellerProfile"},
+    ],
+    "show_sidebar": True,
+    "navigation_expanded": True,
+    "icons": {
+        "auth": "fas fa-users-cog",
+        "auth.user": "fas fa-user",
+        "auth.Group": "fas fa-users",
+        "sellers.SellerProfile": "fas fa-store",
+        "sellers.AllowedSeller": "fas fa-user-check",
+        "core.Product": "fas fa-leaf",
+        "core.Category": "fas fa-list",
+        "orders.Order": "fas fa-shopping-cart",
+    },
+    "order_with_respect_to": ["sellers", "core", "orders", "auth"],
+    "use_google_fonts_cdn": True,
+    "show_ui_builder": True,
+}
+
+JAZZMIN_UI_CONFIG = {
+    "theme": "flatly",
+    "dark_mode_theme": None,
+    "navbar": "navbar-dark",
+    "sidebar": "sidebar-dark-primary",
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
