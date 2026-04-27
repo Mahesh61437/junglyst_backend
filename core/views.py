@@ -5,14 +5,24 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, ProductVariant, ProductImage
+from .models import Product, Category, SubCategory, ProductVariant, ProductImage, Cart, CartItem
+from orders.models import Order
 from .serializers import (
     RegisterSerializer, CustomTokenObtainPairSerializer, UserSerializer,
-    ProductSerializer, CategorySerializer, SubCategorySerializer
+    ProductSerializer, CategorySerializer, SubCategorySerializer, CartSerializer
 )
 from .storage import upload_to_firebase
 
 User = get_user_model()
+
+def link_ghost_orders(user):
+    """Link any previous guest orders to this user based on email/phone."""
+    updated_count = 0
+    if user.email:
+        updated_count += Order.objects.filter(user__isnull=True, guest_email=user.email).update(user=user)
+    if hasattr(user, 'phone_number') and user.phone_number:
+        updated_count += Order.objects.filter(user__isnull=True, guest_phone=user.phone_number).update(user=user)
+    return updated_count
 
 class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
@@ -23,6 +33,10 @@ class RegisterView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+        
+        # Link ghost orders immediately upon registration
+        link_ghost_orders(user)
+        
         return Response({
             "user": UserSerializer(user).data,
             "message": "User created successfully",
@@ -30,6 +44,18 @@ class RegisterView(generics.CreateAPIView):
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
+    
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == status.HTTP_200_OK:
+            # Look up user to link orders on every login (just in case)
+            username = request.data.get('email') # Serializer handles email/username
+            try:
+                user = User.objects.get(email=username) if '@' in username else User.objects.get(username=username)
+                link_ghost_orders(user)
+            except User.DoesNotExist:
+                pass
+        return response
 
 class UserProfileView(generics.RetrieveUpdateAPIView):
     serializer_class = UserSerializer
@@ -136,3 +162,34 @@ class ImageUploadView(generics.GenericAPIView):
             return Response({"url": url}, status=201)
         except Exception as e:
             return Response({"error": str(e)}, status=500)
+
+class SyncCartView(generics.GenericAPIView):
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = CartSerializer
+
+    def post(self, request):
+        items = request.data.get('items', [])
+        cart, _ = Cart.objects.get_or_create(user=request.user)
+        
+        for item_data in items:
+            p_id = item_data.get('product_id')
+            v_id = item_data.get('variant_id')
+            qty = item_data.get('quantity', 1)
+            
+            try:
+                product = Product.objects.get(id=p_id)
+                variant = ProductVariant.objects.get(id=v_id) if v_id else None
+                
+                cart_item, created = CartItem.objects.get_or_create(
+                    cart=cart,
+                    product=product,
+                    variant=variant,
+                    defaults={'quantity': qty}
+                )
+                if not created:
+                    cart_item.quantity += qty
+                    cart_item.save()
+            except (Product.DoesNotExist, ProductVariant.DoesNotExist):
+                continue
+                
+        return Response(CartSerializer(cart).data)
