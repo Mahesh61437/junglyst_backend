@@ -4,11 +4,12 @@ import uuid
 import os
 import time
 import json
+from decouple import config
 from django.conf import settings
 
 # Initialize Firebase Admin once
 if not firebase_admin._apps:
-    service_account_info = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
+    service_account_info = config('FIREBASE_SERVICE_ACCOUNT_JSON', default=None)
     
     try:
         if service_account_info:
@@ -33,12 +34,13 @@ def upload_to_firebase(file_obj, user_id, type_prefix="asset"):
     Structure: sellers/{user_id}/{type_prefix}/{filename}_{timestamp}.{ext}
     """
     # Environment-aware bucket selection
-    env = os.environ.get('DJANGO_ENV', 'LOCAL').upper()
-    bucket_name = "junglyst" if env == 'PROD' else "junglyst_dev"
+    env = config('DJANGO_ENV', 'LOCAL').upper()
+    # bucket_name = "junglyst" if env == 'PROD' else "junglyst_dev"
+    bucket_name = config('FIREBASE_STORAGE_BUCKET')
     
     try:
         bucket = storage.bucket(bucket_name)
-    except Exception:
+    except Exception as e:
         # Fallback to default bucket if specified in config, else use junglyst_dev
         bucket = storage.bucket()
     
