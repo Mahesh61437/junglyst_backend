@@ -44,9 +44,20 @@ class CheckoutView(generics.GenericAPIView):
             email = guest_info.get('email')
             phone = guest_info.get('phone')
 
-        # Totals
-        subtotal = sum(item.variant.price * item.quantity for item in cart.items.all())
-        gst_total = sum((item.variant.price * item.quantity * item.product.categories.first().gst_percentage / 100) for item in cart.items.all() if item.product.categories.exists())
+        # Stock and Totals
+        subtotal = 0
+        gst_total = 0
+        
+        for item in cart.items.all():
+            if item.quantity > item.variant.stock:
+                return Response({
+                    "error": f"Botanical inventory mismatch: {item.product.name} ({item.variant.name}) has only {item.variant.stock} specimens available. Please adjust your box."
+                }, status=400)
+            
+            subtotal += item.variant.price * item.quantity
+            if item.product.categories.exists():
+                gst_total += (item.variant.price * item.quantity * item.product.categories.first().gst_percentage / 100)
+        
         total_amount = subtotal + gst_total
         
         order = Order.objects.create(
@@ -104,6 +115,20 @@ class VerifyPaymentView(generics.GenericAPIView):
                 payment = Payment.objects.get(razorpay_order_id=razorpay_order_id)
                 order = payment.order
                 
+                # Final Stock Check before capture
+                insufficient_items = []
+                for item in order.items.all():
+                    if item.variant and item.variant.stock < item.quantity:
+                        insufficient_items.append(item.product_name)
+                
+                if insufficient_items:
+                    # In a real scenario, we would trigger a refund here
+                    order.status = 'failed'
+                    order.save()
+                    return Response({
+                        "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
+                    }, status=400)
+
                 payment.razorpay_payment_id = razorpay_payment_id
                 payment.razorpay_signature = razorpay_signature
                 payment.status = 'captured'

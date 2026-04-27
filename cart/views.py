@@ -46,12 +46,19 @@ class CartViewSet(viewsets.ModelViewSet):
         item, created = CartItem.objects.get_or_create(
             cart=cart, 
             variant=variant,
-            defaults={'product': variant.product, 'quantity': quantity}
+            defaults={'product': variant.product, 'quantity': 0}
         )
         
-        if not created:
-            item.quantity += quantity
-            item.save()
+        # Check total quantity against stock
+        new_quantity = item.quantity + quantity
+        if new_quantity > variant.stock:
+            return Response({
+                "error": f"Insufficient stock. Only {variant.stock} units available.",
+                "available_stock": variant.stock
+            }, status=400)
+            
+        item.quantity = new_quantity
+        item.save()
             
         serializer = self.get_serializer(cart)
         return Response(serializer.data)
@@ -59,13 +66,20 @@ class CartViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def update_item(self, request):
         item_id = request.data.get('item_id')
-        quantity = request.data.get('quantity')
+        quantity = int(request.data.get('quantity'))
         
         try:
             item = CartItem.objects.get(id=item_id)
-            if int(quantity) <= 0:
+            if quantity <= 0:
                 item.delete()
             else:
+                # Check against stock
+                if quantity > item.variant.stock:
+                    return Response({
+                        "error": f"Insufficient stock. Only {item.variant.stock} units available.",
+                        "available_stock": item.variant.stock
+                    }, status=400)
+                
                 item.quantity = quantity
                 item.save()
         except (CartItem.DoesNotExist, ValueError):
