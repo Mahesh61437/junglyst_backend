@@ -5,6 +5,15 @@ def get_razorpay_client():
     return razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
 def create_razorpay_order(amount_in_paise, currency="INR"):
+    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+        import uuid
+        return {
+            "id": f"order_mock_{uuid.uuid4().hex[:10]}",
+            "amount": amount_in_paise,
+            "currency": currency,
+            "status": "created"
+        }
+    
     client = get_razorpay_client()
     data = {
         "amount": amount_in_paise,

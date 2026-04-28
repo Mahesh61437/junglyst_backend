@@ -29,7 +29,7 @@ class CheckoutView(generics.GenericAPIView):
             return Response({"error": "Cart is empty"}, status=400)
             
         # Address logic
-        if request.user.is_authenticated:
+        if request.user.is_authenticated and address_id:
             try:
                 address_obj = ShippingAddress.objects.get(id=address_id, user=request.user)
                 shipping_address = ShippingAddressSerializer(address_obj).data
@@ -40,14 +40,16 @@ class CheckoutView(generics.GenericAPIView):
         else:
             if not guest_info:
                 return Response({"error": "Guest info required"}, status=400)
-            shipping_address = guest_info.get('address')
+            shipping_address = guest_info
             email = guest_info.get('email')
             phone = guest_info.get('phone')
 
-        # Totals
+        # Totals (Match Frontend Logic: 18% GST, Flat 99 Shipping under 999)
+        from decimal import Decimal
         subtotal = sum(item.variant.price * item.quantity for item in cart.items.all())
-        gst_total = sum((item.variant.price * item.quantity * item.product.categories.first().gst_percentage / 100) for item in cart.items.all() if item.product.categories.exists())
-        total_amount = subtotal + gst_total
+        gst_total = round(subtotal * Decimal('0.18'), 2)
+        shipping_fee = Decimal('0') if subtotal >= 999 or subtotal == 0 else Decimal('99')
+        total_amount = subtotal + gst_total + shipping_fee
         
         order = Order.objects.create(
             order_number=f"JUN-{uuid.uuid4().hex[:8].upper()}",
@@ -56,6 +58,7 @@ class CheckoutView(generics.GenericAPIView):
             guest_phone=phone if not request.user.is_authenticated else None,
             shipping_address=shipping_address,
             subtotal=subtotal,
+            shipping_fee=shipping_fee,
             gst_total=gst_total,
             total_amount=total_amount,
             status='pending'
@@ -75,6 +78,9 @@ class CheckoutView(generics.GenericAPIView):
             )
             
         # Create Razorpay Order
+        from django.conf import settings
+        is_mock_payment = not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET
+        
         try:
             razorpay_order = create_razorpay_order(int(total_amount * 100))
             Payment.objects.create(
@@ -82,6 +88,19 @@ class CheckoutView(generics.GenericAPIView):
                 razorpay_order_id=razorpay_order['id'],
                 amount=total_amount
             )
+            
+            # If mocking payment for local dev, auto-place the order
+            if is_mock_payment:
+                order.status = 'placed'
+                order.is_paid = True
+                order.save()
+                
+                # Also decrement stock
+                for item in order.items.all():
+                    if item.variant:
+                        item.variant.stock -= item.quantity
+                        item.variant.save()
+            
             return Response({
                 "order": OrderSerializer(order).data,
                 "razorpay_order_id": razorpay_order['id'],
@@ -138,7 +157,7 @@ class OrderListView(generics.ListAPIView):
     def get_queryset(self):
         user = self.request.user
         if user.role == 'grower':
-            # For growers, return orders that contain their items
-            return Order.objects.filter(items__seller=user).distinct()
-        # For collectors, return their own orders
-        return Order.objects.filter(user=user)
+            # For growers, return orders that contain their items and are not pending
+            return Order.objects.filter(items__seller=user).exclude(status='pending').distinct()
+        # For collectors, return their own orders that are not pending
+        return Order.objects.filter(user=user).exclude(status='pending')
