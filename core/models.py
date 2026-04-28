@@ -53,11 +53,18 @@ class User(AbstractUser, SoftDeleteModel):
     def __str__(self):
         return f"{self.email} ({self.get_role_display()})"
 
+class ShippingType(models.TextChoices):
+    PLANT = 'plant', _('Plant / Live Specimen')
+    ACCESSORY = 'accessory', _('Accessory / Tool')
+    HEAVY = 'heavy', _('Heavy Item (>3kg)')
+    FLAT = 'flat', _('Flat Rate Item')
+
 class Category(SoftDeleteModel):
     name = models.CharField(max_length=100, unique=True)
     slug = models.SlugField(unique=True)
     description = models.TextField(blank=True, null=True)
     image_url = models.URLField(max_length=1000, blank=True, null=True)
+    shipping_type = models.CharField(max_length=20, choices=ShippingType.choices, default=ShippingType.PLANT)
     gst_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=0.00)
     commission_rate = models.DecimalField(max_digits=5, decimal_places=2, default=20.00)
     

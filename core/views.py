@@ -5,7 +5,8 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, ProductVariant, ProductImage, Cart, CartItem
+from .models import Product, Category, SubCategory, ProductVariant, ProductImage
+from cart.models import Cart, CartItem
 from orders.models import Order
 from .serializers import (
     RegisterSerializer, CustomTokenObtainPairSerializer, UserSerializer,

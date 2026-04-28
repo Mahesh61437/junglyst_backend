@@ -5,6 +5,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from core.models import (
     Category, SubCategory, Tag, Product, ProductVariant, ProductImage
 )
+from cart.models import Cart, CartItem
 
 User = get_user_model()
 
@@ -320,3 +321,34 @@ class ProductSerializer(serializers.ModelSerializer):
         if first_cat:
             return first_cat.name
         return None
+
+class CartItemSerializer(serializers.ModelSerializer):
+    product = ProductSerializer(read_only=True)
+    variant = ProductVariantSerializer(read_only=True)
+    subtotal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CartItem
+        fields = ('id', 'product', 'variant', 'quantity', 'added_at', 'subtotal')
+
+    def get_subtotal(self, obj):
+        price = obj.variant.price if obj.variant else obj.product.price
+        return price * obj.quantity
+
+class CartSerializer(serializers.ModelSerializer):
+    items = CartItemSerializer(many=True, read_only=True)
+    total_items = serializers.SerializerMethodField()
+    subtotal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Cart
+        fields = ('id', 'items', 'total_items', 'subtotal', 'updated_at')
+
+    def get_total_items(self, obj):
+        return sum(item.quantity for item in obj.items.all())
+
+    def get_subtotal(self, obj):
+        return sum(
+            (item.variant.price if item.variant else item.product.price) * item.quantity 
+            for item in obj.items.all()
+        )
