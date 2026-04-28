@@ -31,27 +31,44 @@ class CartViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def add_item(self, request):
         variant_id = request.data.get('variant_id')
+        product_id = request.data.get('productId')
         quantity = int(request.data.get('quantity', 1))
         
+        from django.core.exceptions import ValidationError
+        
         if not variant_id:
-            return Response({"error": "variant_id is required"}, status=400)
-            
-        try:
-            variant = ProductVariant.objects.get(id=variant_id)
-        except ProductVariant.DoesNotExist:
-            return Response({"error": "Variant not found"}, status=404)
+            if not product_id:
+                return Response({"error": "variant_id or productId is required"}, status=400)
+            try:
+                variant = ProductVariant.objects.filter(product_id=product_id).first()
+                if not variant:
+                    return Response({"error": "No variants found for this product"}, status=404)
+            except ValidationError:
+                return Response({"error": "Invalid product ID"}, status=400)
+        else:
+            try:
+                variant = ProductVariant.objects.get(id=variant_id)
+            except (ProductVariant.DoesNotExist, ValidationError):
+                return Response({"error": "Variant not found"}, status=404)
             
         cart = self.get_cart(request)
         
-        item, created = CartItem.objects.get_or_create(
-            cart=cart, 
-            variant=variant,
-            defaults={'product': variant.product, 'quantity': quantity}
-        )
-        
-        if not created:
-            item.quantity += quantity
+        try:
+            item = CartItem.all_objects.get(cart=cart, variant=variant)
+            if item.is_deleted:
+                item.is_deleted = False
+                item.deleted_at = None
+                item.quantity = quantity
+            else:
+                item.quantity += quantity
             item.save()
+        except CartItem.DoesNotExist:
+            item = CartItem.objects.create(
+                cart=cart, 
+                variant=variant,
+                product=variant.product,
+                quantity=quantity
+            )
             
         serializer = self.get_serializer(cart)
         return Response(serializer.data)

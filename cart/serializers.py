@@ -3,12 +3,12 @@ from .models import Cart, CartItem
 from core.serializers import ProductSerializer, ProductVariantSerializer
 
 class CartItemSerializer(serializers.ModelSerializer):
-    product_details = ProductSerializer(source='product', read_only=True)
-    variant_details = ProductVariantSerializer(source='variant', read_only=True)
+    product = ProductSerializer(read_only=True)
+    variant = ProductVariantSerializer(read_only=True)
     
     class Meta:
         model = CartItem
-        fields = ('id', 'product', 'variant', 'quantity', 'product_details', 'variant_details')
+        fields = ('id', 'product', 'variant', 'quantity')
 
 class CartSerializer(serializers.ModelSerializer):
     items = CartItemSerializer(many=True, read_only=True)
