@@ -47,11 +47,11 @@ class SuperAdminDashboardView(generics.GenericAPIView):
         total_revenue_month = orders_this_month.aggregate(total=Sum('total_amount'))['total'] or 0
         total_orders_month = orders_this_month.count()
         
-        total_sellers = User.objects.filter(role='grower').count()
+        total_sellers = User.objects.filter(role__in=['grower', 'admin'], is_staff=False).count()
         total_users = User.objects.exclude(role='admin').count()
 
         # Seller Wise Analytics
-        sellers = User.objects.filter(role='grower')
+        sellers = User.objects.filter(role__in=['grower', 'admin'], is_staff=False)
         sellers_data = []
         for seller in sellers:
             # Orders containing items from this seller
@@ -308,4 +308,28 @@ class SellerGSTDashboardView(APIView):
 
         return Response({"month": f"{year}-{month:02d}", "data": seller_data})
 
+class AuthorizeGrowerView(APIView):
+    permission_classes = (IsAdminUser,)
 
+    def post(self, request, pk):
+        try:
+            user = User.objects.get(id=pk)
+            user.role = 'admin'
+            user.is_verified_seller = True
+            user.save()
+            return Response({"message": "User authorized successfully. Role updated to admin."}, status=200)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=404)
+
+class RejectGrowerView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    def post(self, request, pk):
+        try:
+            user = User.objects.get(id=pk)
+            user.role = 'collector'
+            user.is_verified_seller = False
+            user.save()
+            return Response({"message": "Grower request rejected. Role updated to collector."}, status=200)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=404)
