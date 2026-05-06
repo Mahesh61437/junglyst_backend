@@ -316,7 +316,9 @@ class AuthorizeGrowerView(APIView):
             user = User.objects.get(id=pk)
             user.role = 'admin'
             user.is_verified_seller = True
+            user.is_staff = True
             user.save()
+            print(f"debug: here.....")
             return Response({"message": "User authorized successfully. Role updated to admin."}, status=200)
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=404)

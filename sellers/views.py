@@ -203,7 +203,6 @@ class CheckSellerApprovalView(generics.GenericAPIView):
         seller = request.user
         is_allowed = AllowedSeller.objects.filter(email=seller.email, is_active=True).exists() or \
                      (hasattr(seller, 'mobile') and AllowedSeller.objects.filter(phone=seller.mobile, is_active=True).exists())
-        
         return Response({
             "is_approved": is_allowed or seller.role == 'admin'
         })
