@@ -1,5 +1,6 @@
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django.db import transaction
 import uuid
 from cart.models import Cart
@@ -9,7 +10,7 @@ from notifications.models import AppNotification
 from payments.models import Payment
 from payments.razorpay_utils import create_razorpay_order, verify_payment_signature
 from .models import Order, OrderItem
-from .serializers import OrderSerializer
+from .serializers import OrderSerializer, SellerOrderSerializer
 
 class CheckoutView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
@@ -181,3 +182,64 @@ class OrderDetailView(generics.RetrieveAPIView):
         if user.is_staff or user.role == 'admin':
             return Order.objects.all()
         return Order.objects.filter(user=user)
+
+
+class SellerOrderListView(generics.ListAPIView):
+    """Grower-scoped order list — items and shipment pre-filtered to the seller."""
+    serializer_class = SellerOrderSerializer
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get_queryset(self):
+        return (
+            Order.objects
+            .filter(items__seller=self.request.user)
+            .distinct()
+            .prefetch_related('items', 'shipments')
+            .order_by('-created_at')
+        )
+
+
+class ShipNowView(APIView):
+    """
+    POST /api/orders/ship-now/
+    Body: { order_id, courier_id (optional) }
+    Updates order status, notifies buyer, triggers NimbusPost shipment creation.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request):
+        order_id = request.data.get('order_id')
+        courier_id = request.data.get('courier_id')
+
+        if not order_id:
+            return Response({'error': 'order_id required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            order = Order.objects.get(id=order_id, items__seller=request.user)
+        except Order.DoesNotExist:
+            return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Update order status to processing
+        if order.status not in ('shipped', 'delivered', 'cancelled'):
+            Order.objects.filter(id=order_id).update(status='processing')
+
+        # Notify buyer
+        buyer = order.user
+        if buyer:
+            AppNotification.objects.create(
+                user=buyer,
+                title='Your order is being packed!',
+                message=(
+                    f'Great news! Order {order.order_number} is being prepared for shipment '
+                    f'by your grower. You will receive tracking details soon.'
+                ),
+            )
+
+        # Trigger async NimbusPost shipment creation
+        from shipping.tasks import create_nimbuspost_shipment
+        create_nimbuspost_shipment.delay(str(order_id), str(request.user.id), courier_id)
+
+        return Response(
+            {'message': 'Shipment initiated', 'order_id': str(order_id)},
+            status=status.HTTP_202_ACCEPTED,
+        )

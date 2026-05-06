@@ -28,7 +28,9 @@ class SellerProfile(models.Model):
     gst_document_url = models.URLField(max_length=1000, blank=True, null=True)
     
     location_city = models.CharField(max_length=100, blank=True, null=True)
+    location_state = models.CharField(max_length=100, blank=True, null=True)
     location_pincode = models.CharField(max_length=10, blank=True, null=True)
+    pickup_address = models.CharField(max_length=255, blank=True, null=True, help_text="Street address for NimbusPost pickup")
     
     # Authenticity & Skill Showcase
     expertise_tags = models.JSONField(default=list, blank=True)

@@ -1,3 +1,4 @@
+import uuid
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -5,7 +6,7 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, ProductVariant, ProductImage
+from .models import Product, Category, SubCategory, ProductVariant, ProductImage, WishlistItem
 from cart.models import Cart, CartItem
 from orders.models import Order
 from .serializers import (
@@ -65,8 +66,17 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
     def get_object(self):
         return self.request.user
 
+def _product_queryset():
+    return Product.objects.select_related(
+        'seller', 'seller__seller_profile',
+        'sub_category', 'sub_category__category',
+    ).prefetch_related(
+        'variants', 'images', 'categories',
+        'categories__subcategories', 'tags',
+    )
+
+
 class ProductListView(generics.ListAPIView):
-    queryset = Product.objects.all()
     serializer_class = ProductSerializer
     permission_classes = (permissions.AllowAny,)
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
@@ -75,30 +85,29 @@ class ProductListView(generics.ListAPIView):
     ordering_fields = ('created_at', 'rating')
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = _product_queryset()
+
         seller_slug = self.request.query_params.get('seller_slug')
         if seller_slug:
             queryset = queryset.filter(seller__seller_profile__slug=seller_slug)
 
-        # Only show active products unless the seller is explicitly filtering their own
-        # (sellers pass seller=<their_id> param from the dashboard)
         seller_id = self.request.query_params.get('seller')
         is_active_param = self.request.query_params.get('is_active')
         if seller_id and is_active_param is None:
-            # Seller viewing their own products: show everything (active + archived)
             pass
         else:
-            # Public marketplace: only show active products by default
             if is_active_param is None:
                 queryset = queryset.filter(is_active=True)
 
         return queryset
 
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Product.objects.all()
     serializer_class = ProductSerializer
     permission_classes = (permissions.IsAuthenticatedOrReadOnly,)
-    lookup_field = 'id' 
+    lookup_field = 'id'
+
+    def get_queryset(self):
+        return _product_queryset()
 
     def get_permissions(self):
         if self.request.method in ['PUT', 'PATCH', 'DELETE']:
@@ -135,6 +144,91 @@ class GrowerProductCreateView(generics.CreateAPIView):
         if self.request.user.role not in ['grower', 'admin']:
             raise permissions.PermissionDenied("Only growers can list products")
         serializer.save(seller=self.request.user)
+
+
+class AdminProductCreateView(generics.CreateAPIView):
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = ProductSerializer
+
+    def create(self, request, *args, **kwargs):
+        if not (request.user.is_staff or request.user.role == 'admin'):
+            return Response({'error': 'Admin access required'}, status=403)
+        if not request.data.get('seller_id'):
+            return Response({'error': 'seller_id is required'}, status=400)
+        return super().create(request, *args, **kwargs)
+
+
+class ProductCopyView(generics.GenericAPIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request, id):
+        if not (request.user.is_staff or request.user.role == 'admin'):
+            return Response({'error': 'Admin access required'}, status=403)
+
+        try:
+            original = Product.objects.prefetch_related(
+                'variants', 'images', 'categories', 'tags'
+            ).get(id=id)
+        except Product.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+
+        base_name = f"{original.name} (Copy)"
+        base_slug = slugify(base_name)
+        slug = base_slug
+        counter = 1
+        while Product.objects.filter(slug=slug).exists():
+            slug = f"{base_slug}-{counter}"
+            counter += 1
+
+        seller = original.seller
+        seller_id = request.data.get('seller_id')
+        if seller_id:
+            try:
+                seller = User.objects.get(id=seller_id)
+            except User.DoesNotExist:
+                pass
+
+        new_product = Product(
+            name=base_name,
+            slug=slug,
+            tagline=original.tagline,
+            description=original.description,
+            seller=seller,
+            sub_category=original.sub_category,
+            scientific_name=original.scientific_name,
+            care_level=original.care_level,
+            light_requirements=original.light_requirements,
+            growth_rate=original.growth_rate,
+            is_rare=original.is_rare,
+            origin=original.origin,
+            water_temperature=original.water_temperature,
+            ph_range=original.ph_range,
+            is_active=False,
+            co2_requirement=original.co2_requirement,
+        )
+        new_product.save()
+
+        for cat in original.categories.all():
+            new_product.categories.add(cat)
+
+        variant_map = {}
+        for v in original.variants.all():
+            old_id = v.id
+            v.pk = None
+            v.sku = None
+            v.product = new_product
+            v.save()
+            variant_map[old_id] = v
+
+        for img in original.images.all():
+            old_variant_id = img.variant_id
+            img.pk = None
+            img.product = new_product
+            img.variant = variant_map.get(old_variant_id)
+            img.save()
+
+        from .serializers import ProductSerializer as PS
+        return Response(PS(new_product, context={'request': request}).data, status=201)
 
 class CategoryListView(generics.ListAPIView):
     queryset = Category.objects.all()
@@ -194,3 +288,48 @@ class SyncCartView(generics.GenericAPIView):
                 continue
                 
         return Response(CartSerializer(cart).data)
+
+class WishlistView(generics.GenericAPIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request):
+        items = WishlistItem.objects.filter(user=request.user).select_related(
+            'product', 'product__seller', 'product__seller__seller_profile'
+        ).prefetch_related('product__variants', 'product__images')
+        data = []
+        for item in items:
+            p = item.product
+            variants = p.variants.all()
+            images = p.images.all()
+            first_variant = variants[0] if variants else None
+            data.append({
+                'id': str(p.id),
+                'name': p.name,
+                'price': str(first_variant.price) if first_variant else '0',
+                'image_url': images[0].image_url if images else None,
+                'seller': {
+                    'id': str(p.seller.id),
+                    'store_name': getattr(getattr(p.seller, 'seller_profile', None), 'store_name', p.seller.username),
+                },
+                'added_at': item.added_at.isoformat(),
+            })
+        return Response(data)
+
+    def post(self, request):
+        product_id = request.data.get('product_id')
+        if not product_id:
+            return Response({'error': 'product_id required'}, status=400)
+        try:
+            product = Product.objects.get(id=product_id)
+        except Product.DoesNotExist:
+            return Response({'error': 'Product not found'}, status=404)
+
+        item, created = WishlistItem.objects.get_or_create(user=request.user, product=product)
+        if not created:
+            item.delete()
+            return Response({'status': 'removed', 'product_id': product_id})
+        return Response({'status': 'added', 'product_id': product_id}, status=201)
+
+    def delete(self, request, product_id):
+        WishlistItem.objects.filter(user=request.user, product_id=product_id).delete()
+        return Response({'status': 'removed'})

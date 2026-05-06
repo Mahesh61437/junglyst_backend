@@ -3,7 +3,8 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     RegisterView, CustomTokenObtainPairView, UserProfileView,
     ProductListView, ProductDetailView, CategoryListView, SubCategoryListView,
-    ImageUploadView, GrowerProductCreateView, SyncCartView
+    ImageUploadView, GrowerProductCreateView, AdminProductCreateView,
+    ProductCopyView, SyncCartView, WishlistView
 )
 
 urlpatterns = [
@@ -17,6 +18,8 @@ urlpatterns = [
     # Discovery
     path('products/', ProductListView.as_view(), name='product_list'),
     path('products/create/', GrowerProductCreateView.as_view(), name='grower_product_create'),
+    path('products/admin-create/', AdminProductCreateView.as_view(), name='admin_product_create'),
+    path('products/id/<uuid:id>/copy/', ProductCopyView.as_view(), name='product_copy'),
     path('products/id/<uuid:id>/', ProductDetailView.as_view(), name='product_detail_id'),
     path('products/<slug:slug>/', ProductDetailView.as_view(lookup_field='slug'), name='product_detail_slug'),
     path('categories/', CategoryListView.as_view(), name='category_list'),
@@ -24,4 +27,8 @@ urlpatterns = [
     
     # Utilities
     path('upload/', ImageUploadView.as_view(), name='image_upload'),
+
+    # Wishlist
+    path('wishlist/', WishlistView.as_view(), name='wishlist'),
+    path('wishlist/<uuid:product_id>/', WishlistView.as_view(), name='wishlist_remove'),
 ]
