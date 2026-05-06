@@ -47,11 +47,11 @@ class SuperAdminDashboardView(generics.GenericAPIView):
         total_revenue_month = orders_this_month.aggregate(total=Sum('total_amount'))['total'] or 0
         total_orders_month = orders_this_month.count()
         
-        total_sellers = User.objects.filter(role__in=['grower', 'admin'], is_staff=False).count()
+        total_sellers = User.objects.filter(role__in=['grower', 'admin'], is_verified_seller=True).count()
         total_users = User.objects.exclude(role='admin').count()
 
         # Seller Wise Analytics
-        sellers = User.objects.filter(role__in=['grower', 'admin'], is_staff=False)
+        sellers = User.objects.filter(role__in=['grower', 'admin'])
         sellers_data = []
         for seller in sellers:
             # Orders containing items from this seller
