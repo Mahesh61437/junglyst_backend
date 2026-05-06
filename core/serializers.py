@@ -15,8 +15,8 @@ class UserSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile', 'is_staff')
-        read_only_fields = ('id', 'is_verified_seller')
+        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile', 'is_staff', 'is_superuser')
+        read_only_fields = ('id', 'is_verified_seller', 'is_superuser')
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
