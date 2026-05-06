@@ -26,6 +26,8 @@ class CartViewSet(viewsets.ModelViewSet):
     def list(self, request):
         cart = self.get_cart(request)
         serializer = self.get_serializer(cart)
+        import json
+        print("CART DATA OUT:", json.dumps(serializer.data, default=str))
         return Response(serializer.data)
 
     @action(detail=False, methods=['post'])

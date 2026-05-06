@@ -257,7 +257,8 @@ if IS_PRODUCTION:
         r"^https://.*\.up\.railway\.app$",
         r"^https://junglyst\.com$",
         r"^https://.*\.junglyst\.com$",
-        r"^http://localhost:3000$", # Keep local dev access if needed
+        r"^http://localhost:5173$", # React default
+        r"^http://localhost:3000$", # Alternative
     ]
 else:
     CORS_ALLOW_ALL_ORIGINS = True
