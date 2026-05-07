@@ -2,8 +2,9 @@ import logging
 from datetime import date
 from celery import shared_task
 from django.conf import settings
+from django.core.mail import send_mail
 from .services import NimbuspostService
-from orders.models import Order, OrderItem
+from orders.models import Order, OrderItem, SubOrder
 from .models import Shipment
 
 logger = logging.getLogger(__name__)
@@ -12,8 +13,8 @@ logger = logging.getLogger(__name__)
 PLANT_HSN_CODE = "0602"
 
 
-def _build_shipment_payload(order: Order, seller, courier_id: str) -> dict:
-    """Build the full NimbusPost B2B shipment creation payload from a Junglyst order."""
+def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=None) -> dict:
+    """Build the full NimbusPost shipment creation payload from a Junglyst sub-order."""
     addr = order.shipping_address or {}
 
     consignee_address = addr.get("address_line1", "")
@@ -36,15 +37,21 @@ def _build_shipment_payload(order: Order, seller, courier_id: str) -> dict:
     pickup_address_str = getattr(profile, "pickup_address", None) or pickup_city
     warehouse_name = getattr(profile, "store_name", None) or settings.NIMBUSPOST_WAREHOUSE_NAME
 
-    items = OrderItem.objects.filter(
-        order=order, seller=seller
-    ).select_related("variant", "product")
+    item_qs = OrderItem.objects.filter(order=order, seller=seller).select_related("variant", "product")
+    if sub_order:
+        item_qs = item_qs.filter(sub_order=sub_order)
+    items = list(item_qs)
 
     products = []
     total_weight_gram = 0
     for item in items:
         v = item.variant
-        w = float(getattr(v, "weight", 0.5) or 0.5) * 1000  # kg → grams
+        # Prefer chargeable_weight (packed vs volumetric max); fall back to legacy weight field
+        cw = getattr(v, "chargeable_weight", None)
+        if cw:
+            w = float(cw)
+        else:
+            w = float(getattr(v, "packed_weight_grams", None) or getattr(v, "weight", 0.5) or 0.5) * (1 if getattr(v, "packed_weight_grams", None) else 1000)
         l = float(getattr(v, "length", 10) or 10)
         b = float(getattr(v, "width", 10) or 10)
         h = float(getattr(v, "height", 10) or 10)
@@ -78,12 +85,28 @@ def _build_shipment_payload(order: Order, seller, courier_id: str) -> dict:
             "product_weight": 500,
         }]
 
+    # Override with seller-confirmed actual measurements when available
+    if sub_order and sub_order.actual_weight_grams:
+        total_qty = sum(int(p["no_of_box"]) for p in products) or 1
+        per_unit_weight = max(1, sub_order.actual_weight_grams // total_qty)
+        l = sub_order.actual_length_cm or 15
+        b = sub_order.actual_breadth_cm or 15
+        h = sub_order.actual_height_cm or 15
+        for p in products:
+            p["product_weight"] = per_unit_weight
+            p["product_length"] = str(l)
+            p["product_breadth"] = str(b)
+            p["product_height"] = str(h)
+        total_weight_gram = sub_order.actual_weight_grams
+
     invoice_value = sum(
         float(item.unit_price * item.quantity) for item in items
     ) or float(order.total_amount)
 
+    ref_number = sub_order.sub_order_number if sub_order else f"{order.order_number}-{str(seller.id)[:8]}"
+
     return {
-        "order_id": f"{order.order_number}-{str(seller.id)[:8]}",
+        "order_id": ref_number,
         "payment_method": "prepaid",
         "consignee_name": addr.get("full_name", "Customer"),
         "consignee_company_name": addr.get("full_name", "Customer"),
@@ -98,7 +121,7 @@ def _build_shipment_payload(order: Order, seller, courier_id: str) -> dict:
         "courier_id": str(courier_id),
         "request_auto_pickup": "Yes",
         "invoice": [{
-            "invoice_number": order.order_number,
+            "invoice_number": ref_number,
             "invoice_date": date.today().strftime("%d-%m-%Y"),
             "invoice_value": str(round(invoice_value, 2)),
         }],
@@ -116,10 +139,11 @@ def _build_shipment_payload(order: Order, seller, courier_id: str) -> dict:
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
-def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: str = None):
+def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: str = None, sub_order_id: str = None):
     """
-    Create a NimbusPost B2B shipment for a specific seller's items in an order.
+    Create a NimbusPost shipment for a seller's sub-order.
     If courier_id is not supplied, the cheapest available courier is auto-selected.
+    On failure after max retries, notifies admin and marks sub-order for manual AWB entry.
     """
     from django.contrib.auth import get_user_model
     User = get_user_model()
@@ -131,11 +155,18 @@ def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: 
         logger.error("create_nimbuspost_shipment: not found – %s", exc)
         return str(exc)
 
-    # Prevent duplicate
+    sub_order = None
+    if sub_order_id:
+        try:
+            sub_order = SubOrder.objects.get(id=sub_order_id)
+        except SubOrder.DoesNotExist:
+            logger.warning("SubOrder %s not found, proceeding without sub-order link", sub_order_id)
+
+    # Prevent duplicate booking
     if Shipment.objects.filter(order=order, seller=seller).exclude(status='pending').exists():
         return f"Shipment already created for order {order_id} / seller {seller_id}"
 
-    # Auto-select courier if not provided
+    # Auto-select cheapest courier if not provided
     if not courier_id:
         addr = order.shipping_address or {}
         dest_pincode = str(addr.get("pincode", ""))
@@ -145,22 +176,26 @@ def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: 
         except Exception:
             origin_pincode = "560001"
 
-        items = OrderItem.objects.filter(order=order, seller=seller).select_related("variant")
+        item_qs = OrderItem.objects.filter(order=order, seller=seller)
+        if sub_order:
+            item_qs = item_qs.filter(sub_order=sub_order)
+        items = list(item_qs.select_related("variant"))
         total_weight_kg = sum(
-            float(getattr(i.variant, "weight", 0.5) or 0.5) * i.quantity for i in items
+            float(getattr(i.variant, "chargeable_weight", None) or getattr(i.variant, "packed_weight_grams", None) or (float(getattr(i.variant, "weight", 0.5) or 0.5) * 1000)) / 1000 * i.quantity
+            for i in items if i.variant
         ) or 0.5
 
         svc = NimbuspostService.check_serviceability(
             origin_pincode=origin_pincode,
             destination_pincode=dest_pincode,
             weight_kg=total_weight_kg,
-            order_value=float(order.total_amount),
+            order_value=float(sub_order.seller_total if sub_order else order.total_amount),
         )
         if svc and svc.get("status") and svc.get("data"):
             sorted_couriers = sorted(svc["data"], key=lambda c: float(c.get("courier_charges", 9999)))
             if sorted_couriers:
                 courier_id = sorted_couriers[0]["courier_id"]
-                logger.info("Auto-selected courier %s for order %s", courier_id, order_id)
+                logger.info("Auto-selected courier %s for sub-order %s", courier_id, sub_order_id or order_id)
 
         if not courier_id:
             msg = f"No couriers available for {dest_pincode}"
@@ -168,17 +203,19 @@ def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: 
             try:
                 raise self.retry(exc=Exception(msg))
             except self.MaxRetriesExceededError:
+                _notify_admin_booking_failure(order, sub_order, msg)
                 return f"Failed after retries: {msg}"
 
-    payload = _build_shipment_payload(order, seller, courier_id)
+    payload = _build_shipment_payload(order, seller, courier_id, sub_order)
     result = NimbuspostService.create_shipment(payload)
 
     if not result or not result.get("status"):
         msg = (result or {}).get("message", "No response from NimbusPost")
-        logger.error("Shipment creation failed for order %s: %s", order_id, msg)
+        logger.error("Shipment creation failed for %s: %s", sub_order_id or order_id, msg)
         try:
             raise self.retry(exc=Exception(msg))
         except self.MaxRetriesExceededError:
+            _notify_admin_booking_failure(order, sub_order, msg)
             return f"Failed after retries: {msg}"
 
     data = result["data"]
@@ -203,20 +240,66 @@ def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: 
         },
     )
 
-    if awb and not order.awb_number:
-        Order.objects.filter(id=order_id).update(
+    # Write AWB back to SubOrder
+    if sub_order and awb:
+        SubOrder.objects.filter(id=sub_order.id).update(
             awb_number=awb,
             courier_name=courier,
             status="shipped",
         )
 
-    logger.info("Shipment created: order=%s seller=%s AWB=%s", order_id, seller_id, awb)
+    # Write AWB to master Order (first sub-order wins)
+    if awb and not order.awb_number:
+        Order.objects.filter(id=order_id).update(awb_number=awb, courier_name=courier, status="shipped")
+
+    # Notify buyer
+    buyer = order.user
+    if buyer and awb:
+        from notifications.models import AppNotification
+        AppNotification.objects.create(
+            user=buyer,
+            title="Your order has been shipped!",
+            message=f"Order {sub_order.sub_order_number if sub_order else order.order_number} is on its way. AWB: {awb} via {courier}.",
+        )
+
+    logger.info("Shipment created: %s AWB=%s", sub_order_id or order_id, awb)
     return {"awb_number": awb, "shipment_id": np_shipment_id, "label_url": label, "courier_name": courier}
+
+
+def _notify_admin_booking_failure(order, sub_order, reason):
+    """Email admin when NimbusPost auto-booking fails after all retries."""
+    ref = sub_order.sub_order_number if sub_order else order.order_number
+    admin_email = getattr(settings, "ADMIN_EMAIL", None) or getattr(settings, "DEFAULT_FROM_EMAIL", None)
+    if not admin_email:
+        logger.warning("No ADMIN_EMAIL configured — skipping failure notification for %s", ref)
+        return
+    try:
+        send_mail(
+            subject=f"[Junglyst] Shipment booking failed: {ref}",
+            message=(
+                f"NimbusPost auto-booking failed for {ref}.\n\n"
+                f"Reason: {reason}\n\n"
+                f"Please log into the seller dashboard and enter the AWB manually."
+            ),
+            from_email=admin_email,
+            recipient_list=[admin_email],
+            fail_silently=True,
+        )
+    except Exception as e:
+        logger.error("Failed to send admin notification: %s", e)
 
 
 @shared_task
 def sync_all_shipment_statuses():
     """Periodic task: sync statuses for all active shipments (run hourly via Celery Beat)."""
+    NP_TO_SUBORDER = {
+        "booked": "shipped", "pickup_scheduled": "shipped", "picked_up": "shipped",
+        "in_transit": "in_transit", "out_for_delivery": "out_for_delivery",
+        "delivered": "delivered", "delivery_failed": "delivery_failed",
+        "rto_initiated": "delivery_failed", "rto_delivered": "cancelled",
+        "cancelled": "cancelled",
+    }
+
     active = Shipment.objects.exclude(
         status__in=["delivered", "cancelled", "returned", "pending"]
     ).filter(awb_number__isnull=False)
@@ -225,11 +308,13 @@ def sync_all_shipment_statuses():
     for shipment in active:
         result = NimbuspostService.track_shipment(shipment.awb_number)
         if result and result.get("status"):
-            new_status = result.get("data", {}).get("status")
+            raw = (result.get("data", {}).get("status") or "").lower().replace(" ", "_")
+            new_status = NP_TO_SUBORDER.get(raw, raw)
             if new_status and new_status != shipment.status:
                 shipment.status = new_status
                 shipment.save(update_fields=["status", "updated_at"])
                 Order.objects.filter(id=shipment.order_id).update(status=new_status)
+                SubOrder.objects.filter(awb_number=shipment.awb_number).update(status=new_status)
                 updated += 1
 
     return f"Synced {updated} shipment statuses."

@@ -5,6 +5,7 @@ from rest_framework.views import APIView
 from .models import ShippingAddress, Shipment
 from .serializers import ShippingAddressSerializer, ShipmentSerializer
 from .services import NimbuspostService
+from .pincode_zones import classify_pincode
 
 
 class ShippingAddressViewSet(viewsets.ModelViewSet):
@@ -260,3 +261,86 @@ class PackageImageUploadView(APIView):
                 shipment.save(update_fields=["package_image_url", "updated_at"])
 
         return Response({"message": "Package image saved", "image_url": image_url})
+
+
+class NimbusPostWebhookView(APIView):
+    """
+    POST /api/shipping/webhook/nimbuspost/
+    Receives real-time tracking updates from NimbusPost.
+    Maps courier status → SubOrder status and notifies buyer.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    # NimbusPost status → SubOrder status mapping
+    STATUS_MAP = {
+        "booked":            "shipped",
+        "pickup_scheduled":  "shipped",
+        "picked_up":         "shipped",
+        "in_transit":        "in_transit",
+        "out_for_delivery":  "out_for_delivery",
+        "delivered":         "delivered",
+        "delivery_failed":   "delivery_failed",
+        "rto_initiated":     "delivery_failed",
+        "rto_delivered":     "cancelled",
+        "cancelled":         "cancelled",
+        "doa":               "doa_raised",
+    }
+
+    BUYER_MESSAGES = {
+        "in_transit":       ("Order In Transit", "Your order {ref} is in transit and on its way to you."),
+        "out_for_delivery": ("Out for Delivery!", "Great news! Order {ref} is out for delivery today."),
+        "delivered":        ("Order Delivered!", "Your order {ref} has been delivered. Enjoy your new botanical!"),
+        "delivery_failed":  ("Delivery Attempt Failed", "Delivery for order {ref} was unsuccessful. The courier will retry or contact you."),
+        "doa_raised":       ("DOA Complaint Noted", "We have received your DOA report for order {ref}. Our team will reach out soon."),
+    }
+
+    def post(self, request):
+        awb = request.data.get("awb_number") or request.data.get("awb")
+        raw_status = (request.data.get("status") or "").lower().replace(" ", "_")
+
+        if not awb:
+            return Response({"error": "awb_number required"}, status=400)
+
+        mapped = self.STATUS_MAP.get(raw_status)
+        if not mapped:
+            return Response({"message": f"Status '{raw_status}' not mapped, ignored"})
+
+        # Update Shipment record
+        Shipment.objects.filter(awb_number=awb).update(status=mapped)
+
+        # Update SubOrder
+        from orders.models import SubOrder
+        sub_orders = SubOrder.objects.filter(awb_number=awb).select_related("order__user")
+        for so in sub_orders:
+            so.status = mapped
+            so.save(update_fields=["status", "updated_at"])
+
+            buyer = so.order.user
+            if buyer and mapped in self.BUYER_MESSAGES:
+                title, msg_tpl = self.BUYER_MESSAGES[mapped]
+                from notifications.models import AppNotification
+                AppNotification.objects.create(
+                    user=buyer,
+                    title=title,
+                    message=msg_tpl.format(ref=so.sub_order_number),
+                )
+
+        return Response({"message": f"Webhook processed: {awb} → {mapped}"})
+
+
+class PincodeCheckView(APIView):
+    """
+    GET /api/shipping/pincode-check/?pincode=XXXXXX
+    Returns zone classification and deliverability for a given Indian pincode.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        pincode = request.query_params.get('pincode', '').strip()
+        if not pincode or not pincode.isdigit() or len(pincode) != 6:
+            return Response(
+                {"error": "Invalid pincode. Must be a 6-digit number."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = classify_pincode(pincode)
+        return Response(result)

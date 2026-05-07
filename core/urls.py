@@ -4,7 +4,7 @@ from .views import (
     RegisterView, CustomTokenObtainPairView, UserProfileView,
     ProductListView, ProductDetailView, CategoryListView, SubCategoryListView,
     ImageUploadView, GrowerProductCreateView, AdminProductCreateView,
-    ProductCopyView, SyncCartView, WishlistView
+    ProductCopyView, SyncCartView, WishlistView, HomeDataView,
 )
 
 urlpatterns = [
@@ -31,4 +31,7 @@ urlpatterns = [
     # Wishlist
     path('wishlist/', WishlistView.as_view(), name='wishlist'),
     path('wishlist/<uuid:product_id>/', WishlistView.as_view(), name='wishlist_remove'),
+
+    # Home page aggregate
+    path('home/', HomeDataView.as_view(), name='home_data'),
 ]

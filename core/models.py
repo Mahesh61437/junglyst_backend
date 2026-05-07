@@ -162,10 +162,35 @@ class ProductVariant(SoftDeleteModel):
     
     compare_at_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     weight = models.DecimalField(max_digits=10, decimal_places=3, help_text="Weight in Kilograms", default=0.5)
-    length = models.DecimalField(max_digits=10, decimal_places=2, help_text="Length in cm", default=10.0)
-    width = models.DecimalField(max_digits=10, decimal_places=2, help_text="Width in cm", default=10.0)
-    height = models.DecimalField(max_digits=10, decimal_places=2, help_text="Height in cm", default=10.0)
-    
+    length = models.DecimalField(max_digits=10, decimal_places=2, help_text="Box length in cm", default=10.0)
+    width = models.DecimalField(max_digits=10, decimal_places=2, help_text="Box breadth in cm", default=10.0)
+    height = models.DecimalField(max_digits=10, decimal_places=2, help_text="Box height in cm", default=10.0)
+
+    # Shipping classification fields (SHIP-001)
+    class ItemCategory(models.TextChoices):
+        LIGHT = 'light', 'Light Item'
+        HEAVY = 'heavy', 'Heavy Item'
+
+    item_category = models.CharField(
+        max_length=10,
+        choices=ItemCategory.choices,
+        default=ItemCategory.LIGHT,
+        help_text="Light: plants/moss/isopods. Heavy: rocks/substrate/hardscape.",
+    )
+    packed_weight_grams = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Actual weight when packed for shipping (grams, 1–30000)",
+    )
+
+    @property
+    def chargeable_weight(self):
+        """Returns chargeable weight in grams: max(packed, volumetric)."""
+        if not self.packed_weight_grams:
+            return None
+        from decimal import Decimal
+        vol = (Decimal(str(self.length)) * Decimal(str(self.width)) * Decimal(str(self.height)) / Decimal('5000')) * Decimal('1000')
+        return max(self.packed_weight_grams, int(vol))
+
     stock = models.IntegerField(default=0)
     
     is_active = models.BooleanField(default=True)

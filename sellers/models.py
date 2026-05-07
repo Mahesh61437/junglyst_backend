@@ -18,7 +18,8 @@ class SellerProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='seller_profile')
     store_name = models.CharField(max_length=255, unique=True)
     slug = models.SlugField(unique=True)
-    logo_url = models.URLField(max_length=1000, blank=True, null=True)
+    logo_url = models.URLField(max_length=1000, blank=True, null=True)   # full brand logo (rectangular/square)
+    icon_url = models.URLField(max_length=1000, blank=True, null=True)   # small square mark / app icon
     banner_url = models.URLField(max_length=1000, blank=True, null=True)
     brand_color = models.CharField(max_length=7, default='#0A3029')
     bio = models.TextField(blank=True, null=True)

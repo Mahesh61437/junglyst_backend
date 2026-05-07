@@ -76,11 +76,27 @@ class TagSerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)
-    
+    chargeable_weight = serializers.SerializerMethodField()
+
     class Meta:
         model = ProductVariant
         fields = '__all__'
-        read_only_fields = ['product'] # price is now allowed to be passed but we can handle it in model save if needed
+        read_only_fields = ['product']
+
+    def get_chargeable_weight(self, obj):
+        return obj.chargeable_weight
+
+    def validate_packed_weight_grams(self, value):
+        if value is not None and not (1 <= value <= 30000):
+            raise serializers.ValidationError("Packed weight must be between 1g and 30,000g.")
+        return value
+
+    def validate(self, attrs):
+        for dim_key in ('length', 'width', 'height'):
+            val = attrs.get(dim_key)
+            if val is not None and val <= 0:
+                raise serializers.ValidationError({dim_key: "Box dimensions must be positive."})
+        return attrs
 
 class ProductImageSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)

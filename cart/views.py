@@ -42,12 +42,16 @@ class CartViewSet(viewsets.ModelViewSet):
             return Response({"error": "Variant not found"}, status=404)
             
         cart = self.get_cart(request)
-        
-        item, created = CartItem.objects.get_or_create(
-            cart=cart, 
-            variant=variant,
-            defaults={'product': variant.product, 'quantity': 0}
-        )
+
+        # Use all_objects to handle soft-deleted items (unique constraint includes deleted rows)
+        try:
+            item = CartItem.all_objects.get(cart=cart, variant=variant)
+            if item.is_deleted:
+                item.is_deleted = False
+                item.deleted_at = None
+                item.quantity = 0
+        except CartItem.DoesNotExist:
+            item = CartItem(cart=cart, variant=variant, product=variant.product, quantity=0)
         
         # Check total quantity against stock
         new_quantity = item.quantity + quantity
@@ -71,7 +75,9 @@ class CartViewSet(viewsets.ModelViewSet):
         try:
             item = CartItem.objects.get(id=item_id)
             if quantity <= 0:
-                item.delete()
+                # Hard delete to avoid unique constraint conflicts on re-add
+                from django.db.models import Model
+                Model.delete(item)
             else:
                 # Check against stock
                 if quantity > item.variant.stock:

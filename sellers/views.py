@@ -1,6 +1,6 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
-from django.db.models import Sum
+from django.db.models import Sum, Count, Q
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
 from .models import SellerProfile, AllowedSeller
@@ -51,10 +51,15 @@ class GrowerDashboardView(generics.GenericAPIView):
             .annotate(total_qty=Sum('quantity'), total_rev=Sum('unit_price'))\
             .order_by('-total_qty')[:5]
 
-        # Inventory Distribution
-        out_of_stock = ProductVariant.objects.filter(product__seller=seller, stock=0).count()
-        low_stock = ProductVariant.objects.filter(product__seller=seller, stock__gt=0, stock__lt=5).count()
-        healthy_stock = ProductVariant.objects.filter(product__seller=seller, stock__gte=5).count()
+        # Inventory Distribution — single query with conditional aggregation
+        inv = ProductVariant.objects.filter(product__seller=seller).aggregate(
+            out_of_stock=Count('id', filter=Q(stock=0)),
+            low_stock=Count('id', filter=Q(stock__gt=0, stock__lt=5)),
+            healthy_stock=Count('id', filter=Q(stock__gte=5)),
+        )
+        out_of_stock = inv['out_of_stock']
+        low_stock = inv['low_stock']
+        healthy_stock = inv['healthy_stock']
 
         metrics = {
             "total_revenue": total_revenue,
@@ -174,7 +179,7 @@ class SellerProfileListView(generics.ListAPIView):
     pagination_class = None 
 
     def get_queryset(self):
-        queryset = SellerProfile.objects.filter(is_active=True).order_by('sort_order', '-rating')
+        queryset = SellerProfile.objects.select_related('user').filter(is_active=True).order_by('sort_order', '-rating')
         featured = self.request.query_params.get('featured')
         if featured == 'true':
             queryset = queryset.filter(is_featured=True)
@@ -211,16 +216,17 @@ class CheckSellerApprovalView(generics.GenericAPIView):
 
 class PlatformStatsView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
-    
+
     def get(self, request):
-        active_sellers = SellerProfile.objects.filter(is_active=True).count()
-        total_products = Product.objects.filter(is_active=True).count()
-        
-        return Response({
-            "total_sellers": active_sellers,
-            "total_products": total_products,
-            "survival_rate": 98 # Maintain as trust metric for now
-        })
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        # Single aggregation across all three counts
+        stats = {
+            'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
+            'total_products': Product.objects.filter(is_active=True).count(),
+            'total_users': User.objects.filter(is_active=True).count(),
+        }
+        return Response(stats)
 
 class VerifiedCuratorDirectoryView(generics.ListAPIView):
     """

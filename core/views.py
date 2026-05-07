@@ -333,3 +333,35 @@ class WishlistView(generics.GenericAPIView):
     def delete(self, request, product_id):
         WishlistItem.objects.filter(user=request.user, product_id=product_id).delete()
         return Response({'status': 'removed'})
+
+
+class HomeDataView(generics.GenericAPIView):
+    """
+    Single aggregate endpoint for the home page.
+    Returns featured sellers, latest 8 products, and platform stats in one round trip.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        from sellers.models import SellerProfile
+        from sellers.serializers import SellerProfileSerializer
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+
+        featured_sellers = SellerProfile.objects.select_related('user').filter(
+            is_active=True, is_featured=True
+        ).order_by('sort_order', '-rating')
+
+        products_qs = _product_queryset().filter(is_active=True).order_by('-created_at')[:8]
+
+        stats = {
+            'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
+            'total_products': Product.objects.filter(is_active=True).count(),
+            'total_users': User.objects.filter(is_active=True).count(),
+        }
+
+        return Response({
+            'featured_sellers': SellerProfileSerializer(featured_sellers, many=True).data,
+            'products': ProductSerializer(products_qs, many=True).data,
+            'stats': stats,
+        })
