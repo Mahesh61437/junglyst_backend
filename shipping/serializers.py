@@ -10,4 +10,9 @@ class ShippingAddressSerializer(serializers.ModelSerializer):
 class ShipmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Shipment
-        fields = ('id', 'seller', 'nimbuspost_id', 'status', 'label_url', 'awb_number')
+        fields = (
+            'id', 'seller', 'order', 'nimbuspost_id', 'nimbuspost_order_id',
+            'awb_number', 'courier_name', 'status',
+            'label_url', 'manifest_url', 'package_image_url', 'pickup_scheduled_at',
+            'created_at', 'updated_at',
+        )

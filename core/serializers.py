@@ -15,8 +15,8 @@ class UserSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile', 'is_staff')
-        read_only_fields = ('id', 'is_verified_seller')
+        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile', 'is_staff', 'is_superuser')
+        read_only_fields = ('id', 'is_verified_seller', 'is_superuser')
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
@@ -76,11 +76,27 @@ class TagSerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)
-    
+    chargeable_weight = serializers.SerializerMethodField()
+
     class Meta:
         model = ProductVariant
         fields = '__all__'
-        read_only_fields = ['product'] # price is now allowed to be passed but we can handle it in model save if needed
+        read_only_fields = ['product']
+
+    def get_chargeable_weight(self, obj):
+        return obj.chargeable_weight
+
+    def validate_packed_weight_grams(self, value):
+        if value is not None and not (1 <= value <= 30000):
+            raise serializers.ValidationError("Packed weight must be between 1g and 30,000g.")
+        return value
+
+    def validate(self, attrs):
+        for dim_key in ('length', 'width', 'height'):
+            val = attrs.get(dim_key)
+            if val is not None and val <= 0:
+                raise serializers.ValidationError({dim_key: "Box dimensions must be positive."})
+        return attrs
 
 class ProductImageSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)
@@ -98,6 +114,7 @@ class ProductSerializer(serializers.ModelSerializer):
     sub_category = SubCategorySerializer(read_only=True)
     category_id = serializers.IntegerField(write_only=True, required=False)
     sub_category_id = serializers.IntegerField(write_only=True, required=False)
+    seller_id = serializers.UUIDField(write_only=True, required=False)
     image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
     
@@ -122,6 +139,12 @@ class ProductSerializer(serializers.ModelSerializer):
         images_data = validated_data.pop('images', [])
         category_id = validated_data.pop('category_id', None)
         sub_category_id = validated_data.pop('sub_category_id', None)
+        seller_id = validated_data.pop('seller_id', None)
+        if seller_id and 'seller' not in validated_data:
+            try:
+                validated_data['seller'] = User.objects.get(id=seller_id)
+            except User.DoesNotExist:
+                raise serializers.ValidationError({'seller_id': 'User not found'})
         
         # Auto-slugify
         name = validated_data.get('name')
@@ -188,6 +211,12 @@ class ProductSerializer(serializers.ModelSerializer):
         images_data = validated_data.pop('images', _missing)
         category_id = validated_data.pop('category_id', None)
         sub_category_id = validated_data.pop('sub_category_id', None)
+        seller_id = validated_data.pop('seller_id', None)
+        if seller_id:
+            try:
+                instance.seller = User.objects.get(id=seller_id)
+            except User.DoesNotExist:
+                raise serializers.ValidationError({'seller_id': 'User not found'})
 
         # Update core fields (e.g. is_active from archive PATCH)
         for attr, value in validated_data.items():
@@ -273,54 +302,59 @@ class ProductSerializer(serializers.ModelSerializer):
 
         return instance
 
+    def _first_variant(self, obj):
+        # Uses prefetch cache — avoids 9 separate DB hits per product
+        if not hasattr(obj, '_cached_first_variant'):
+            variants = obj.variants.all()
+            obj._cached_first_variant = variants[0] if variants else None
+        return obj._cached_first_variant
+
     def get_variant(self, obj):
-        return obj.variants.first()
+        return self._first_variant(obj)
 
     def get_price(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.price if v else 0
 
     def get_base_price(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.base_price if v else 0
 
     def get_gst_rate(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.gst_rate if v else 0
 
     def get_commission_rate(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.commission_rate if v else 0
 
     def get_stock(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.stock if v else 0
 
     def get_weight(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.weight if v else 0
 
     def get_length(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.length if v else 0
 
     def get_width(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.width if v else 0
 
     def get_height(self, obj):
-        v = self.get_variant(obj)
+        v = self._first_variant(obj)
         return v.height if v else 0
+
     def get_image(self, obj):
-        first_image = obj.images.first()
-        if first_image:
-            return first_image.image_url
-        return None
+        images = obj.images.all()
+        return images[0].image_url if images else None
+
     def get_category(self, obj):
-        first_cat = obj.categories.first()
-        if first_cat:
-            return first_cat.name
-        return None
+        categories = obj.categories.all()
+        return categories[0].name if categories else None
 
 class CartItemSerializer(serializers.ModelSerializer):
     product = ProductSerializer(read_only=True)

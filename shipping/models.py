@@ -24,13 +24,19 @@ class ShippingAddress(SoftDeleteModel):
 class Shipment(SoftDeleteModel):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='shipments')
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='grower_shipments')
-    
-    nimbuspost_id = models.CharField(max_length=100, unique=True, null=True, blank=True)
+
+    # NimbusPost identifiers
+    nimbuspost_id = models.CharField(max_length=100, unique=True, null=True, blank=True)    # NP shipment_id
+    nimbuspost_order_id = models.CharField(max_length=100, null=True, blank=True)           # NP order_id
     awb_number = models.CharField(max_length=100, null=True, blank=True)
+    courier_name = models.CharField(max_length=100, null=True, blank=True)
+
     status = models.CharField(max_length=50, default='pending')
     label_url = models.URLField(max_length=1000, null=True, blank=True)
+    manifest_url = models.URLField(max_length=1000, null=True, blank=True)
+    package_image_url = models.URLField(max_length=1000, null=True, blank=True)
     pickup_scheduled_at = models.DateTimeField(null=True, blank=True)
-    
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

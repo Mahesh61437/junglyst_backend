@@ -18,7 +18,8 @@ class SellerProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='seller_profile')
     store_name = models.CharField(max_length=255, unique=True)
     slug = models.SlugField(unique=True)
-    logo_url = models.URLField(max_length=1000, blank=True, null=True)
+    logo_url = models.URLField(max_length=1000, blank=True, null=True)   # full brand logo (rectangular/square)
+    icon_url = models.URLField(max_length=1000, blank=True, null=True)   # small square mark / app icon
     banner_url = models.URLField(max_length=1000, blank=True, null=True)
     brand_color = models.CharField(max_length=7, default='#0A3029')
     bio = models.TextField(blank=True, null=True)
@@ -28,7 +29,9 @@ class SellerProfile(models.Model):
     gst_document_url = models.URLField(max_length=1000, blank=True, null=True)
     
     location_city = models.CharField(max_length=100, blank=True, null=True)
+    location_state = models.CharField(max_length=100, blank=True, null=True)
     location_pincode = models.CharField(max_length=10, blank=True, null=True)
+    pickup_address = models.CharField(max_length=255, blank=True, null=True, help_text="Street address for NimbusPost pickup")
     
     # Authenticity & Skill Showcase
     expertise_tags = models.JSONField(default=list, blank=True)
