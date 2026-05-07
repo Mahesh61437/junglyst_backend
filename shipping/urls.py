@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import ShippingAddressViewSet, LogisticsViewSet
+from .views import ShippingAddressViewSet, LogisticsViewSet, PackageImageUploadView, PincodeCheckView, NimbusPostWebhookView
 
 router = DefaultRouter()
 router.register(r'addresses', ShippingAddressViewSet, basename='address')
@@ -8,4 +8,7 @@ router.register(r'logistics', LogisticsViewSet, basename='logistics')
 
 urlpatterns = [
     path('', include(router.urls)),
+    path('package-image/', PackageImageUploadView.as_view(), name='package_image_upload'),
+    path('pincode-check/', PincodeCheckView.as_view(), name='pincode_check'),
+    path('webhook/nimbuspost/', NimbusPostWebhookView.as_view(), name='nimbuspost_webhook'),
 ]
