@@ -4,7 +4,7 @@ from .views import (
     RegisterView, CustomTokenObtainPairView, UserProfileView,
     ProductListView, ProductDetailView, CategoryListView, SubCategoryListView,
     ImageUploadView, GrowerProductCreateView, AdminProductCreateView,
-    ProductCopyView, SyncCartView, WishlistView, HomeDataView,,
+    ProductCopyView, SyncCartView, WishlistView, HomeDataView,
     ForgotPasswordView, ResetPasswordView
 )
 

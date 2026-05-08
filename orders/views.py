@@ -230,15 +230,10 @@ class CheckoutView(generics.GenericAPIView):
                 "currency": "INR",
             }, status=201)
         except Exception as e:
-            # Skip payment success for testing purpose - return order even if payment init fails
-            print(f"DEBUG: Razorpay failed but continuing for testing: {str(e)}")
+            print(f"DEBUG: Razorpay failed: {str(e)}")
             return Response({
-                "order": OrderSerializer(order).data,
-                "message": "Payment initialized in TEST MODE (skipped actual gateway)",
-                "razorpay_order_id": f"test_order_{uuid.uuid4().hex[:8]}",
-                "amount": total_amount,
-                "currency": "INR"
-            })
+                "error": f"Failed to initialize payment gateway: {str(e)}"
+            }, status=400)
 
 class VerifyPaymentView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
@@ -262,6 +257,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 if insufficient_items:
                     # In a real scenario, we would trigger a refund here
                     order.status = 'failed'
+                    order.payment_status = 'failed'
                     order.save()
                     return Response({
                         "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
@@ -273,6 +269,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 payment.save()
                 
                 order.is_paid = True
+                order.payment_status = 'completed'
                 order.status = 'placed'
                 order.save()
                 

@@ -12,6 +12,12 @@ class OrderStatus(models.TextChoices):
     CANCELLED = 'cancelled', _('Cancelled')
     RETURNED = 'returned', _('Returned')
 
+class PaymentStatus(models.TextChoices):
+    PENDING = 'pending', _('Pending')
+    FAILED = 'failed', _('Failed')
+    COMPLETED = 'completed', _('Completed')
+    REFUNDED = 'refunded', _('Refunded')
+
 class Order(SoftDeleteModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     order_number = models.CharField(max_length=20, unique=True)
@@ -33,6 +39,7 @@ class Order(SoftDeleteModel):
     estimated_delivery = models.DateField(null=True, blank=True)
     
     is_paid = models.BooleanField(default=False)
+    payment_status = models.CharField(max_length=20, choices=PaymentStatus.choices, default=PaymentStatus.PENDING)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

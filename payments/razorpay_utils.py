@@ -25,3 +25,13 @@ def verify_payment_signature(razorpay_order_id, razorpay_payment_id, razorpay_si
         return True
     except:
         return False
+
+def verify_webhook_signature(body, signature, secret=None):
+    if secret is None:
+        secret = settings.RAZORPAY_WEBHOOK_SECRET
+    client = get_razorpay_client()
+    try:
+        client.utility.verify_webhook_signature(body, signature, secret)
+        return True
+    except:
+        return False
