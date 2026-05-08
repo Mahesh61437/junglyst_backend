@@ -102,11 +102,30 @@ class SellerSubOrderSerializer(serializers.ModelSerializer):
     def get_buyer_first_name(self, obj):
         if obj.order.user:
             return obj.order.user.first_name or obj.order.user.username
-        addr = obj.order.shipping_address or {}
-        return addr.get('firstName') or addr.get('full_name', '').split()[0] or 'Buyer'
+        
+        addr = obj.order.shipping_address
+        if isinstance(addr, str):
+            import json
+            try:
+                addr = json.loads(addr)
+            except Exception:
+                addr = {}
+        if not isinstance(addr, dict):
+            addr = {}
+            
+        return addr.get('firstName') or addr.get('full_name', '').split()[0] if addr.get('full_name') else 'Buyer'
 
     def get_buyer_pincode(self, obj):
-        addr = obj.order.shipping_address or {}
+        addr = obj.order.shipping_address
+        if isinstance(addr, str):
+            import json
+            try:
+                addr = json.loads(addr)
+            except Exception:
+                addr = {}
+        if not isinstance(addr, dict):
+            addr = {}
+            
         return addr.get('zip') or addr.get('pincode') or addr.get('postal_code') or '—'
 
 

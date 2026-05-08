@@ -319,26 +319,15 @@ class OrderListView(generics.ListAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        user = self.request.user
-        if user.role == 'grower':
-            # For growers, return orders that contain their items
-            return Order.objects.filter(items__seller=user).distinct()
-        if user.is_staff or user.role == 'admin':
-            return Order.objects.all()
-        # For collectors, return their own orders
-        return Order.objects.filter(user=user)
+        # Return the user's own purchases only
+        return Order.objects.filter(user=self.request.user).order_by('-created_at')
 
 class OrderDetailView(generics.RetrieveAPIView):
     serializer_class = OrderSerializer
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        user = self.request.user
-        if user.role == 'grower':
-            return Order.objects.filter(items__seller=user).distinct()
-        if user.is_staff or user.role == 'admin':
-            return Order.objects.all()
-        return Order.objects.filter(user=user)
+        return Order.objects.filter(user=self.request.user)
 
 
 class SellerOrderListView(generics.ListAPIView):
