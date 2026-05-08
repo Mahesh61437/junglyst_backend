@@ -156,14 +156,15 @@ class CheckoutView(generics.GenericAPIView):
         subtotal = sum(float(item.variant.price) * item.quantity for item in cart_items)
         gst_total = sum(
             float(item.variant.price) * item.quantity *
-            float(item.product.categories.first().gst_percentage if item.product.categories.exists() else 0) / 100
+            (float(item.product.categories.first().gst_percentage) / (100 + float(item.product.categories.first().gst_percentage)))
+            if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
         total_shipping = sum(
             _shipping_fee_for_seller(b['subtotal'], b['has_heavy'])
             for b in seller_buckets.values()
         )
-        total_amount = subtotal + gst_total + total_shipping
+        total_amount = subtotal + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
         order_number = _generate_order_number()
@@ -196,7 +197,7 @@ class CheckoutView(generics.GenericAPIView):
                 subtotal=bucket['subtotal'],
                 shipping_fee=seller_shipping,
                 seller_total=bucket['subtotal'] + seller_shipping,
-                status='placed',
+                status='pending',
                 dispatch_deadline=dispatch_deadline,
             )
 
@@ -284,6 +285,8 @@ class VerifyPaymentView(generics.GenericAPIView):
                 # Notify each seller about their new sub-order (non-blocking bulk create)
                 seller_notifs = []
                 for sub in order.sub_orders.select_related('seller').all():
+                    sub.status = 'placed'
+                    sub.save()
                     item_count = sub.items.count()
                     seller_notifs.append(AppNotification(
                         user=sub.seller,
@@ -314,6 +317,29 @@ class VerifyPaymentView(generics.GenericAPIView):
         else:
             return Response({"error": "Invalid payment signature"}, status=400)
 
+class CancelOrderView(APIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request, pk):
+        try:
+            order = Order.objects.get(id=pk, user=request.user)
+        except Order.DoesNotExist:
+            return Response({'error': 'Order not found'}, status=404)
+
+        if order.status != 'pending':
+            return Response({'error': f'Cannot cancel order with status {order.status}'}, status=400)
+
+        order.status = 'cancelled'
+        order.payment_status = 'failed'
+        order.save()
+
+        # Cancel sub-orders
+        for sub in order.sub_orders.all():
+            sub.status = 'cancelled'
+            sub.save()
+
+        return Response({'message': 'Order cancelled successfully'})
+
 class OrderListView(generics.ListAPIView):
     serializer_class = OrderSerializer
     permission_classes = (permissions.IsAuthenticated,)
@@ -338,7 +364,7 @@ class SellerOrderListView(generics.ListAPIView):
     def get_queryset(self):
         return (
             Order.objects
-            .filter(items__seller=self.request.user)
+            .filter(items__seller=self.request.user, is_paid=True)
             .distinct()
             .prefetch_related('items', 'shipments')
             .order_by('-created_at')
@@ -351,7 +377,7 @@ class SellerSubOrderListView(generics.ListAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        qs = SubOrder.objects.filter(seller=self.request.user).select_related('order').prefetch_related('items')
+        qs = SubOrder.objects.filter(seller=self.request.user, order__is_paid=True).select_related('order').prefetch_related('items')
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)

@@ -48,6 +48,7 @@ class Order(SoftDeleteModel):
         return f"Order {self.order_number}"
 
 class SubOrderStatus(models.TextChoices):
+    PENDING = 'pending', _('Pending')
     PLACED = 'placed', _('Placed')
     CONFIRMED = 'confirmed', _('Confirmed')
     PACKING = 'packing', _('Packing')
@@ -67,7 +68,7 @@ class SubOrder(SoftDeleteModel):
     sub_order_number = models.CharField(max_length=30, unique=True)  # e.g. JNG-2026-00123-A
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sub_orders')
 
-    status = models.CharField(max_length=30, choices=SubOrderStatus.choices, default=SubOrderStatus.PLACED)
+    status = models.CharField(max_length=30, choices=SubOrderStatus.choices, default=SubOrderStatus.PENDING)
 
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)

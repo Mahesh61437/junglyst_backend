@@ -72,6 +72,7 @@ class ForgotPasswordView(generics.GenericAPIView):
             return Response({"error": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
+            print('-------------------')
             user = User.objects.get(email=email)
         except User.DoesNotExist:
             # Return success even if user doesn't exist for security reasons (prevent email enumeration)
@@ -79,6 +80,7 @@ class ForgotPasswordView(generics.GenericAPIView):
 
         # Generate OTP
         otp = str(random.randint(100000, 999999))
+        print(f"debug:generated otp {otp} for {email}")
         
         # Save to cache (valid for 10 minutes)
         cache_key = f"password_reset_otp_{email}"
