@@ -167,6 +167,11 @@ class ProductListView(generics.ListAPIView):
 
         return queryset
 
+    def paginate_queryset(self, queryset):
+        if self.request.query_params.get('no_pagination'):
+            return None
+        return super().paginate_queryset(queryset)
+
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
     permission_classes = (permissions.IsAuthenticatedOrReadOnly,)

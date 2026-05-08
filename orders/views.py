@@ -357,6 +357,11 @@ class SellerSubOrderListView(generics.ListAPIView):
             qs = qs.filter(status=status_filter)
         return qs.order_by('-created_at')
 
+    def paginate_queryset(self, queryset):
+        if self.request.query_params.get('no_pagination'):
+            return None
+        return super().paginate_queryset(queryset)
+
 
 class ConfirmSubOrderView(APIView):
     """Seller confirms a sub-order → status 'confirmed', starts 48h dispatch clock."""
