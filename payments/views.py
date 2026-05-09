@@ -9,6 +9,7 @@ from notifications.models import AppNotification
 from cart.models import Cart
 from cart.models import CartItem
 from orders.models import Order
+from orders.email_utils import send_order_confirmation_emails
 from .models import Payment
 from .cashfree_utils import verify_webhook_signature
 
@@ -114,6 +115,9 @@ class CashfreeWebhookView(APIView):
             if order.user:
                 Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
                 CartItem.objects.filter(cart__user=order.user).delete()
+
+            # Send confirmation emails to customer, admins, and sellers
+            send_order_confirmation_emails(order)
 
         except Payment.DoesNotExist:
             pass

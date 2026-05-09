@@ -30,7 +30,13 @@ def create_cashfree_order(order_id, order_amount, customer_details, order_curren
             "customer_name": customer_details.get("customer_name", "Guest User")
         },
         "order_meta": {
-            "return_url": "http://localhost:5173/payment-status?order_id={order_id}"
+            "return_url": "http://localhost:5173/payment-status?order_id={order_id}",
+            "payment_methods_filters": {
+                "methods": {
+                    "action": "ALLOW",
+                    "values": ["upi"]
+                }
+            }
         }
     }
     

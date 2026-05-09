@@ -17,6 +17,7 @@ from payments.models import Payment
 from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
 from .models import Order, OrderItem, SubOrder
 from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer
+from .email_utils import send_order_confirmation_emails
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -319,6 +320,9 @@ class VerifyPaymentView(generics.GenericAPIView):
                     Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
                     from cart.models import CartItem
                     CartItem.objects.filter(cart__user=order.user).delete()
+
+                # Send confirmation emails to customer, admins, and sellers
+                send_order_confirmation_emails(order)
 
                 return Response({"message": "Payment verified and order placed"}, status=200)
             except Payment.DoesNotExist:

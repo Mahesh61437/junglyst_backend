@@ -40,6 +40,7 @@ class Order(SoftDeleteModel):
     
     is_paid = models.BooleanField(default=False)
     payment_status = models.CharField(max_length=20, choices=PaymentStatus.choices, default=PaymentStatus.PENDING)
+    payment_gateway = models.CharField(max_length=20, blank=True, null=True)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
