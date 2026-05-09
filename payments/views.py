@@ -10,17 +10,20 @@ from cart.models import Cart
 from cart.models import CartItem
 from orders.models import Order
 from .models import Payment
-from .razorpay_utils import verify_webhook_signature
+from .cashfree_utils import verify_webhook_signature
 
 @method_decorator(csrf_exempt, name='dispatch')
-class RazorpayWebhookView(APIView):
+class CashfreeWebhookView(APIView):
     permission_classes = (AllowAny,)
 
     def post(self, request):
         body = request.body.decode('utf-8')
-        signature = request.headers.get('X-Razorpay-Signature')
+        signature = {
+            'x-webhook-timestamp': request.headers.get('x-webhook-timestamp', ''),
+            'x-webhook-signature': request.headers.get('x-webhook-signature', '')
+        }
 
-        if not signature:
+        if not signature['x-webhook-signature']:
             return HttpResponse("Missing signature", status=400)
 
         if not verify_webhook_signature(body, signature):
@@ -28,23 +31,23 @@ class RazorpayWebhookView(APIView):
 
         try:
             data = json.loads(body)
-            event = data.get('event')
-            payload = data.get('payload', {})
+            event = data.get('type')
+            payload = data.get('data', {})
 
-            if event == 'order.paid':
-                order_data = payload.get('order', {}).get('entity', {})
-                payment_data = payload.get('payment', {}).get('entity', {})
-                razorpay_order_id = order_data.get('id')
-                razorpay_payment_id = payment_data.get('id')
+            if event == 'PAYMENT_SUCCESS_WEBHOOK':
+                payment_data = payload.get('payment', {})
+                order_data = payload.get('order', {})
+                cashfree_order_id = order_data.get('order_id')
+                cashfree_payment_id = payment_data.get('cf_payment_id')
 
-                if razorpay_order_id:
-                    self.handle_order_paid(razorpay_order_id, razorpay_payment_id, payment_data)
+                if cashfree_order_id:
+                    self.handle_order_paid(cashfree_order_id, cashfree_payment_id, payment_data)
 
-            elif event == 'payment.failed':
-                payment_data = payload.get('payment', {}).get('entity', {})
-                razorpay_order_id = payment_data.get('order_id')
-                if razorpay_order_id:
-                    self.handle_payment_failed(razorpay_order_id)
+            elif event == 'PAYMENT_FAILED_WEBHOOK':
+                order_data = payload.get('order', {})
+                cashfree_order_id = order_data.get('order_id')
+                if cashfree_order_id:
+                    self.handle_payment_failed(cashfree_order_id)
 
         except Exception as e:
             print(f"Webhook processing error: {e}")
@@ -52,15 +55,14 @@ class RazorpayWebhookView(APIView):
 
         return HttpResponse("OK", status=200)
 
-    def handle_order_paid(self, razorpay_order_id, razorpay_payment_id, payment_data):
+    def handle_order_paid(self, cashfree_order_id, cashfree_payment_id, payment_data):
         try:
-            payment = Payment.objects.get(razorpay_order_id=razorpay_order_id)
+            payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
             if payment.status == 'captured':
-                return # Already processed by frontend handler
+                return
                 
             order = payment.order
             
-            # Reduce stock
             insufficient_items = []
             for item in order.items.all():
                 if item.variant and item.variant.stock < item.quantity:
@@ -72,8 +74,8 @@ class RazorpayWebhookView(APIView):
                 order.save()
                 return
 
-            payment.razorpay_payment_id = razorpay_payment_id
-            payment.method = payment_data.get('method', '')
+            payment.cashfree_payment_id = cashfree_payment_id
+            payment.method = payment_data.get('payment_group', '')
             payment.status = 'captured'
             payment.save()
             
@@ -82,7 +84,6 @@ class RazorpayWebhookView(APIView):
             order.status = 'placed'
             order.save()
             
-            # Notify buyer
             if order.user:
                 AppNotification.objects.create(
                     user=order.user,
@@ -90,7 +91,6 @@ class RazorpayWebhookView(APIView):
                     message=f"Your order {order.order_number} has been successfully placed and is being prepared."
                 )
 
-            # Notify each seller
             seller_notifs = []
             for sub in order.sub_orders.select_related('seller').all():
                 item_count = sub.items.count()
@@ -118,9 +118,9 @@ class RazorpayWebhookView(APIView):
         except Payment.DoesNotExist:
             pass
 
-    def handle_payment_failed(self, razorpay_order_id):
+    def handle_payment_failed(self, cashfree_order_id):
         try:
-            payment = Payment.objects.get(razorpay_order_id=razorpay_order_id)
+            payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
             if payment.status != 'captured':
                 payment.status = 'failed'
                 payment.save()

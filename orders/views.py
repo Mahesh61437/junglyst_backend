@@ -14,7 +14,7 @@ from shipping.serializers import ShippingAddressSerializer
 from shipping.pincode_zones import classify_pincode
 from notifications.models import AppNotification
 from payments.models import Payment
-from payments.razorpay_utils import create_razorpay_order, verify_payment_signature
+from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
 from .models import Order, OrderItem, SubOrder
 from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer
 
@@ -216,22 +216,33 @@ class CheckoutView(generics.GenericAPIView):
                     seller=bucket['seller'],
                 )
 
-        # Razorpay
+        # Cashfree
         try:
-            razorpay_order = create_razorpay_order(int(total_amount * 100))
+            cashfree_order = create_cashfree_order(
+                order_id=order.order_number,
+                order_amount=float(total_amount),
+                customer_details={
+                    "customer_id": str(request.user.id) if request.user.is_authenticated else "guest",
+                    "customer_email": email or "guest@example.com",
+                    "customer_phone": str(phone) if phone else "9999999999",
+                    "customer_name": request.user.get_full_name() if request.user.is_authenticated else "Guest User"
+                }
+            )
             Payment.objects.create(
                 order=order,
-                razorpay_order_id=razorpay_order['id'],
+                cashfree_order_id=cashfree_order['order_id'],
+                cashfree_session_id=cashfree_order['payment_session_id'],
                 amount=total_amount,
             )
             return Response({
                 "order": OrderSerializer(order).data,
-                "razorpay_order_id": razorpay_order['id'],
+                "payment_session_id": cashfree_order['payment_session_id'],
+                "cashfree_order_id": cashfree_order['order_id'],
                 "amount": total_amount,
                 "currency": "INR",
             }, status=201)
         except Exception as e:
-            print(f"DEBUG: Razorpay failed: {str(e)}")
+            print(f"DEBUG: Cashfree failed: {str(e)}")
             return Response({
                 "error": f"Failed to initialize payment gateway: {str(e)}"
             }, status=400)
@@ -240,13 +251,12 @@ class VerifyPaymentView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
 
     def post(self, request):
-        razorpay_order_id = request.data.get('razorpay_order_id')
-        razorpay_payment_id = request.data.get('razorpay_payment_id')
-        razorpay_signature = request.data.get('razorpay_signature')
+        cashfree_order_id = request.data.get('cashfree_order_id')
         
-        if verify_payment_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature):
+        is_verified, cf_payment_id = verify_cashfree_payment(cashfree_order_id)
+        if is_verified:
             try:
-                payment = Payment.objects.get(razorpay_order_id=razorpay_order_id)
+                payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
                 order = payment.order
                 
                 # Final Stock Check before capture
@@ -264,8 +274,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                         "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
                     }, status=400)
 
-                payment.razorpay_payment_id = razorpay_payment_id
-                payment.razorpay_signature = razorpay_signature
+                payment.cashfree_payment_id = cf_payment_id
                 payment.status = 'captured'
                 payment.save()
                 
