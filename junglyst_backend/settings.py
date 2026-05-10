@@ -299,10 +299,9 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'shipping.tasks.sync_all_shipment_statuses',
         'schedule': 3600.0,  # every hour
     },
-    'reconcile-pending-payments': {
-        'task': 'payments.tasks.reconcile_pending_payments',
-        'schedule': 3600.0,  # every hour
-    },
+    # Payment reconciliation is on-demand (not periodic).
+    # 4 delayed checks are scheduled per-payment at checkout time.
+    # See payments.tasks.schedule_payment_checks()
 }
 
 # Static & Media Files

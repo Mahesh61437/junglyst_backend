@@ -23,8 +23,47 @@ class Payment(SoftDeleteModel):
     method = models.CharField(max_length=50, blank=True, null=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     status = models.CharField(max_length=20, default='created')
+
+    # ── Complaint / dispute tracking fields ──────────────────────────────
+
+    # Bank reference number (UPI UTR / NEFT ref / IMPS ref)
+    # This is the proof customers cite when saying "money debited but order not placed"
+    bank_reference = models.CharField(
+        max_length=100, blank=True, null=True,
+        help_text="UPI UTR / NEFT reference number from bank."
+    )
+
+    # Raw gateway status (e.g. 'SUCCESS', 'FAILED', 'USER_DROPPED', 'PENDING')
+    # Separate from our internal `status` field — helps debug mismatches
+    gateway_status = models.CharField(
+        max_length=50, blank=True, null=True,
+        help_text="Raw payment status from the gateway API."
+    )
+
+    # Error details — why a payment failed
+    error_code = models.CharField(max_length=100, blank=True, null=True)
+    error_message = models.TextField(blank=True, null=True)
+
+    # Full gateway response (for investigating disputes / chargebacks)
+    gateway_response = models.JSONField(
+        blank=True, null=True,
+        help_text="Full raw JSON response from the gateway (for dispute investigation)."
+    )
+
+    # Timestamps for status transitions
+    paid_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When the payment was confirmed as captured."
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Payment {self.id} | {self.gateway} | {self.status} | ₹{self.amount}"
 
 
 class PaymentGatewaySettings(models.Model):

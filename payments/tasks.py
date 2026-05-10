@@ -1,51 +1,123 @@
 """
 payments/tasks.py
 
-Periodic reconciliation for stuck / in-flight payments.
+On-demand payment reconciliation using django-celery-beat PeriodicTask.
 
-Design principles:
-  1. NEVER expire a payment based on age alone — only expire when the
-     gateway EXPLICITLY says the payment failed/cancelled.
-  2. Keep checking until we get a definitive gateway response OR
-     until HARD_EXPIRE_HOURS (24h) — this covers UPI late settlements.
-  3. Once expired by reconcile (no explicit failure — just timeout),
-     the Cashfree webhook can still revive it if the bank settles late
-     (handle_order_paid in views.py skips 'captured' but processes 'failed').
+When a Payment is created at checkout, we create 4 ClockedSchedule entries
+in the database, each linked to a PeriodicTask that fires ONCE:
 
-Runs every hour via Celery Beat. Cashfree webhook handles real-time success;
-this task is the safety net for network drops, browser kills, etc.
+    T+15min  → check_payment_status(payment_id)
+    T+30min  → check_payment_status(payment_id)
+    T+1hr    → check_payment_status(payment_id)
+    T+24hr   → check_payment_status(payment_id)
 
-Razorpay does NOT have a webhook in this setup — this task is the only
-safety net for Razorpay late settlements.
+Advantages over apply_async(countdown=...):
+  - Tasks are visible in Django Admin (Periodic Tasks section)
+  - They can be filtered by payment ID, disabled, or deleted
+  - When a payment is resolved, cancel_payment_checks() deletes all
+    remaining tasks — they never execute at all (not even briefly)
+  - Survives worker restarts (persisted in DB, not in-memory)
 """
 
+import json
 import logging
 from datetime import timedelta
 
 from celery import shared_task
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-# Give UPI at least 10 min before first check (most resolve in < 60s, but
-# bank processing can take longer)
-MIN_AGE_MINUTES = 10
+# Delays for the 4 scheduled checks
+RECONCILE_CHECKS = [
+    (15,    '15min'),
+    (30,    '30min'),
+    (60,    '1hr'),
+    (1440,  '24hr'),   # 24 * 60
+]
 
-# Hard-expire after 24 hours — no bank will settle a UPI after this
-HARD_EXPIRE_HOURS = 24
+TASK_NAME_PREFIX = 'payment-check'
 
 
-# ── Cashfree: get definitive payment status ──────────────────────────────────
+def _task_name(payment_id, label):
+    """Generate a unique, filterable name for a scheduled task."""
+    return f"{TASK_NAME_PREFIX}-{payment_id}-{label}"
+
+
+# ── Schedule / Cancel helpers ────────────────────────────────────────────────
+
+def schedule_payment_checks(payment_id):
+    """
+    Create 4 one-shot PeriodicTask entries in django-celery-beat.
+    Call this right after Payment.objects.create() in the checkout view.
+
+    Each task uses ClockedSchedule (fires once at a specific datetime).
+    """
+    from django_celery_beat.models import ClockedSchedule, PeriodicTask
+
+    now = timezone.now()
+
+    for delay_minutes, label in RECONCILE_CHECKS:
+        fire_at = now + timedelta(minutes=delay_minutes)
+
+        clocked, _ = ClockedSchedule.objects.get_or_create(
+            clocked_time=fire_at,
+        )
+
+        task_name = _task_name(payment_id, label)
+
+        # Avoid duplicates if checkout is retried
+        PeriodicTask.objects.update_or_create(
+            name=task_name,
+            defaults={
+                'task': 'payments.tasks.check_payment_status',
+                'clocked': clocked,
+                'one_off': True,       # auto-disables after first run
+                'enabled': True,
+                'args': json.dumps([payment_id]),
+                'kwargs': json.dumps({'label': label}),
+            },
+        )
+
+    logger.info(
+        "Scheduled %d reconcile checks for payment %s (at %s)",
+        len(RECONCILE_CHECKS), payment_id,
+        ", ".join(label for _, label in RECONCILE_CHECKS),
+    )
+
+
+def cancel_payment_checks(payment_id):
+    """
+    Delete all remaining scheduled tasks for a resolved payment.
+    Call this after a payment is captured or gateway-confirmed failed.
+    """
+    from django_celery_beat.models import PeriodicTask
+
+    prefix = f"{TASK_NAME_PREFIX}-{payment_id}-"
+    deleted_count, _ = PeriodicTask.objects.filter(
+        name__startswith=prefix,
+        enabled=True,
+    ).delete()
+
+    if deleted_count:
+        logger.info(
+            "Cancelled %d remaining scheduled checks for payment %s",
+            deleted_count, payment_id,
+        )
+
+
+# ── Gateway status helpers ───────────────────────────────────────────────────
 
 def _cashfree_gateway_status(payment):
     """
     Query Cashfree payments list endpoint for a definitive status.
 
     Returns:
-      ('captured', cf_payment_id)  — bank confirmed SUCCESS
-      ('failed',   None)           — bank confirmed FAILURE/CANCELLED
-      ('pending',  None)           — still in-flight; check again next run
+      ('captured', cf_payment_id, payment_data)  — bank confirmed SUCCESS
+      ('failed',   None,          payment_data)   — bank confirmed FAILURE
+      ('pending',  None,          None)            — still in-flight
     """
     import requests as req
     from payments.cashfree_utils import get_cashfree_url, get_cashfree_headers
@@ -57,36 +129,33 @@ def _cashfree_gateway_status(payment):
         r = req.get(url, headers=get_cashfree_headers(), timeout=15)
         if r.status_code != 200:
             logger.warning(
-                "Cashfree payments fetch %s: HTTP %s", payment.cashfree_order_id, r.status_code
+                "Cashfree payments fetch %s: HTTP %s",
+                payment.cashfree_order_id, r.status_code,
             )
-            return 'pending', None
+            return 'pending', None, None
 
         payments_list = r.json() if isinstance(r.json(), list) else []
         for p in payments_list:
             pstatus = (p.get("payment_status") or "").upper()
             if pstatus == "SUCCESS":
-                return 'captured', p.get("cf_payment_id")
+                return 'captured', p.get("cf_payment_id"), p
             if pstatus in FINAL_FAILED:
-                return 'failed', None
-            # PENDING / PROCESSING → keep polling
+                return 'failed', None, p
 
-        # No payment attempt recorded yet at Cashfree level
-        return 'pending', None
+        return 'pending', None, None
 
     except Exception as exc:
         logger.warning(
-            "Cashfree reconcile error for %s: %s", payment.cashfree_order_id, exc
+            "Cashfree reconcile error for %s: %s",
+            payment.cashfree_order_id, exc,
         )
-        return 'pending', None
+        return 'pending', None, None
 
-
-# ── Razorpay: get definitive payment status ──────────────────────────────────
 
 def _razorpay_gateway_status(payment):
     """
     Query Razorpay orders/{id}/payments for a definitive status.
-
-    Returns same tuple as _cashfree_gateway_status.
+    Returns same tuple shape as _cashfree_gateway_status.
     """
     import requests as req
     from payments.razorpay_utils import _auth
@@ -99,36 +168,35 @@ def _razorpay_gateway_status(payment):
         r = req.get(url, auth=(key_id, key_secret), timeout=15)
         if r.status_code != 200:
             logger.warning(
-                "Razorpay payments fetch %s: HTTP %s", payment.razorpay_order_id, r.status_code
+                "Razorpay payments fetch %s: HTTP %s",
+                payment.razorpay_order_id, r.status_code,
             )
-            return 'pending', None
+            return 'pending', None, None
 
         for p in r.json().get('items', []):
             pstatus = p.get('status', '').lower()
             if pstatus == 'captured':
-                return 'captured', p.get('id')
+                return 'captured', p.get('id'), p
             if pstatus in FINAL_FAILED:
-                return 'failed', None
-            # 'created' / 'authorized' → still in-flight
+                return 'failed', None, p
 
-        return 'pending', None
+        return 'pending', None, None
 
     except Exception as exc:
         logger.warning(
-            "Razorpay reconcile error for %s: %s", payment.razorpay_order_id, exc
+            "Razorpay reconcile error for %s: %s",
+            payment.razorpay_order_id, exc,
         )
-        return 'pending', None
+        return 'pending', None, None
 
 
 # ── Shared capture helper ────────────────────────────────────────────────────
 
 @transaction.atomic
-def _capture_payment(payment, gateway_payment_id=None):
+def _capture_payment(payment, gateway_payment_id=None, gateway_data=None):
     """
     Mark payment + order as captured; deduct stock; notify buyer.
-    Safe to call multiple times — idempotent on payment.status == 'captured'.
-    Also handles the case where the order was previously marked 'failed'
-    by an earlier (premature) expiry: resets it to 'placed'.
+    Idempotent — safe to call multiple times.
     """
     from cart.models import Cart, CartItem
     from notifications.models import AppNotification
@@ -136,26 +204,32 @@ def _capture_payment(payment, gateway_payment_id=None):
 
     order = payment.order
 
-    # Strict idempotency — never double-capture
+    # Already captured → nothing to do
     if payment.status == 'captured':
         logger.info("_capture_payment: payment %s already captured, skipping.", payment.id)
         return
 
     # Final stock check
-    insufficient = [
-        item.product_name
-        for item in order.items.all()
-        if item.variant and item.variant.stock < item.quantity
-    ]
+    insufficient = []
+    for item in order.items.select_related('variant').all():
+        if item.variant:
+            variant = item.variant.__class__.objects.select_for_update().get(pk=item.variant.pk)
+            if variant.stock < item.quantity:
+                insufficient.append(item.product_name)
+
     if insufficient:
         payment.status = 'failed'
-        payment.save(update_fields=['status'])
+        payment.error_message = f"Stock mismatch: {', '.join(insufficient)}"
+        payment.save(update_fields=['status', 'error_message'])
         order.status = 'failed'
         order.payment_status = 'failed'
         order.save(update_fields=['status', 'payment_status', 'updated_at'])
         logger.error(
-            "Reconcile: stock mismatch for order %s — %s", order.order_number, insufficient
+            "Reconcile: stock mismatch for order %s — %s",
+            order.order_number, insufficient,
         )
+        # Cancel remaining checks — payment is resolved (failed)
+        cancel_payment_checks(payment.id)
         return
 
     # Write gateway payment ID
@@ -165,7 +239,18 @@ def _capture_payment(payment, gateway_payment_id=None):
         else:
             payment.razorpay_payment_id = gateway_payment_id
 
+    # Store gateway response for dispute tracking
+    if gateway_data:
+        payment.gateway_response = gateway_data
+        payment.bank_reference = (
+            gateway_data.get('bank_reference', '')
+            or gateway_data.get('utr', '')
+            or gateway_data.get('acquirer_data', {}).get('upi_transaction_id', '')
+        )
+
     payment.status = 'captured'
+    payment.gateway_status = 'SUCCESS' if payment.gateway == 'cashfree' else 'captured'
+    payment.paid_at = timezone.now()
     payment.save()
 
     # Reset order — may have been prematurely marked 'failed'
@@ -174,16 +259,18 @@ def _capture_payment(payment, gateway_payment_id=None):
     order.status = 'placed'
     order.save()
 
-    # Deduct stock
-    for item in order.items.all():
+    # Deduct stock atomically
+    for item in order.items.select_related('variant').all():
         if item.variant:
-            item.variant.stock -= item.quantity
-            item.variant.save()
+            item.variant.__class__.objects.filter(pk=item.variant.pk).update(
+                stock=F('stock') - item.quantity
+            )
 
     # Mark sub-orders as placed
     for sub in order.sub_orders.all():
-        sub.status = 'placed'
-        sub.save(update_fields=['status', 'updated_at'])
+        if sub.status not in ('placed', 'confirmed', 'shipped', 'delivered'):
+            sub.status = 'placed'
+            sub.save(update_fields=['status', 'updated_at'])
 
     # Clear buyer cart
     if order.user:
@@ -201,121 +288,125 @@ def _capture_payment(payment, gateway_payment_id=None):
             ),
         )
 
+    order_number = order.order_number
+
     try:
         send_order_confirmation_emails(order)
     except Exception as exc:
         logger.error(
-            "Reconcile: email failed for order %s: %s", order.order_number, exc
+            "Reconcile: email failed for order %s: %s", order_number, exc
         )
 
-    logger.info("Reconcile: captured order %s via %s", order.order_number, payment.gateway)
+    logger.info("Reconcile: captured order %s via %s", order_number, payment.gateway)
+
+    # Cancel remaining scheduled checks — payment is done
+    cancel_payment_checks(payment.id)
 
 
-# ── Main reconciliation task ─────────────────────────────────────────────────
+# ── Main on-demand reconcile task ────────────────────────────────────────────
 
-@shared_task(name='payments.tasks.reconcile_pending_payments')
-def reconcile_pending_payments():
+@shared_task(
+    name='payments.tasks.check_payment_status',
+    bind=True,
+    max_retries=0,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def check_payment_status(self, payment_id, label=''):
     """
-    Runs every hour via Celery Beat.
+    Check the status of a single payment against the gateway API.
 
-    Checks ALL payments still in 'created' status that are older than
-    MIN_AGE_MINUTES. No upper age cap — we keep checking until the
-    gateway gives a definitive answer or HARD_EXPIRE_HOURS is reached.
+    Scheduled via django-celery-beat ClockedSchedule at:
+      T+15min, T+30min, T+1hr, T+24hr
 
-    Decision tree per payment:
-      gateway → SUCCESS        : capture (works even if previously marked 'failed')
-      gateway → explicit FAIL  : mark failed (if not already)
-      gateway → PENDING/unknown: leave as 'created'; check next run
-      age > HARD_EXPIRE_HOURS  : hard-expire (no bank settles after 24h)
+    Each invocation:
+      1. Checks if payment is already resolved → exits + cancels remaining tasks
+      2. If still pending → queries gateway API
+      3. If captured/failed → processes + cancels remaining tasks
+      4. If still pending at 24hr → hard-expires + cancels remaining tasks
     """
     from payments.models import Payment
 
-    now = timezone.now()
-    min_age_cutoff = now - timedelta(minutes=MIN_AGE_MINUTES)
-    hard_expire_cutoff = now - timedelta(hours=HARD_EXPIRE_HOURS)
+    HARD_EXPIRE_SECONDS = 86400  # 24 hours
 
-    # Include 'failed' status too — Cashfree can still succeed after we
-    # prematurely expire (bank settles late). Re-check anything not 'captured'.
-    stale_payments = Payment.objects.filter(
-        status__in=['created', 'failed'],
-        created_at__lte=min_age_cutoff,
-        created_at__gte=hard_expire_cutoff,  # don't query payments older than 24h
-    ).exclude(
-        status='failed',
-        order__payment_status='failed',
-        order__status='failed',
-    ).select_related('order')
-    # ^ For 'failed' payments, only re-check if the gateway might still
-    #   succeed — exclude ones where we got an explicit failure webhook.
-    #   (We distinguish by checking if both payment + order are 'failed'.)
+    try:
+        payment = Payment.objects.select_related('order').get(id=payment_id)
+    except Payment.DoesNotExist:
+        logger.warning("check_payment_status[%s]: payment %s not found.", label, payment_id)
+        cancel_payment_checks(payment_id)
+        return f"Payment {payment_id} not found."
 
-    total = stale_payments.count()
-    if not total:
-        logger.info("Reconcile: no stale payments to check.")
-        return "No stale payments to reconcile."
+    # ── Fast exit: already resolved → cancel remaining tasks ────────────
+    if payment.status == 'captured':
+        logger.info("check_payment_status[%s]: payment %s already captured.", label, payment_id)
+        cancel_payment_checks(payment_id)
+        return f"Payment {payment_id} already captured — cancelled remaining checks."
 
-    logger.info("Reconcile: checking %d payment(s).", total)
-    captured = expired = skipped = 0
+    if (payment.status == 'failed'
+            and payment.order.status == 'failed'
+            and payment.gateway_status in ('FAILED', 'CANCELLED', 'VOID')):
+        logger.info("check_payment_status[%s]: payment %s already gateway-failed.", label, payment_id)
+        cancel_payment_checks(payment_id)
+        return f"Payment {payment_id} already failed — cancelled remaining checks."
 
-    for payment in stale_payments:
-        try:
-            # ── Get gateway status ────────────────────────────────────────
-            if payment.gateway == 'cashfree' and payment.cashfree_order_id:
-                result, gw_id = _cashfree_gateway_status(payment)
-            elif payment.gateway == 'razorpay' and payment.razorpay_order_id:
-                result, gw_id = _razorpay_gateway_status(payment)
-            else:
-                logger.warning("Reconcile: payment %s has no gateway ID, skipping.", payment.id)
-                skipped += 1
-                continue
+    # ── Query the gateway API ───────────────────────────────────────────
+    if payment.gateway == 'cashfree' and payment.cashfree_order_id:
+        result, gw_id, gw_data = _cashfree_gateway_status(payment)
+    elif payment.gateway == 'razorpay' and payment.razorpay_order_id:
+        result, gw_id, gw_data = _razorpay_gateway_status(payment)
+    else:
+        logger.warning("check_payment_status[%s]: payment %s has no gateway ID.", label, payment_id)
+        return f"Payment {payment_id} has no gateway ID."
 
-            # ── Handle result ─────────────────────────────────────────────
-            if result == 'captured':
-                _capture_payment(payment, gw_id)
-                captured += 1
+    # ── Handle result ───────────────────────────────────────────────────
+    if result == 'captured':
+        _capture_payment(payment, gw_id, gw_data)
+        # cancel_payment_checks is called inside _capture_payment
+        return f"Payment {payment_id} captured at {label} check."
 
-            elif result == 'failed':
-                if payment.status != 'failed':
-                    with transaction.atomic():
-                        payment.status = 'failed'
-                        payment.save(update_fields=['status'])
-                        order = payment.order
-                        # Don't overwrite a placed order (webhook may have captured it)
-                        if order.status not in ('placed', 'shipped', 'delivered'):
-                            order.status = 'failed'
-                            order.payment_status = 'failed'
-                            order.save(update_fields=['status', 'payment_status', 'updated_at'])
-                    logger.info(
-                        "Reconcile: gateway-confirmed failure for order %s (%s)",
-                        payment.order.order_number, payment.gateway
-                    )
-                expired += 1
+    if result == 'failed':
+        with transaction.atomic():
+            payment.status = 'failed'
+            payment.gateway_status = (gw_data or {}).get('payment_status', 'FAILED')
+            error_details = (gw_data or {}).get('error_details') or {}
+            payment.error_code = error_details.get('error_code', '')
+            payment.error_message = error_details.get('error_description', '')
+            payment.gateway_response = gw_data
+            payment.save()
+            order = payment.order
+            if order.status not in ('placed', 'shipped', 'delivered'):
+                order.status = 'failed'
+                order.payment_status = 'failed'
+                order.save(update_fields=['status', 'payment_status', 'updated_at'])
+        cancel_payment_checks(payment_id)
+        logger.info(
+            "check_payment_status[%s]: gateway failure for payment %s (order %s)",
+            label, payment_id, payment.order.order_number,
+        )
+        return f"Payment {payment_id} failed at {label} check — cancelled remaining."
 
-            else:
-                # Still pending at gateway — check if we've hit the hard limit
-                age = now - payment.created_at
-                if age >= timedelta(hours=HARD_EXPIRE_HOURS):
-                    with transaction.atomic():
-                        payment.status = 'failed'
-                        payment.save(update_fields=['status'])
-                        order = payment.order
-                        if order.status not in ('placed', 'shipped', 'delivered'):
-                            order.status = 'failed'
-                            order.payment_status = 'failed'
-                            order.save(update_fields=['status', 'payment_status', 'updated_at'])
-                    logger.warning(
-                        "Reconcile: hard-expired order %s after %dh (no gateway response)",
-                        payment.order.order_number, HARD_EXPIRE_HOURS
-                    )
-                    expired += 1
-                else:
-                    # Still within window — leave for next run
-                    skipped += 1
+    # ── Still pending — hard-expire if 24h reached ──────────────────────
+    age_seconds = (timezone.now() - payment.created_at).total_seconds()
+    if age_seconds >= HARD_EXPIRE_SECONDS:
+        with transaction.atomic():
+            payment.status = 'failed'
+            payment.error_message = 'Hard-expired after 24 hours — no gateway response.'
+            payment.save(update_fields=['status', 'error_message'])
+            order = payment.order
+            if order.status not in ('placed', 'shipped', 'delivered'):
+                order.status = 'failed'
+                order.payment_status = 'failed'
+                order.save(update_fields=['status', 'payment_status', 'updated_at'])
+        cancel_payment_checks(payment_id)
+        logger.warning(
+            "check_payment_status[%s]: hard-expired payment %s (order %s).",
+            label, payment_id, payment.order.order_number,
+        )
+        return f"Payment {payment_id} hard-expired at {label} check."
 
-        except Exception as exc:
-            logger.error("Reconcile: unhandled error for payment %s: %s", payment.id, exc)
-            skipped += 1
-
-    summary = f"Reconcile complete: {captured} captured, {expired} expired, {skipped} still pending."
-    logger.info(summary)
-    return summary
+    # Still within window — next scheduled check will handle it
+    logger.info(
+        "check_payment_status[%s]: payment %s still pending (age=%dm).",
+        label, payment_id, int(age_seconds // 60),
+    )
+    return f"Payment {payment_id} still pending at {label} check (age={int(age_seconds // 60)}min)."

@@ -234,13 +234,19 @@ class CheckoutView(generics.GenericAPIView):
                         "customer_name": request.user.get_full_name() if request.user.is_authenticated else "Guest User"
                     }
                 )
-                Payment.objects.create(
+                payment = Payment.objects.create(
                     order=order,
                     gateway=PaymentGateway.CASHFREE,
                     cashfree_order_id=cashfree_order['order_id'],
                     cashfree_session_id=cashfree_order['payment_session_id'],
                     amount=total_amount,
                 )
+                # Schedule delayed reconciliation checks at 15min, 30min, 1hr, 24hr
+                try:
+                    from payments.tasks import schedule_payment_checks
+                    schedule_payment_checks(payment.id)
+                except Exception:
+                    pass  # Don't block checkout if Celery is down
                 return Response({
                     "gateway": PaymentGateway.CASHFREE,
                     "order": OrderSerializer(order).data,
@@ -262,12 +268,18 @@ class CheckoutView(generics.GenericAPIView):
                 amount_inr=float(total_amount),
                 currency="INR",
             )
-            Payment.objects.create(
+            payment = Payment.objects.create(
                 order=order,
                 gateway=PaymentGateway.RAZORPAY,
                 razorpay_order_id=rzp_order["id"],
                 amount=total_amount,
             )
+            # Schedule delayed reconciliation checks at 15min, 30min, 1hr, 24hr
+            try:
+                from payments.tasks import schedule_payment_checks
+                schedule_payment_checks(payment.id)
+            except Exception:
+                pass  # Don't block checkout if Celery is down
             from django.conf import settings
             return Response({
                 "gateway": PaymentGateway.RAZORPAY,
@@ -325,6 +337,25 @@ class VerifyPaymentView(generics.GenericAPIView):
                 payment.razorpay_payment_id = razorpay_payment_id
                 payment.razorpay_signature = razorpay_signature
                 payment.status = 'captured'
+                payment.gateway_status = 'captured'
+                payment.paid_at = timezone.now()
+                # Fetch payment details from Razorpay for method & bank reference
+                try:
+                    import requests as req
+                    from payments.razorpay_utils import _auth
+                    key_id, key_secret = _auth()
+                    rzp_resp = req.get(
+                        f'https://api.razorpay.com/v1/payments/{razorpay_payment_id}',
+                        auth=(key_id, key_secret), timeout=10,
+                    ).json()
+                    payment.method = rzp_resp.get('method', '')
+                    payment.bank_reference = (
+                        rzp_resp.get('acquirer_data', {}).get('upi_transaction_id', '')
+                        or rzp_resp.get('acquirer_data', {}).get('bank_transaction_id', '')
+                    )
+                    payment.gateway_response = rzp_resp
+                except Exception:
+                    pass  # Don't block capture if detail fetch fails
                 payment.save()
                 
                 order.is_paid = True
@@ -381,7 +412,7 @@ class VerifyPaymentView(generics.GenericAPIView):
         cashfree_order_id = request.data.get('cashfree_order_id')
         if not cashfree_order_id:
             return Response({"error": "cashfree_order_id is required"}, status=400)
-        is_verified, cf_payment_id = verify_cashfree_payment(cashfree_order_id)
+        is_verified, cf_payment_id, cf_payment_data = verify_cashfree_payment(cashfree_order_id)
         if is_verified:
             try:
                 payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
@@ -396,7 +427,6 @@ class VerifyPaymentView(generics.GenericAPIView):
                         insufficient_items.append(item.product_name)
                 
                 if insufficient_items:
-                    # In a real scenario, we would trigger a refund here
                     order.status = 'failed'
                     order.payment_status = 'failed'
                     order.save()
@@ -407,6 +437,16 @@ class VerifyPaymentView(generics.GenericAPIView):
                 payment.gateway = PaymentGateway.CASHFREE
                 payment.cashfree_payment_id = cf_payment_id
                 payment.status = 'captured'
+                payment.gateway_status = 'SUCCESS'
+                payment.paid_at = timezone.now()
+                # Capture method & bank reference from gateway response
+                if cf_payment_data:
+                    payment.method = cf_payment_data.get('payment_group', '')
+                    payment.bank_reference = (
+                        cf_payment_data.get('bank_reference', '')
+                        or cf_payment_data.get('utr', '')
+                    )
+                    payment.gateway_response = cf_payment_data
                 payment.save()
                 
                 order.is_paid = True
@@ -523,7 +563,7 @@ class PaymentStatusView(APIView):
 
             # Query Cashfree API for real-time status
             try:
-                is_paid, cf_payment_id = verify_cashfree_payment(cashfree_order_id)
+                is_paid, cf_payment_id, cf_payment_data = verify_cashfree_payment(cashfree_order_id)
             except Exception:
                 # Gateway unreachable → tell frontend to keep polling
                 return Response({"status": "processing"})
@@ -532,8 +572,7 @@ class PaymentStatusView(APIView):
                 # Capture immediately (don't wait for reconcile task)
                 try:
                     from payments.tasks import _capture_payment
-                    payment.cashfree_payment_id = cf_payment_id
-                    _capture_payment(payment, cf_payment_id)
+                    _capture_payment(payment, cf_payment_id, cf_payment_data)
                 except Exception:
                     pass  # reconcile task will catch it
                 return Response({

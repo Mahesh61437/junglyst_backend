@@ -20,6 +20,7 @@ def create_cashfree_order(order_id, order_amount, customer_details, order_curren
     headers = get_cashfree_headers()
     
     frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173')
+    backend_url = getattr(settings, 'BACKEND_URL', 'http://localhost:8000')
     
     payload = {
         "order_id": order_id,
@@ -33,6 +34,7 @@ def create_cashfree_order(order_id, order_amount, customer_details, order_curren
         },
         "order_meta": {
             "return_url": f"{frontend_url}/payment-status?order_id={order_id}",
+            "notify_url": f"{backend_url}/api/payments/webhook/cashfree/",
             "payment_methods_filters": {
                 "methods": {
                     "action": "ALLOW",
@@ -42,23 +44,29 @@ def create_cashfree_order(order_id, order_amount, customer_details, order_curren
         }
     }
     
-    response = requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json=payload, headers=headers, timeout=25)
     if response.status_code == 200:
         return response.json()
     else:
         raise Exception(f"Cashfree order creation failed: {response.text}")
 
 def verify_cashfree_payment(order_id):
+    """
+    Returns (is_verified, cf_payment_id, payment_data) tuple.
+    payment_data contains bank_reference, payment_group, utr etc.
+    """
     url = f"{get_cashfree_url()}/{order_id}/payments"
     headers = get_cashfree_headers()
     
-    response = requests.get(url, headers=headers)
+    response = requests.get(url, headers=headers, timeout=20)
     if response.status_code == 200:
         payments = response.json()
         for payment in payments:
             if payment.get("payment_status") == "SUCCESS":
-                return True, payment.get("cf_payment_id")
-    return False, None
+                return True, payment.get("cf_payment_id"), payment
+            elif payment.get("payment_status") in ("FAILED", "CANCELLED", "VOID"):
+                return False, None, payment
+    return False, None, None
 
 def verify_webhook_signature(payload_body, signature):
     """
@@ -86,7 +94,7 @@ def verify_webhook_signature(payload_body, signature):
     secret = settings.CASHFREE_SECRET_KEY.encode('utf-8')
 
     expected_signature = base64.b64encode(
-        hmac.new(secret, data.encode('utf-8'), hashlib.sha256).digest()
+        hmac.digest(secret, data.encode('utf-8'), 'sha256')
     ).decode('utf-8')
 
     return hmac.compare_digest(expected_signature, actual_signature)
