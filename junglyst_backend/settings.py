@@ -361,6 +361,8 @@ ENABLE_PAYMENTS = config('ENABLE_PAYMENTS', default=False, cast=bool)
 RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID', default='')
 RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET', default='')
 
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
+
 NIMBUSPOST_EMAIL = config('NIMBUSPOST_EMAIL', default='')
 NIMBUSPOST_PASSWORD = config('NIMBUSPOST_PASSWORD', default='')
 NIMBUSPOST_WAREHOUSE_NAME = config('NIMBUSPOST_WAREHOUSE_NAME', default='Junglyst')

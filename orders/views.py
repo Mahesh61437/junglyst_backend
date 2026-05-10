@@ -459,7 +459,25 @@ class VerifyPaymentView(generics.GenericAPIView):
             except Payment.DoesNotExist:
                 return Response({"error": "Payment record not found"}, status=404)
 
-        return Response({"error": "Invalid payment signature"}, status=400)
+        # Payment not yet confirmed — could be still processing or failed
+        # Check the actual payment status at Cashfree to give a useful response
+        try:
+            import requests as req
+            from payments.cashfree_utils import get_cashfree_url, get_cashfree_headers
+            cf_url = f"{get_cashfree_url()}/{cashfree_order_id}/payments"
+            cf_resp = req.get(cf_url, headers=get_cashfree_headers(), timeout=10)
+            if cf_resp.status_code == 200:
+                for p in cf_resp.json():
+                    pstatus = (p.get("payment_status") or "").upper()
+                    if pstatus in ("PENDING", "PROCESSING"):
+                        return Response({
+                            "error": "Payment is still being processed by your bank. Please check My Orders in a few minutes.",
+                            "status": "processing",
+                        }, status=202)
+        except Exception:
+            pass
+
+        return Response({"error": "Payment could not be verified. If money was debited, please check My Orders or contact support."}, status=400)
 
 
 class PaymentStatusView(APIView):

@@ -144,13 +144,17 @@ class CashfreeWebhookView(APIView):
     def handle_payment_failed(self, cashfree_order_id):
         try:
             payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
-            if payment.status != 'captured':
-                payment.status = 'failed'
-                payment.save()
-                order = payment.order
-                order.status = 'failed'
-                order.payment_status = 'failed'
-                order.save()
+            # Never overwrite a captured payment or a placed/shipped order
+            if payment.status == 'captured':
+                return
+            order = payment.order
+            if order.status in ('placed', 'shipped', 'in_transit', 'out_for_delivery', 'delivered'):
+                return
+            payment.status = 'failed'
+            payment.save()
+            order.status = 'failed'
+            order.payment_status = 'failed'
+            order.save()
         except Payment.DoesNotExist:
             pass
 
