@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.db import models
 from .models import Order, OrderItem, SubOrder
 from shipping.serializers import ShipmentSerializer
 
@@ -152,3 +153,20 @@ class SellerOrderSerializer(serializers.ModelSerializer):
 
     def get_my_item_count(self, obj):
         return obj.items.filter(seller=self._seller()).count()
+
+
+class OrderSuccessSerializer(serializers.ModelSerializer):
+    """
+    Lightweight serializer for success page — only includes essential data:
+    order_number, total_quantity, and total_amount.
+    Optimized to reduce API response time.
+    """
+    total_quantity = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Order
+        fields = ('id', 'order_number', 'total_quantity', 'total_amount', 'is_paid')
+
+    def get_total_quantity(self, obj):
+        """Calculate total items ordered across all order items."""
+        return obj.items.aggregate(models.Sum('quantity'))['quantity__sum'] or 0

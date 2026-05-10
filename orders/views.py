@@ -18,7 +18,7 @@ from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payme
 from payments.models import PaymentGatewaySettings, PaymentGateway
 from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
 from .models import Order, OrderItem, SubOrder
-from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer
+from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer, OrderSuccessSerializer
 from .email_utils import send_order_confirmation_emails
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -249,7 +249,7 @@ class CheckoutView(generics.GenericAPIView):
                     pass  # Don't block checkout if Celery is down
                 return Response({
                     "gateway": PaymentGateway.CASHFREE,
-                    "order": OrderSerializer(order).data,
+                    "order": OrderSuccessSerializer(order).data,
                     "payment_session_id": cashfree_order['payment_session_id'],
                     "cashfree_order_id": cashfree_order['order_id'],
                     "amount": total_amount,
@@ -283,7 +283,7 @@ class CheckoutView(generics.GenericAPIView):
             from django.conf import settings
             return Response({
                 "gateway": PaymentGateway.RAZORPAY,
-                "order": OrderSerializer(order).data,
+                "order": OrderSuccessSerializer(order).data,
                 "razorpay_order_id": rzp_order["id"],
                 "razorpay_key_id": getattr(settings, "RAZORPAY_KEY_ID", ""),
                 "amount": total_amount,
@@ -404,7 +404,10 @@ class VerifyPaymentView(generics.GenericAPIView):
                 # Send confirmation emails to customer, admins, and sellers
                 send_order_confirmation_emails(order)
 
-                return Response({"message": "Payment verified and order placed"}, status=200)
+                return Response({
+                    "message": "Payment verified and order placed",
+                    "order": OrderSuccessSerializer(order).data
+                }, status=200)
             except Payment.DoesNotExist:
                 return Response({"error": "Payment record not found"}, status=404)
 
@@ -495,7 +498,10 @@ class VerifyPaymentView(generics.GenericAPIView):
                 # Send confirmation emails to customer, admins, and sellers
                 send_order_confirmation_emails(order)
 
-                return Response({"message": "Payment verified and order placed"}, status=200)
+                return Response({
+                    "message": "Payment verified and order placed",
+                    "order": OrderSuccessSerializer(order).data
+                }, status=200)
             except Payment.DoesNotExist:
                 return Response({"error": "Payment record not found"}, status=404)
 
@@ -559,6 +565,7 @@ class PaymentStatusView(APIView):
                 return Response({
                     "status": "success",
                     "order_number": payment.order.order_number,
+                    "order": OrderSerializer(payment.order).data,
                 })
 
             # Query Cashfree API for real-time status
@@ -578,6 +585,7 @@ class PaymentStatusView(APIView):
                 return Response({
                     "status": "success",
                     "order_number": payment.order.order_number,
+                    "order": OrderSerializer(payment.order).data,
                 })
 
             # Check if Cashfree confirms a failure
@@ -597,6 +605,7 @@ class PaymentStatusView(APIView):
                             return Response({
                                 "status": "success",
                                 "order_number": payment.order.order_number,
+                                "order": OrderSerializer(payment.order).data,
                             })
             except Exception:
                 pass
@@ -616,6 +625,7 @@ class PaymentStatusView(APIView):
                 return Response({
                     "status": "success",
                     "order_number": payment.order.order_number,
+                    "order": OrderSerializer(payment.order).data,
                 })
 
             # Query Razorpay API
@@ -638,6 +648,7 @@ class PaymentStatusView(APIView):
                             return Response({
                                 "status": "success",
                                 "order_number": payment.order.order_number,
+                                "order": OrderSerializer(payment.order).data,
                             })
                         if pstatus == 'failed':
                             return Response({"status": "failed"})
