@@ -59,18 +59,32 @@ def verify_cashfree_payment(order_id):
     return False, None
 
 def verify_webhook_signature(payload_body, signature):
+    """
+    Verify Cashfree webhook HMAC-SHA256 signature.
+
+    Note: No timestamp-staleness check here because Cashfree retries
+    failed webhooks for up to 24 hours using the SAME timestamp + signature.
+    A 5-minute window would block legitimate retries.
+
+    Replay attacks are harmless — handle_order_paid is idempotent
+    (checks payment.status == 'captured' and returns early).
+    The HMAC signature itself prevents forgery, which is the real threat.
+    """
     import hmac
     import hashlib
     import base64
-    
+
     timestamp = signature.get('x-webhook-timestamp', '')
     actual_signature = signature.get('x-webhook-signature', '')
-    
+
+    if not timestamp or not actual_signature:
+        return False
+
     data = timestamp + payload_body
     secret = settings.CASHFREE_SECRET_KEY.encode('utf-8')
-    
+
     expected_signature = base64.b64encode(
         hmac.new(secret, data.encode('utf-8'), hashlib.sha256).digest()
     ).decode('utf-8')
-    
+
     return hmac.compare_digest(expected_signature, actual_signature)

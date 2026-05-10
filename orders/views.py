@@ -303,8 +303,10 @@ class VerifyPaymentView(generics.GenericAPIView):
             try:
                 payment = Payment.objects.get(razorpay_order_id=razorpay_order_id)
                 order = payment.order
-                
-                # Final Stock Check before capture
+
+                # Idempotency guard: already captured → return success, skip double processing
+                if payment.status == 'captured':
+                    return Response({"message": "Payment already verified"}, status=200)
                 insufficient_items = []
                 for item in order.items.all():
                     if item.variant and item.variant.stock < item.quantity:
@@ -384,8 +386,10 @@ class VerifyPaymentView(generics.GenericAPIView):
             try:
                 payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
                 order = payment.order
-                
-                # Final Stock Check before capture
+
+                # Idempotency guard: already captured → return success, skip double processing
+                if payment.status == 'captured':
+                    return Response({"message": "Payment already verified"}, status=200)
                 insufficient_items = []
                 for item in order.items.all():
                     if item.variant and item.variant.stock < item.quantity:
@@ -456,6 +460,135 @@ class VerifyPaymentView(generics.GenericAPIView):
                 return Response({"error": "Payment record not found"}, status=404)
 
         return Response({"error": "Invalid payment signature"}, status=400)
+
+
+class PaymentStatusView(APIView):
+    """
+    GET /api/orders/payment-status/?cashfree_order_id=xxx
+    GET /api/orders/payment-status/?razorpay_order_id=xxx
+
+    Real-time payment status check — called by the frontend when the
+    payment modal closes in an ambiguous state (user entered PIN but
+    modal closed before the bank response arrived).
+
+    Returns:
+      { status: 'success' | 'processing' | 'failed', order_number? }
+
+    If the gateway confirms success and our DB hasn't captured yet,
+    this view captures the payment immediately (same as VerifyPaymentView),
+    so the reconcile task doesn't need to wait an hour.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        cashfree_order_id = request.query_params.get('cashfree_order_id')
+        razorpay_order_id = request.query_params.get('razorpay_order_id')
+
+        if not cashfree_order_id and not razorpay_order_id:
+            return Response({"error": "cashfree_order_id or razorpay_order_id required"}, status=400)
+
+        # ── Cashfree ────────────────────────────────────────────────────────
+        if cashfree_order_id:
+            try:
+                payment = Payment.objects.select_related('order').get(
+                    cashfree_order_id=cashfree_order_id
+                )
+            except Payment.DoesNotExist:
+                return Response({"status": "failed"}, status=404)
+
+            # Already captured in our DB → success
+            if payment.status == 'captured':
+                return Response({
+                    "status": "success",
+                    "order_number": payment.order.order_number,
+                })
+
+            # Query Cashfree API for real-time status
+            try:
+                is_paid, cf_payment_id = verify_cashfree_payment(cashfree_order_id)
+            except Exception:
+                # Gateway unreachable → tell frontend to keep polling
+                return Response({"status": "processing"})
+
+            if is_paid:
+                # Capture immediately (don't wait for reconcile task)
+                try:
+                    from payments.tasks import _capture_payment
+                    payment.cashfree_payment_id = cf_payment_id
+                    _capture_payment(payment, cf_payment_id)
+                except Exception:
+                    pass  # reconcile task will catch it
+                return Response({
+                    "status": "success",
+                    "order_number": payment.order.order_number,
+                })
+
+            # Check if Cashfree confirms a failure
+            # (verify_cashfree_payment returns False for both PENDING and FAILED)
+            # We need to distinguish — call the payments list endpoint directly
+            try:
+                import requests as req
+                from payments.cashfree_utils import get_cashfree_url, get_cashfree_headers
+                url = f"{get_cashfree_url()}/{cashfree_order_id}/payments"
+                r = req.get(url, headers=get_cashfree_headers(), timeout=10)
+                if r.status_code == 200:
+                    for p in r.json():
+                        pstatus = p.get("payment_status", "").upper()
+                        if pstatus in ("FAILED", "CANCELLED", "VOID", "NOT_ATTEMPTED"):
+                            return Response({"status": "failed"})
+                        if pstatus == "SUCCESS":
+                            return Response({
+                                "status": "success",
+                                "order_number": payment.order.order_number,
+                            })
+            except Exception:
+                pass
+
+            return Response({"status": "processing"})
+
+        # ── Razorpay ─────────────────────────────────────────────────────────
+        if razorpay_order_id:
+            try:
+                payment = Payment.objects.select_related('order').get(
+                    razorpay_order_id=razorpay_order_id
+                )
+            except Payment.DoesNotExist:
+                return Response({"status": "failed"}, status=404)
+
+            if payment.status == 'captured':
+                return Response({
+                    "status": "success",
+                    "order_number": payment.order.order_number,
+                })
+
+            # Query Razorpay API
+            try:
+                import requests as req
+                from payments.razorpay_utils import _auth
+                key_id, key_secret = _auth()
+                url = f"https://api.razorpay.com/v1/orders/{razorpay_order_id}/payments"
+                r = req.get(url, auth=(key_id, key_secret), timeout=10)
+                if r.status_code == 200:
+                    for p in r.json().get('items', []):
+                        pstatus = p.get('status', '')
+                        if pstatus == 'captured':
+                            try:
+                                from payments.tasks import _capture_payment
+                                payment.razorpay_payment_id = p.get('id')
+                                _capture_payment(payment, p.get('id'))
+                            except Exception:
+                                pass
+                            return Response({
+                                "status": "success",
+                                "order_number": payment.order.order_number,
+                            })
+                        if pstatus == 'failed':
+                            return Response({"status": "failed"})
+            except Exception:
+                pass
+
+            return Response({"status": "processing"})
+
 
 class CancelOrderView(APIView):
     permission_classes = (permissions.IsAuthenticated,)

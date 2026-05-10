@@ -293,10 +293,14 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
-# Sample Periodic Tasks
+# Periodic Tasks
 CELERY_BEAT_SCHEDULE = {
     'sync-shipment-statuses': {
         'task': 'shipping.tasks.sync_all_shipment_statuses',
+        'schedule': 3600.0,  # every hour
+    },
+    'reconcile-pending-payments': {
+        'task': 'payments.tasks.reconcile_pending_payments',
         'schedule': 3600.0,  # every hour
     },
 }
