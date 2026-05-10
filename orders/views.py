@@ -15,6 +15,8 @@ from shipping.pincode_zones import classify_pincode
 from notifications.models import AppNotification
 from payments.models import Payment
 from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
+from payments.models import PaymentGatewaySettings, PaymentGateway
+from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
 from .models import Order, OrderItem, SubOrder
 from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer
 from .email_utils import send_order_confirmation_emails
@@ -217,33 +219,66 @@ class CheckoutView(generics.GenericAPIView):
                     seller=bucket['seller'],
                 )
 
+        active_gateway = PaymentGatewaySettings.get_solo().active_gateway
+
         # Cashfree
+        if active_gateway == PaymentGateway.CASHFREE:
+            try:
+                cashfree_order = create_cashfree_order(
+                    order_id=order.order_number,
+                    order_amount=float(total_amount),
+                    customer_details={
+                        "customer_id": str(request.user.id) if request.user.is_authenticated else "guest",
+                        "customer_email": email or "guest@example.com",
+                        "customer_phone": str(phone) if phone else "9999999999",
+                        "customer_name": request.user.get_full_name() if request.user.is_authenticated else "Guest User"
+                    }
+                )
+                Payment.objects.create(
+                    order=order,
+                    gateway=PaymentGateway.CASHFREE,
+                    cashfree_order_id=cashfree_order['order_id'],
+                    cashfree_session_id=cashfree_order['payment_session_id'],
+                    amount=total_amount,
+                )
+                return Response({
+                    "gateway": PaymentGateway.CASHFREE,
+                    "order": OrderSerializer(order).data,
+                    "payment_session_id": cashfree_order['payment_session_id'],
+                    "cashfree_order_id": cashfree_order['order_id'],
+                    "amount": total_amount,
+                    "currency": "INR",
+                }, status=201)
+            except Exception as e:
+                print(f"DEBUG: Cashfree failed: {str(e)}")
+                return Response({
+                    "error": f"Failed to initialize payment gateway: {str(e)}"
+                }, status=400)
+
+        # Razorpay
         try:
-            cashfree_order = create_cashfree_order(
-                order_id=order.order_number,
-                order_amount=float(total_amount),
-                customer_details={
-                    "customer_id": str(request.user.id) if request.user.is_authenticated else "guest",
-                    "customer_email": email or "guest@example.com",
-                    "customer_phone": str(phone) if phone else "9999999999",
-                    "customer_name": request.user.get_full_name() if request.user.is_authenticated else "Guest User"
-                }
+            rzp_order = create_razorpay_order(
+                receipt=order.order_number,
+                amount_inr=float(total_amount),
+                currency="INR",
             )
             Payment.objects.create(
                 order=order,
-                cashfree_order_id=cashfree_order['order_id'],
-                cashfree_session_id=cashfree_order['payment_session_id'],
+                gateway=PaymentGateway.RAZORPAY,
+                razorpay_order_id=rzp_order["id"],
                 amount=total_amount,
             )
+            from django.conf import settings
             return Response({
+                "gateway": PaymentGateway.RAZORPAY,
                 "order": OrderSerializer(order).data,
-                "payment_session_id": cashfree_order['payment_session_id'],
-                "cashfree_order_id": cashfree_order['order_id'],
+                "razorpay_order_id": rzp_order["id"],
+                "razorpay_key_id": getattr(settings, "RAZORPAY_KEY_ID", ""),
                 "amount": total_amount,
                 "currency": "INR",
             }, status=201)
         except Exception as e:
-            print(f"DEBUG: Cashfree failed: {str(e)}")
+            print(f"DEBUG: Razorpay failed: {str(e)}")
             return Response({
                 "error": f"Failed to initialize payment gateway: {str(e)}"
             }, status=400)
@@ -252,12 +287,21 @@ class VerifyPaymentView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
 
     def post(self, request):
-        cashfree_order_id = request.data.get('cashfree_order_id')
-        
-        is_verified, cf_payment_id = verify_cashfree_payment(cashfree_order_id)
-        if is_verified:
+        gateway = request.data.get("gateway") or PaymentGateway.CASHFREE
+
+        if gateway == PaymentGateway.RAZORPAY:
+            razorpay_order_id = request.data.get("razorpay_order_id")
+            razorpay_payment_id = request.data.get("razorpay_payment_id")
+            razorpay_signature = request.data.get("razorpay_signature")
+
+            if not (razorpay_order_id and razorpay_payment_id and razorpay_signature):
+                return Response({"error": "razorpay_order_id, razorpay_payment_id, razorpay_signature are required"}, status=400)
+
+            if not verify_razorpay_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature):
+                return Response({"error": "Invalid payment signature"}, status=400)
+
             try:
-                payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
+                payment = Payment.objects.get(razorpay_order_id=razorpay_order_id)
                 order = payment.order
                 
                 # Final Stock Check before capture
@@ -275,13 +319,16 @@ class VerifyPaymentView(generics.GenericAPIView):
                         "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
                     }, status=400)
 
-                payment.cashfree_payment_id = cf_payment_id
+                payment.gateway = PaymentGateway.RAZORPAY
+                payment.razorpay_payment_id = razorpay_payment_id
+                payment.razorpay_signature = razorpay_signature
                 payment.status = 'captured'
                 payment.save()
                 
                 order.is_paid = True
                 order.payment_status = 'completed'
                 order.status = 'placed'
+                order.payment_gateway = PaymentGateway.RAZORPAY
                 order.save()
                 
                 # Notify buyer
@@ -327,8 +374,88 @@ class VerifyPaymentView(generics.GenericAPIView):
                 return Response({"message": "Payment verified and order placed"}, status=200)
             except Payment.DoesNotExist:
                 return Response({"error": "Payment record not found"}, status=404)
-        else:
-            return Response({"error": "Invalid payment signature"}, status=400)
+
+        # Default: Cashfree
+        cashfree_order_id = request.data.get('cashfree_order_id')
+        if not cashfree_order_id:
+            return Response({"error": "cashfree_order_id is required"}, status=400)
+        is_verified, cf_payment_id = verify_cashfree_payment(cashfree_order_id)
+        if is_verified:
+            try:
+                payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
+                order = payment.order
+                
+                # Final Stock Check before capture
+                insufficient_items = []
+                for item in order.items.all():
+                    if item.variant and item.variant.stock < item.quantity:
+                        insufficient_items.append(item.product_name)
+                
+                if insufficient_items:
+                    # In a real scenario, we would trigger a refund here
+                    order.status = 'failed'
+                    order.payment_status = 'failed'
+                    order.save()
+                    return Response({
+                        "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
+                    }, status=400)
+
+                payment.gateway = PaymentGateway.CASHFREE
+                payment.cashfree_payment_id = cf_payment_id
+                payment.status = 'captured'
+                payment.save()
+                
+                order.is_paid = True
+                order.payment_status = 'completed'
+                order.status = 'placed'
+                order.payment_gateway = PaymentGateway.CASHFREE
+                order.save()
+                
+                # Notify buyer
+                if order.user:
+                    AppNotification.objects.create(
+                        user=order.user,
+                        title="Order Placed!",
+                        message=f"Your order {order.order_number} has been successfully placed and is being prepared."
+                    )
+
+                # Notify each seller about their new sub-order (non-blocking bulk create)
+                seller_notifs = []
+                for sub in order.sub_orders.select_related('seller').all():
+                    sub.status = 'placed'
+                    sub.save()
+                    item_count = sub.items.count()
+                    seller_notifs.append(AppNotification(
+                        user=sub.seller,
+                        title="New Order Received!",
+                        message=(
+                            f"Sub-order {sub.sub_order_number} has been placed with "
+                            f"{item_count} item{'s' if item_count != 1 else ''}. "
+                            f"Please confirm within 48 hours."
+                        ),
+                    ))
+                if seller_notifs:
+                    AppNotification.objects.bulk_create(seller_notifs)
+
+                for item in order.items.all():
+                    if item.variant:
+                        item.variant.stock -= item.quantity
+                        item.variant.save()
+
+                # Clear the buyer's cart
+                if order.user:
+                    Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user=order.user).delete()
+
+                # Send confirmation emails to customer, admins, and sellers
+                send_order_confirmation_emails(order)
+
+                return Response({"message": "Payment verified and order placed"}, status=200)
+            except Payment.DoesNotExist:
+                return Response({"error": "Payment record not found"}, status=404)
+
+        return Response({"error": "Invalid payment signature"}, status=400)
 
 class CancelOrderView(APIView):
     permission_classes = (permissions.IsAuthenticated,)

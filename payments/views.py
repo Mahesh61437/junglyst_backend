@@ -4,13 +4,14 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
 from django.utils import timezone
 from notifications.models import AppNotification
 from cart.models import Cart
 from cart.models import CartItem
 from orders.models import Order
 from orders.email_utils import send_order_confirmation_emails
-from .models import Payment
+from .models import Payment, PaymentGatewaySettings, PaymentGateway
 from .cashfree_utils import verify_webhook_signature
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -134,3 +135,26 @@ class CashfreeWebhookView(APIView):
                 order.save()
         except Payment.DoesNotExist:
             pass
+
+
+class PaymentGatewaySettingsView(APIView):
+    """
+    GET  /api/payments/gateway-settings/  -> { active_gateway }
+    PATCH /api/payments/gateway-settings/ -> { active_gateway }
+    Admin-only.
+    """
+    from core.permissions import IsAdminUser
+    permission_classes = (IsAdminUser,)
+
+    def get(self, request):
+        s = PaymentGatewaySettings.get_solo()
+        return Response({"active_gateway": s.active_gateway})
+
+    def patch(self, request):
+        active = request.data.get("active_gateway")
+        if active not in (PaymentGateway.CASHFREE, PaymentGateway.RAZORPAY):
+            return Response({"error": "active_gateway must be 'cashfree' or 'razorpay'."}, status=400)
+        s = PaymentGatewaySettings.get_solo()
+        s.active_gateway = active
+        s.save(update_fields=["active_gateway", "updated_at"])
+        return Response({"active_gateway": s.active_gateway})

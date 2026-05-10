@@ -86,6 +86,10 @@ class SuperAdminDashboardView(generics.GenericAPIView):
         for so in all_sub_orders_qs:
             user = so.order.user
             try:
+                pg = so.order.payment.gateway
+            except Exception:
+                pg = None
+            try:
                 seller_store = so.seller.seller_profile.store_name
             except Exception:
                 seller_store = so.seller.get_full_name() or so.seller.username
@@ -96,6 +100,7 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 'total_amount': so.seller_total,
                 'status': so.status,
                 'created_at': so.created_at,
+                'payment_gateway': so.order.payment_gateway or pg,
                 'guest_email': so.order.guest_email,
                 'guest_phone': so.order.guest_phone,
                 'user__email': user.email if user else None,
