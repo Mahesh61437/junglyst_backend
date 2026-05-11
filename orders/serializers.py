@@ -170,3 +170,121 @@ class OrderSuccessSerializer(serializers.ModelSerializer):
     def get_total_quantity(self, obj):
         """Calculate total items ordered across all order items."""
         return obj.items.aggregate(models.Sum('quantity'))['quantity__sum'] or 0
+
+
+class OrderTrackingSerializer(serializers.ModelSerializer):
+    """
+    Lightweight tracking serializer — optimized for fast fetching.
+    Only includes: order_id, order_number, order_quantity, payment_status, items, sub_order_details, shipment_details.
+    """
+    total_quantity = serializers.SerializerMethodField()
+    payment_status = serializers.SerializerMethodField()
+    items = serializers.SerializerMethodField()
+    sub_orders = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Order
+        fields = ('id', 'order_number', 'total_quantity', 'status', 'payment_status', 'items', 'sub_orders', 'created_at')
+
+    def get_total_quantity(self, obj):
+        """Calculate total items ordered from pre-fetched items."""
+        return sum(item.quantity for item in obj.items.all())
+
+    def get_payment_status(self, obj):
+        """Return payment status."""
+        # Try to get cached payment if available, otherwise query
+        try:
+            payment = obj.payments.first()  # Related name from Payment model
+        except:
+            from payments.models import Payment
+            payment = Payment.objects.filter(order=obj).first()
+        
+        return {
+            'is_paid': obj.is_paid,
+            'payment_method': payment.method if payment else None,
+            'amount_paid': float(payment.amount) if payment else None,
+        }
+
+    def get_items(self, obj):
+        """Return lightweight order items list from pre-fetched data."""
+        return [
+            {
+                'id': str(item.id),
+                'product_name': item.product_name or (item.product.name if item.product else 'Unknown'),
+                'variant_name': item.variant_name or (item.variant.name if item.variant else 'Default'),
+                'quantity': item.quantity,
+                'unit_price': float(item.unit_price),
+                'product_image': self._get_product_image_cached(item),
+            }
+            for item in obj.items.all()
+        ]
+
+    def get_sub_orders(self, obj):
+        """Return only tracking-relevant sub-order data from pre-fetched relationships."""
+        result = []
+        for so in obj.sub_orders.all():
+            items_data = [
+                {
+                    'product_name': item.product_name or (item.product.name if item.product else 'Unknown'),
+                    'variant_name': item.variant_name or (item.variant.name if item.variant else 'Default'),
+                    'quantity': item.quantity,
+                    'unit_price': float(item.unit_price),
+                }
+                for item in so.items.all()
+            ]
+            
+            result.append({
+                'id': str(so.id),
+                'sub_order_number': so.sub_order_number,
+                'status': so.status,
+                'seller_name': self._get_seller_name_cached(so),
+                'items': items_data,
+                'awb_number': so.awb_number,
+                'courier_name': so.courier_name,
+                'shipment': self._get_shipment_data_cached(so),
+            })
+        return result
+
+    def _get_product_image_cached(self, item):
+        """Extract product image URL from pre-loaded product data."""
+        try:
+            if item.product and hasattr(item.product, 'images'):
+                images = list(item.product.images.all()) if hasattr(item.product.images, 'all') else []
+                if images:
+                    primary = next((img for img in images if img.is_primary), None) or images[0]
+                    return primary.image_url if hasattr(primary, 'image_url') else None
+        except Exception:
+            pass
+        return None
+
+    def _get_seller_name_cached(self, sub_order):
+        """Extract seller name from pre-loaded data."""
+        try:
+            seller = sub_order.seller
+            if hasattr(seller, 'seller_profile') and seller.seller_profile:
+                return seller.seller_profile.store_name
+            return seller.get_full_name() or seller.username
+        except Exception:
+            return 'Unknown Seller'
+
+    def _get_shipment_data_cached(self, sub_order):
+        """Return only tracking-relevant shipment data."""
+        # Try to find shipment from pre-loaded shipments
+        try:
+            # Access the order's prefetched shipments
+            if hasattr(sub_order, 'order') and hasattr(sub_order.order, 'shipments'):
+                shipments = list(sub_order.order.shipments.all())
+                shipment = next(
+                    (s for s in shipments if s.seller_id == sub_order.seller_id), 
+                    None
+                )
+                if shipment:
+                    return {
+                        'id': str(shipment.id),
+                        'status': shipment.status,
+                        'tracking_url': shipment.tracking_url,
+                        'estimated_delivery': shipment.estimated_delivery.isoformat() if shipment.estimated_delivery else None,
+                    }
+        except Exception:
+            pass
+        return None

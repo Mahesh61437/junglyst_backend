@@ -18,7 +18,7 @@ from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payme
 from payments.models import PaymentGatewaySettings, PaymentGateway
 from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
 from .models import Order, OrderItem, SubOrder
-from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer, OrderSuccessSerializer
+from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer, OrderSuccessSerializer, OrderTrackingSerializer
 from .email_utils import send_order_confirmation_emails
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -695,6 +695,32 @@ class OrderDetailView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         return Order.objects.filter(user=self.request.user)
+
+
+class OrderTrackView(APIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        order_number = request.query_params.get('order_number')
+        if not order_number:
+            return Response({'error': 'order_number is required'}, status=400)
+        try:
+            from django.db.models import Prefetch
+            # Aggressive prefetching to avoid N+1 queries
+            order = Order.objects.prefetch_related(
+                Prefetch('items', queryset=OrderItem.objects.select_related('product', 'variant')),
+                Prefetch(
+                    'sub_orders',
+                    queryset=SubOrder.objects.select_related('seller').prefetch_related(
+                        Prefetch('items', queryset=OrderItem.objects.select_related('product', 'variant')),
+                    )
+                ),
+                Prefetch('shipments'),
+            ).get(order_number=order_number)
+        except Order.DoesNotExist:
+            return Response({'error': 'Order not found'}, status=404)
+
+        return Response(OrderTrackingSerializer(order).data)
 
 
 class SellerOrderListView(generics.ListAPIView):

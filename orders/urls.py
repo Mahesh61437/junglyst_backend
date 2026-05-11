@@ -1,7 +1,7 @@
 from django.urls import path
 from .views import (
     CheckoutView, VerifyPaymentView, PaymentStatusView, OrderListView, OrderDetailView,
-    SellerOrderListView, ShipNowView,
+    OrderTrackView, SellerOrderListView, ShipNowView,
     SellerSubOrderListView, ConfirmSubOrderView, UploadPackagingPhotoView,
     UpdateShipmentDetailsView, SubOrderShipView, UpdateSubOrderStatusView,
     CancelOrderView,
@@ -10,6 +10,7 @@ from .views import (
 urlpatterns = [
     path('', OrderListView.as_view(), name='order_list'),
     path('<uuid:pk>/', OrderDetailView.as_view(), name='order_detail'),
+    path('track/', OrderTrackView.as_view(), name='order_track'),
     path('checkout/', CheckoutView.as_view(), name='checkout'),
     path('checkout/verify/', VerifyPaymentView.as_view(), name='verify_payment'),
     path('payment-status/', PaymentStatusView.as_view(), name='payment_status'),
