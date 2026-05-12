@@ -1,212 +1,454 @@
 """
 Management command: seed_products
-Creates 10 unique product listings per grower seller, each with 1-3 variants.
-Safe to run multiple times — skips existing products by name+seller.
+Creates categories, subcategories, shipping rates, and 10 products per seller.
+Run: python manage.py seed_products
+Safe to re-run — skips already-existing items by name/slug.
 """
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils.text import slugify
 from decimal import Decimal
-import uuid
-from core.models import User, Product, ProductVariant, ProductImage, Category
+import random
 
-CATALOG = [
-    # (name, description, category_name, variants)
-    # variants: list of (name, price, stock, item_category, weight_g, length, breadth, height)
-    (
-        "Anubias Nana Petite",
-        "A miniature variety of Anubias ideal for foreground placement. Extremely slow growing and low maintenance, perfect for shrimp tanks.",
-        "Aquatic Plants",
-        [("Single Rhizome", 349, 20, "light", 60, 10, 8, 5),
-         ("Portion (3 Rhizomes)", 899, 10, "light", 150, 12, 10, 6)],
-    ),
-    (
-        "Bucephalandra Wavy Green",
-        "Endemic to Borneo, this Bucephalandra variety features wavy green leaves with iridescent shimmer under LED lighting.",
-        "Aquatic Plants",
-        [("Single Stem", 249, 25, "light", 40, 8, 6, 4),
-         ("Bunch (5 Stems)", 999, 12, "light", 180, 12, 10, 6)],
-    ),
-    (
-        "Rotala Rotundifolia H'Ra",
-        "A vibrant red stem plant that thrives under high light. Perfect for creating colour contrast in Dutch-style aquascapes.",
-        "Aquatic Plants",
-        [("Bunch (10 Stems)", 179, 30, "light", 100, 15, 8, 5)],
-    ),
-    (
-        "Java Moss",
-        "Classic aquarium moss that attaches easily to driftwood and rocks. Hardy and adaptable for beginners and experts alike.",
-        "Mosses & Liverworts",
-        [("Golf Ball Portion", 99, 50, "light", 50, 8, 8, 5),
-         ("Large Portion (200g)", 349, 20, "light", 220, 15, 12, 8)],
-    ),
-    (
-        "Flame Moss",
-        "Unique upward-growing moss that resembles flickering flames. Creates stunning vertical texture in aquascapes.",
-        "Mosses & Liverworts",
-        [("Small Portion", 149, 35, "light", 55, 8, 8, 5),
-         ("Large Portion", 399, 15, "light", 200, 14, 10, 7)],
-    ),
-    (
-        "Eleocharis Parvula (Dwarf Hairgrass)",
-        "Creates a stunning grass carpet effect. Best grown in nutrient-rich substrate with moderate to high lighting.",
-        "Aquatic Plants",
-        [("1 Pot", 129, 40, "light", 120, 7, 7, 12),
-         ("3 Pots", 339, 18, "light", 340, 15, 12, 12)],
-    ),
-    (
-        "Bolbitis Heudelotii",
-        "African water fern with elegant dark green fronds. Grows well attached to hardscape and prefers good water flow.",
-        "Rare Ferns",
-        [("Single Rhizome (10cm)", 449, 15, "light", 90, 12, 10, 6),
-         ("Large Rhizome (20cm)", 849, 8, "light", 200, 18, 14, 8)],
-    ),
-    (
-        "Cryptocoryne Wendtii Brown",
-        "A robust Crypt variety with distinctive brown-red leaves. Tolerates low light and minimal CO2, a true beginner plant.",
-        "Aquatic Plants",
-        [("Single Potted Plant", 139, 25, "light", 150, 9, 9, 12),
-         ("3 Plants", 369, 12, "light", 420, 16, 14, 14)],
-    ),
-    (
-        "Marsilea Hirsuta",
-        "Foreground carpeting plant with four-leaf clover shape. Grows without CO2 at a moderate pace.",
-        "Aquatic Plants",
-        [("Portion (10 Runners)", 199, 30, "light", 80, 10, 8, 4),
-         ("Large Portion (30 Runners)", 499, 12, "light", 200, 15, 12, 6)],
-    ),
-    (
-        "Subwassertang",
-        "Freshwater liverwort that creates lush, cloud-like mounds. Excellent for shrimp tanks as it provides hiding spots.",
-        "Mosses & Liverworts",
-        [("Golf Ball Portion", 119, 40, "light", 60, 9, 9, 6),
-         ("Large Portion", 299, 20, "light", 180, 14, 12, 8)],
-    ),
-    # Extras so each seller gets a different set when we rotate
-    (
-        "Vesicularia Montagnei (Christmas Moss)",
-        "Named for its branch structure resembling a Christmas tree. Rich green colour and easy to care for.",
-        "Mosses & Liverworts",
-        [("Small Portion", 129, 35, "light", 55, 8, 8, 5),
-         ("Large Portion", 349, 15, "light", 200, 14, 10, 7)],
-    ),
-    (
-        "Staurogyne Repens",
-        "Compact bushy foreground plant with light green leaves. Ideal for Dutch aquascapes, grows without CO2.",
-        "Aquatic Plants",
-        [("Bunch (5 Stems)", 159, 30, "light", 100, 12, 8, 6),
-         ("Bunch (15 Stems)", 399, 14, "light", 280, 18, 12, 8)],
-    ),
-    (
-        "Taxiphyllum Alternans (Taiwan Moss)",
-        "Beautiful feathery moss perfect for creating dense walls or carpets. Very hardy and fast growing.",
-        "Mosses & Liverworts",
-        [("Golf Ball Portion", 109, 40, "light", 55, 8, 8, 5)],
-    ),
-    (
-        "Ludwigia Super Red Mini",
-        "Intensely red stem plant that stays compact. Needs high light and CO2 to develop its signature red colouration.",
-        "Aquatic Plants",
-        [("Bunch (5 Stems)", 249, 20, "light", 110, 14, 8, 5),
-         ("Bunch (10 Stems)", 449, 10, "light", 200, 18, 10, 6)],
-    ),
-    (
-        "Hygrophila Pinnatifida",
-        "Unusual stem plant with deeply pinnatifid leaves that can also be attached to hardscape like a rhizome plant.",
-        "Aquatic Plants",
-        [("Single Stem", 179, 25, "light", 70, 14, 8, 5),
-         ("Bunch (5 Stems)", 749, 10, "light", 280, 18, 12, 7)],
-    ),
+CATEGORIES_DATA = [
+    {
+        'name': 'Aquatic Plants',
+        'gst_percentage': Decimal('12.00'),
+        'commission_rate': Decimal('15.00'),
+        'shipping_type': 'plant',
+        'subcategories': [
+            {'name': 'Stem Plants',      'gst_percentage': None, 'commission_rate': None},
+            {'name': 'Rosette Plants',   'gst_percentage': None, 'commission_rate': None},
+            {'name': 'Epiphytes',        'gst_percentage': None, 'commission_rate': None},
+            {'name': 'Carpeting Plants', 'gst_percentage': None, 'commission_rate': None},
+            {'name': 'Floating Plants',  'gst_percentage': None, 'commission_rate': None},
+        ],
+        'shipping_rates': [
+            {'min_weight_grams': 0,    'max_weight_grams': 500,  'rate': Decimal('49.00'),  'free_above_order_value': Decimal('699.00')},
+            {'min_weight_grams': 500,  'max_weight_grams': 1500, 'rate': Decimal('79.00'),  'free_above_order_value': Decimal('999.00')},
+            {'min_weight_grams': 1500, 'max_weight_grams': None, 'rate': Decimal('119.00'), 'free_above_order_value': Decimal('1499.00')},
+        ],
+    },
+    {
+        'name': 'Mosses & Liverworts',
+        'gst_percentage': Decimal('5.00'),
+        'commission_rate': Decimal('15.00'),
+        'shipping_type': 'plant',
+        'subcategories': [
+            {'name': 'Mosses',     'gst_percentage': None,         'commission_rate': None},
+            {'name': 'Liverworts', 'gst_percentage': None,         'commission_rate': None},
+            {'name': 'Riccia',     'gst_percentage': Decimal('5.00'), 'commission_rate': None},
+        ],
+        'shipping_rates': [
+            {'min_weight_grams': 0,   'max_weight_grams': 300,  'rate': Decimal('39.00'), 'free_above_order_value': Decimal('499.00')},
+            {'min_weight_grams': 300, 'max_weight_grams': None, 'rate': Decimal('69.00'), 'free_above_order_value': Decimal('799.00')},
+        ],
+    },
+    {
+        'name': 'Rare Ferns',
+        'gst_percentage': Decimal('12.00'),
+        'commission_rate': Decimal('18.00'),
+        'shipping_type': 'plant',
+        'subcategories': [
+            {'name': 'Aquatic Ferns',    'gst_percentage': None, 'commission_rate': None},
+            {'name': 'Terrestrial Ferns','gst_percentage': None, 'commission_rate': None},
+        ],
+        'shipping_rates': [
+            {'min_weight_grams': 0,    'max_weight_grams': 500,  'rate': Decimal('59.00'),  'free_above_order_value': Decimal('999.00')},
+            {'min_weight_grams': 500,  'max_weight_grams': None, 'rate': Decimal('99.00'),  'free_above_order_value': Decimal('1999.00')},
+        ],
+    },
+    {
+        'name': 'Hardscape & Substrate',
+        'gst_percentage': Decimal('18.00'),
+        'commission_rate': Decimal('12.00'),
+        'shipping_type': 'heavy',
+        'subcategories': [
+            {'name': 'Driftwood',     'gst_percentage': Decimal('18.00'), 'commission_rate': None},
+            {'name': 'Rocks & Stones','gst_percentage': Decimal('18.00'), 'commission_rate': None},
+            {'name': 'Aqua Substrate','gst_percentage': Decimal('18.00'), 'commission_rate': Decimal('10.00')},
+        ],
+        'shipping_rates': [
+            {'min_weight_grams': 0,    'max_weight_grams': 1000, 'rate': Decimal('99.00'),  'free_above_order_value': Decimal('1499.00')},
+            {'min_weight_grams': 1000, 'max_weight_grams': 3000, 'rate': Decimal('149.00'), 'free_above_order_value': Decimal('2499.00')},
+            {'min_weight_grams': 3000, 'max_weight_grams': None, 'rate': Decimal('199.00'), 'free_above_order_value': None},
+        ],
+    },
+    {
+        'name': 'Live Food & Feeders',
+        'gst_percentage': Decimal('5.00'),
+        'commission_rate': Decimal('12.00'),
+        'shipping_type': 'plant',
+        'subcategories': [
+            {'name': 'Daphnia & Moina',  'gst_percentage': None, 'commission_rate': None},
+            {'name': 'Brine Shrimp',     'gst_percentage': None, 'commission_rate': None},
+            {'name': 'Micro Worms',      'gst_percentage': None, 'commission_rate': None},
+        ],
+        'shipping_rates': [
+            {'min_weight_grams': 0,   'max_weight_grams': 200,  'rate': Decimal('49.00'), 'free_above_order_value': Decimal('399.00')},
+            {'min_weight_grams': 200, 'max_weight_grams': None, 'rate': Decimal('79.00'), 'free_above_order_value': Decimal('699.00')},
+        ],
+    },
+    {
+        'name': 'Accessories & Tools',
+        'gst_percentage': Decimal('18.00'),
+        'commission_rate': Decimal('10.00'),
+        'shipping_type': 'accessory',
+        'subcategories': [
+            {'name': 'Fertilizers',       'gst_percentage': Decimal('18.00'), 'commission_rate': None},
+            {'name': 'CO2 Equipment',     'gst_percentage': Decimal('18.00'), 'commission_rate': None},
+            {'name': 'Lights & Filters',  'gst_percentage': Decimal('18.00'), 'commission_rate': None},
+            {'name': 'Tools & Scissors',  'gst_percentage': Decimal('12.00'), 'commission_rate': None},
+        ],
+        'shipping_rates': [
+            {'min_weight_grams': 0,    'max_weight_grams': 500,  'rate': Decimal('79.00'),  'free_above_order_value': Decimal('999.00')},
+            {'min_weight_grams': 500,  'max_weight_grams': 2000, 'rate': Decimal('119.00'), 'free_above_order_value': Decimal('1999.00')},
+            {'min_weight_grams': 2000, 'max_weight_grams': None, 'rate': Decimal('169.00'), 'free_above_order_value': None},
+        ],
+    },
 ]
 
-PLACEHOLDER_IMAGES = [
-    "https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=600",
-    "https://images.unsplash.com/photo-1591858064831-a4ed24d4a9c2?w=600",
-    "https://images.unsplash.com/photo-1622659580640-11e8adc9c9c8?w=600",
-    "https://images.unsplash.com/photo-1574263867128-a3d5c1862e8e?w=600",
-    "https://images.unsplash.com/photo-1632513370984-2f5e7c5e5b20?w=600",
-    "https://images.unsplash.com/photo-1585320806297-9794b3e4aaae?w=600",
-    "https://images.unsplash.com/photo-1509316785289-025f5b846b35?w=600",
-    "https://images.unsplash.com/photo-1592150621744-aca64f48394a?w=600",
-    "https://images.unsplash.com/photo-1614594975525-e45190c55d0b?w=600",
-    "https://images.unsplash.com/photo-1616694006973-5b7ee5abcc0b?w=600",
+# 10 new products per seller — wide variety of categories, care levels, price ranges
+PRODUCT_TEMPLATES = [
+    # Aquatic Plants / Stem Plants
+    {
+        'name': 'Rotala Macrandra',
+        'tagline': 'Vibrant red stem with demanding care needs',
+        'scientific_name': 'Rotala macrandra',
+        'category': 'Aquatic Plants', 'subcategory': 'Stem Plants',
+        'care_level': 'Advanced', 'light_requirements': 'High',
+        'growth_rate': 'Fast', 'co2_requirement': 'High',
+        'water_temperature': '22–28°C', 'ph_range': '6.0–7.5',
+        'origin': 'India', 'is_rare': True,
+        'variants': [
+            {'name': 'Single Stem', 'base_price': Decimal('120'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 30, 'packed_weight_grams': 80, 'item_category': 'light'},
+            {'name': '5 Stems Bundle', 'base_price': Decimal('550'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 15, 'packed_weight_grams': 200, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1518568814500-bf0f8d125f46?w=600',
+    },
+    # Aquatic Plants / Carpeting Plants
+    {
+        'name': 'Hemianthus Callitrichoides (HC Cuba)',
+        'tagline': 'The finest carpeting plant for aquascapes',
+        'scientific_name': 'Hemianthus callitrichoides',
+        'category': 'Aquatic Plants', 'subcategory': 'Carpeting Plants',
+        'care_level': 'Advanced', 'light_requirements': 'High',
+        'growth_rate': 'Slow', 'co2_requirement': 'High',
+        'water_temperature': '20–26°C', 'ph_range': '5.5–7.0',
+        'origin': 'Cuba', 'is_rare': True,
+        'variants': [
+            {'name': '5×5cm Portion', 'base_price': Decimal('199'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 20, 'packed_weight_grams': 60, 'item_category': 'light'},
+            {'name': '10×10cm Portion', 'base_price': Decimal('349'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 10, 'packed_weight_grams': 120, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1543163521-1bf539c55dd2?w=600',
+    },
+    # Aquatic Plants / Epiphytes
+    {
+        'name': 'Bucephalandra Mini Coin',
+        'tagline': 'Compact epiphyte with shimmering leaves',
+        'scientific_name': 'Bucephalandra sp. Mini Coin',
+        'category': 'Aquatic Plants', 'subcategory': 'Epiphytes',
+        'care_level': 'Easy', 'light_requirements': 'Low',
+        'growth_rate': 'Slow', 'co2_requirement': 'Low',
+        'water_temperature': '22–28°C', 'ph_range': '6.0–7.5',
+        'origin': 'Borneo', 'is_rare': True,
+        'variants': [
+            {'name': 'Rhizome Cutting', 'base_price': Decimal('280'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 12, 'packed_weight_grams': 90, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1585687433888-21a0b0cac5db?w=600',
+    },
+    # Aquatic Plants / Rosette Plants
+    {
+        'name': 'Echinodorus Ozelot Red',
+        'tagline': 'Spotted rosette with deep red coloration',
+        'scientific_name': 'Echinodorus ozelot',
+        'category': 'Aquatic Plants', 'subcategory': 'Rosette Plants',
+        'care_level': 'Easy', 'light_requirements': 'Medium',
+        'growth_rate': 'Moderate', 'co2_requirement': 'Low',
+        'water_temperature': '20–28°C', 'ph_range': '6.5–7.5',
+        'origin': 'South America', 'is_rare': False,
+        'variants': [
+            {'name': 'Small Plant', 'base_price': Decimal('150'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 25, 'packed_weight_grams': 120, 'item_category': 'light'},
+            {'name': 'Large Plant', 'base_price': Decimal('299'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 10, 'packed_weight_grams': 220, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1476231682828-37e571bc172f?w=600',
+    },
+    # Mosses / Mosses
+    {
+        'name': 'Christmas Moss',
+        'tagline': 'Branching fronds resembling fir tree branches',
+        'scientific_name': 'Vesicularia montagnei',
+        'category': 'Mosses & Liverworts', 'subcategory': 'Mosses',
+        'care_level': 'Easy', 'light_requirements': 'Low',
+        'growth_rate': 'Moderate', 'co2_requirement': 'Low',
+        'water_temperature': '18–28°C', 'ph_range': '6.0–7.5',
+        'origin': 'Asia', 'is_rare': False,
+        'variants': [
+            {'name': 'Golf Ball Portion', 'base_price': Decimal('99'), 'gst_rate': Decimal('5'), 'commission_rate': Decimal('15'), 'stock': 40, 'packed_weight_grams': 50, 'item_category': 'light'},
+            {'name': 'Fist-Size Portion', 'base_price': Decimal('179'), 'gst_rate': Decimal('5'), 'commission_rate': Decimal('15'), 'stock': 20, 'packed_weight_grams': 100, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1523348837708-15d4a09cfac2?w=600',
+    },
+    # Rare Ferns / Aquatic Ferns
+    {
+        'name': 'Bolbitis Difformis Baby Leaf',
+        'tagline': 'Miniature aquatic fern with delicate texture',
+        'scientific_name': 'Bolbitis difformis',
+        'category': 'Rare Ferns', 'subcategory': 'Aquatic Ferns',
+        'care_level': 'Medium', 'light_requirements': 'Medium',
+        'growth_rate': 'Slow', 'co2_requirement': 'Medium',
+        'water_temperature': '20–28°C', 'ph_range': '6.0–7.5',
+        'origin': 'Southeast Asia', 'is_rare': True,
+        'variants': [
+            {'name': 'Single Rhizome', 'base_price': Decimal('220'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('18'), 'stock': 15, 'packed_weight_grams': 90, 'item_category': 'light'},
+            {'name': '3 Rhizome Pack', 'base_price': Decimal('580'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('18'), 'stock': 8, 'packed_weight_grams': 200, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1501004318641-b39e6451bec6?w=600',
+    },
+    # Hardscape / Driftwood
+    {
+        'name': 'Spider Wood — Aquascape Grade',
+        'tagline': 'Intricately branched wood for natural layouts',
+        'scientific_name': None,
+        'category': 'Hardscape & Substrate', 'subcategory': 'Driftwood',
+        'care_level': 'Easy', 'light_requirements': 'Low',
+        'growth_rate': 'Slow', 'co2_requirement': 'Low',
+        'water_temperature': None, 'ph_range': None,
+        'origin': 'South Asia', 'is_rare': False,
+        'variants': [
+            {'name': 'Small (15–25cm)', 'base_price': Decimal('249'), 'gst_rate': Decimal('18'), 'commission_rate': Decimal('12'), 'stock': 20, 'packed_weight_grams': 800, 'item_category': 'heavy', 'length': 30, 'width': 20, 'height': 15},
+            {'name': 'Medium (25–40cm)', 'base_price': Decimal('499'), 'gst_rate': Decimal('18'), 'commission_rate': Decimal('12'), 'stock': 10, 'packed_weight_grams': 1500, 'item_category': 'heavy', 'length': 45, 'width': 30, 'height': 20},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=600',
+    },
+    # Accessories / Fertilizers
+    {
+        'name': 'Aqua Flourish Pro — Macro Fertilizer',
+        'tagline': 'Complete macro nutrients for demanding stem plants',
+        'scientific_name': None,
+        'category': 'Accessories & Tools', 'subcategory': 'Fertilizers',
+        'care_level': 'Easy', 'light_requirements': 'Medium',
+        'growth_rate': 'Fast', 'co2_requirement': 'Low',
+        'water_temperature': None, 'ph_range': None,
+        'origin': 'India', 'is_rare': False,
+        'variants': [
+            {'name': '250ml Bottle', 'base_price': Decimal('349'), 'gst_rate': Decimal('18'), 'commission_rate': Decimal('10'), 'stock': 50, 'packed_weight_grams': 400, 'item_category': 'heavy'},
+            {'name': '500ml Bottle', 'base_price': Decimal('599'), 'gst_rate': Decimal('18'), 'commission_rate': Decimal('10'), 'stock': 30, 'packed_weight_grams': 700, 'item_category': 'heavy'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1516253593875-bd7ba052fbc5?w=600',
+    },
+    # Live Food
+    {
+        'name': 'Live Daphnia Magna Culture',
+        'tagline': 'High-protein live food for nano fish and bettas',
+        'scientific_name': 'Daphnia magna',
+        'category': 'Live Food & Feeders', 'subcategory': 'Daphnia & Moina',
+        'care_level': 'Medium', 'light_requirements': 'Low',
+        'growth_rate': 'Fast', 'co2_requirement': 'Low',
+        'water_temperature': '18–26°C', 'ph_range': '7.0–8.0',
+        'origin': 'India', 'is_rare': False,
+        'variants': [
+            {'name': '250ml Bag',  'base_price': Decimal('79'),  'gst_rate': Decimal('5'), 'commission_rate': Decimal('12'), 'stock': 60, 'packed_weight_grams': 350, 'item_category': 'light'},
+            {'name': '500ml Bag',  'base_price': Decimal('139'), 'gst_rate': Decimal('5'), 'commission_rate': Decimal('12'), 'stock': 40, 'packed_weight_grams': 600, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1559827291-72ee739d0d9a?w=600',
+    },
+    # Aquatic Plants / Floating
+    {
+        'name': 'Salvinia Minima',
+        'tagline': 'Fast-growing floating cover for shrimp tanks',
+        'scientific_name': 'Salvinia minima',
+        'category': 'Aquatic Plants', 'subcategory': 'Floating Plants',
+        'care_level': 'Easy', 'light_requirements': 'Medium',
+        'growth_rate': 'Fast', 'co2_requirement': 'Low',
+        'water_temperature': '18–30°C', 'ph_range': '6.0–8.0',
+        'origin': 'South America', 'is_rare': False,
+        'variants': [
+            {'name': 'Cup Portion', 'base_price': Decimal('69'),  'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 80, 'packed_weight_grams': 60, 'item_category': 'light'},
+            {'name': 'Large Bag',   'base_price': Decimal('149'), 'gst_rate': Decimal('12'), 'commission_rate': Decimal('15'), 'stock': 50, 'packed_weight_grams': 150, 'item_category': 'light'},
+        ],
+        'image_url': 'https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?w=600',
+    },
 ]
 
 
 class Command(BaseCommand):
-    help = "Seed 10 unique product listings per grower seller"
+    help = 'Seed categories, subcategories, shipping rates, and 10 new products per seller'
 
+    def add_arguments(self, parser):
+        parser.add_argument('--clear-products', action='store_true',
+                            help='Delete all existing seed products before re-seeding')
+
+    @transaction.atomic
     def handle(self, *args, **options):
-        sellers = list(User.objects.filter(role="grower"))
-        if not sellers:
-            self.stderr.write("No grower users found. Create some first.")
+        from core.models import (
+            Category, SubCategory, CategoryShippingRate,
+            Product, ProductVariant, ProductImage
+        )
+        from core.models import User
+
+        # ── 1. Categories & Subcategories ────────────────────────────────────
+        self.stdout.write('Seeding categories...')
+        cat_objs = {}
+        subcat_objs = {}
+
+        for cat_data in CATEGORIES_DATA:
+            cat, created = Category.objects.get_or_create(
+                slug=slugify(cat_data['name']),
+                defaults={
+                    'name': cat_data['name'],
+                    'gst_percentage': cat_data['gst_percentage'],
+                    'commission_rate': cat_data['commission_rate'],
+                    'shipping_type': cat_data['shipping_type'],
+                }
+            )
+            if not created:
+                # Update GST/commission in case they changed
+                cat.gst_percentage = cat_data['gst_percentage']
+                cat.commission_rate = cat_data['commission_rate']
+                cat.shipping_type = cat_data['shipping_type']
+                cat.save()
+            cat_objs[cat_data['name']] = cat
+            action = 'Created' if created else 'Updated'
+            self.stdout.write(f'  {action} category: {cat.name}')
+
+            # Subcategories
+            for sub_data in cat_data.get('subcategories', []):
+                slug = slugify(f"{cat_data['name']}-{sub_data['name']}")
+                sub, sub_created = SubCategory.objects.get_or_create(
+                    slug=slug,
+                    defaults={
+                        'category': cat,
+                        'name': sub_data['name'],
+                        'gst_percentage': sub_data['gst_percentage'],
+                        'commission_rate': sub_data['commission_rate'],
+                    }
+                )
+                if not sub_created:
+                    sub.gst_percentage = sub_data['gst_percentage']
+                    sub.commission_rate = sub_data['commission_rate']
+                    sub.save()
+                subcat_objs[f"{cat_data['name']}|{sub_data['name']}"] = sub
+                sub_action = 'Created' if sub_created else 'Updated'
+                self.stdout.write(f'    {sub_action} subcategory: {sub.name}')
+
+            # Shipping rates for this category
+            for rate_data in cat_data.get('shipping_rates', []):
+                rate, rate_created = CategoryShippingRate.objects.get_or_create(
+                    category=cat,
+                    sub_category=None,
+                    min_weight_grams=rate_data['min_weight_grams'],
+                    max_weight_grams=rate_data['max_weight_grams'],
+                    defaults={
+                        'rate': rate_data['rate'],
+                        'free_above_order_value': rate_data.get('free_above_order_value'),
+                    }
+                )
+                if not rate_created:
+                    rate.rate = rate_data['rate']
+                    rate.free_above_order_value = rate_data.get('free_above_order_value')
+                    rate.save()
+
+        # ── 2. Products per seller ───────────────────────────────────────────
+        self.stdout.write('\nSeeding products...')
+        sellers = User.objects.filter(role='grower', is_deleted=False)
+
+        if not sellers.exists():
+            self.stdout.write(self.style.WARNING('No grower sellers found. Skipping products.'))
             return
 
-        cats = {c.name: c for c in Category.objects.all()}
-        if not cats:
-            self.stderr.write("No categories found. Seed categories first.")
-            return
+        total_created = 0
+        for seller in sellers:
+            seller_label = seller.email.split('@')[0]
+            created_count = 0
 
-        default_cat = next(iter(cats.values()))
-        created_total = 0
+            for tmpl in PRODUCT_TEMPLATES:
+                product_name = f"{tmpl['name']} — {seller_label}"
 
-        for seller_idx, seller in enumerate(sellers):
-            # Give each seller a unique slice of 10 from the catalog (rotate by seller index)
-            start = (seller_idx * 3) % len(CATALOG)
-            indices = [(start + i) % len(CATALOG) for i in range(10)]
-            seller_catalog = [CATALOG[i] for i in indices]
+                if options['clear_products']:
+                    Product.objects.filter(name=product_name, seller=seller).delete()
 
-            seller_created = 0
-            for prod_idx, (name, desc, cat_name, variants) in enumerate(seller_catalog):
-                full_name = f"{name} — {seller.username[:12]}" if len(sellers) > 1 else name
-
-                if Product.objects.filter(seller=seller, name=full_name).exists():
-                    self.stdout.write(f"  Skip (exists): {full_name}")
+                if Product.objects.filter(name=product_name, seller=seller).exists():
+                    self.stdout.write(f'  [SKIP] {product_name}')
                     continue
 
-                cat = cats.get(cat_name, default_cat)
-                img_url = PLACEHOLDER_IMAGES[prod_idx % len(PLACEHOLDER_IMAGES)]
+                # Resolve category + subcategory
+                cat_obj = cat_objs.get(tmpl['category'])
+                sub_obj = subcat_objs.get(f"{tmpl['category']}|{tmpl['subcategory']}")
 
-                with transaction.atomic():
-                    base_slug = slugify(full_name)
-                    slug = base_slug
-                    if Product.objects.filter(slug=slug).exists():
-                        slug = f"{base_slug}-{uuid.uuid4().hex[:6]}"
-                    product = Product.objects.create(
-                        seller=seller,
-                        name=full_name,
-                        slug=slug,
-                        description=desc,
-                        is_active=True,
+                # Build unique slug
+                base_slug = slugify(product_name)
+                slug = base_slug
+                counter = 1
+                while Product.objects.filter(slug=slug).exists():
+                    slug = f"{base_slug}-{counter}"
+                    counter += 1
+
+                product = Product.objects.create(
+                    name=product_name,
+                    slug=slug,
+                    seller=seller,
+                    tagline=tmpl['tagline'],
+                    description=(
+                        f"{tmpl['tagline']}. {tmpl['name']} is a popular choice among aquarists "
+                        f"originating from {tmpl.get('origin', 'various regions')}. "
+                        f"Suitable for {tmpl['care_level'].lower()}-level keepers."
+                    ),
+                    scientific_name=tmpl.get('scientific_name') or '',
+                    care_level=tmpl['care_level'],
+                    light_requirements=tmpl['light_requirements'],
+                    growth_rate=tmpl['growth_rate'],
+                    co2_requirement=tmpl['co2_requirement'],
+                    water_temperature=tmpl.get('water_temperature') or '',
+                    ph_range=tmpl.get('ph_range') or '',
+                    origin=tmpl.get('origin') or '',
+                    is_rare=tmpl.get('is_rare', False),
+                    sub_category=sub_obj,
+                    is_active=True,
+                )
+
+                if cat_obj:
+                    product.categories.add(cat_obj)
+                if sub_obj and sub_obj.category not in product.categories.all():
+                    product.categories.add(sub_obj.category)
+
+                # Variants
+                for v_tmpl in tmpl['variants']:
+                    ProductVariant.objects.create(
+                        product=product,
+                        name=v_tmpl['name'],
+                        base_price=v_tmpl['base_price'],
+                        gst_rate=v_tmpl['gst_rate'],
+                        commission_rate=v_tmpl['commission_rate'],
+                        stock=v_tmpl['stock'],
+                        packed_weight_grams=v_tmpl.get('packed_weight_grams', 200),
+                        item_category=v_tmpl.get('item_category', 'light'),
+                        length=v_tmpl.get('length', 15),
+                        width=v_tmpl.get('width', 10),
+                        height=v_tmpl.get('height', 8),
+                        weight=Decimal(str(v_tmpl.get('packed_weight_grams', 200))) / Decimal('1000'),
                     )
-                    ProductImage.objects.create(product=product, image_url=img_url, is_primary=True, order=0)
-                    product.categories.add(cat)
 
-                    for v_name, v_price, v_stock, v_cat, v_weight, v_l, v_b, v_h in variants:
-                        gst = float(cat.gst_percentage)
-                        base = round(v_price / (1 + gst / 100), 2)
-                        ProductVariant.objects.create(
-                            product=product,
-                            name=v_name,
-                            base_price=Decimal(str(base)),
-                            gst_rate=cat.gst_percentage,
-                            commission_rate=Decimal("15.00"),
-                            price=Decimal(str(v_price)),
-                            stock=v_stock,
-                            item_category=v_cat,
-                            packed_weight_grams=v_weight,
-                            length=Decimal(str(v_l)),
-                            width=Decimal(str(v_b)),
-                            height=Decimal(str(v_h)),
-                            is_active=True,
-                        )
+                # Image
+                if tmpl.get('image_url'):
+                    ProductImage.objects.create(
+                        product=product,
+                        image_url=tmpl['image_url'],
+                        is_primary=True,
+                        order=0,
+                    )
 
-                self.stdout.write(f"  Created: {full_name} ({len(variants)} variants)")
-                seller_created += 1
+                created_count += 1
+                self.stdout.write(f'  [OK] {product_name}')
 
-            self.stdout.write(self.style.SUCCESS(
-                f"Seller '{seller.username}': {seller_created} products created"
-            ))
-            created_total += seller_created
+            total_created += created_count
+            self.stdout.write(
+                self.style.SUCCESS(f'  → {created_count} products created for {seller.email}')
+            )
 
-        self.stdout.write(self.style.SUCCESS(f"\nDone. Total created: {created_total}"))
+        self.stdout.write(self.style.SUCCESS(
+            f'\nDone. {total_created} products created across {sellers.count()} sellers.'
+        ))
+        self.stdout.write(self.style.SUCCESS(
+            f'Categories: {len(cat_objs)} | Subcategories: {len(subcat_objs)}'
+        ))

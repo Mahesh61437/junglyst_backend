@@ -33,6 +33,7 @@ class Order(SoftDeleteModel):
     estimated_delivery = models.DateField(null=True, blank=True)
     
     is_paid = models.BooleanField(default=False)
+    payment_status = models.CharField(max_length=50, default='pending')
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

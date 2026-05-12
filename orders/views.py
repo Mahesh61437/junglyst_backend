@@ -1,7 +1,9 @@
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.conf import settings
 from django.db import transaction
+from django.db.models import Prefetch
 from django.utils import timezone
 from datetime import timedelta
 from types import SimpleNamespace
@@ -15,7 +17,10 @@ from notifications.models import AppNotification
 from payments.models import Payment
 from payments.razorpay_utils import create_razorpay_order, verify_payment_signature
 from .models import Order, OrderItem, SubOrder
-from .serializers import OrderSerializer, SellerOrderSerializer, SellerSubOrderSerializer
+from .serializers import (
+    OrderSerializer, OrderListSerializer, OrderDetailSerializer,
+    SellerOrderSerializer, SellerSubOrderSerializer,
+)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -41,6 +46,52 @@ def _shipping_fee_for_seller(subtotal: float, has_heavy: bool) -> int:
         if subtotal < 699:   return 99
         if subtotal < 999:   return 49
         return 0
+
+
+def _finalize_order(order, payment=None, payment_data=None):
+    if payment is not None:
+        if payment_data:
+            payment.razorpay_payment_id = payment_data.get('razorpay_payment_id')
+            payment.razorpay_signature = payment_data.get('razorpay_signature')
+        payment.status = 'captured'
+        payment.save()
+
+    order.is_paid = True
+    order.status = 'placed'
+    order.payment_status = 'captured'
+    order.save()
+
+    if order.user:
+        AppNotification.objects.create(
+            user=order.user,
+            title="Order Placed!",
+            message=f"Your order {order.order_number} has been successfully placed and is being prepared."
+        )
+
+        seller_notifs = []
+        for sub in order.sub_orders.select_related('seller').all():
+            item_count = sub.items.count()
+            seller_notifs.append(AppNotification(
+                user=sub.seller,
+                title="New Order Received!",
+                message=(
+                    f"Sub-order {sub.sub_order_number} has been placed with "
+                    f"{item_count} item{'s' if item_count != 1 else ''}. "
+                    f"Please confirm within 48 hours."
+                ),
+            ))
+        if seller_notifs:
+            AppNotification.objects.bulk_create(seller_notifs)
+
+        Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
+        from cart.models import CartItem
+        CartItem.objects.filter(cart__user=order.user).delete()
+
+    for item in order.items.all():
+        if item.variant:
+            item.variant.stock -= item.quantity
+            item.variant.save()
+
 
 class CheckoutView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
@@ -145,11 +196,7 @@ class CheckoutView(generics.GenericAPIView):
         if len(seller_buckets) > 3:
             return Response({"error": "Cart supports up to 3 sellers. Please remove items."}, status=400)
 
-        # SHIP-003: min ₹500 per seller
-        for sid, bucket in seller_buckets.items():
-            if bucket['subtotal'] < 500:
-                store = getattr(getattr(bucket['seller'], 'seller_profile', None), 'store_name', None) or bucket['seller'].username
-                return Response({"error": f"Minimum order from {store} is ₹500."}, status=400)
+        # SHIP-003: min order check removed; accept all cart values
 
         # Totals
         subtotal = sum(float(item.variant.price) * item.quantity for item in cart_items)
@@ -158,10 +205,8 @@ class CheckoutView(generics.GenericAPIView):
             float(item.product.categories.first().gst_percentage if item.product.categories.exists() else 0) / 100
             for item in cart_items
         )
-        total_shipping = sum(
-            _shipping_fee_for_seller(b['subtotal'], b['has_heavy'])
-            for b in seller_buckets.values()
-        )
+        has_heavy = any(b['has_heavy'] for b in seller_buckets.values())
+        total_shipping = _shipping_fee_for_seller(subtotal, has_heavy)
         total_amount = subtotal + gst_total + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
@@ -228,6 +273,25 @@ class CheckoutView(generics.GenericAPIView):
                 "amount": total_amount,
                 "currency": "INR",
             }, status=201)
+        except ValueError as e:
+            if settings.DEBUG:
+                mock_order_id = f"mock-{uuid.uuid4().hex[:12]}"
+                payment = Payment.objects.create(
+                    order=order,
+                    razorpay_order_id=mock_order_id,
+                    amount=total_amount,
+                    status='captured',
+                )
+                _finalize_order(order, payment)
+                return Response({
+                    "order": OrderSerializer(order).data,
+                    "razorpay_order_id": mock_order_id,
+                    "amount": total_amount,
+                    "currency": "INR",
+                    "mock_payment": True,
+                    "message": "Razorpay is not configured. Checkout completed in development fallback mode."
+                }, status=201)
+            return Response({"error": str(e)}, status=400)
         except Exception as e:
             return Response({"error": f"Payment initiation failed: {str(e)}"}, status=500)
 
@@ -258,49 +322,10 @@ class VerifyPaymentView(generics.GenericAPIView):
                         "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
                     }, status=400)
 
-                payment.razorpay_payment_id = razorpay_payment_id
-                payment.razorpay_signature = razorpay_signature
-                payment.status = 'captured'
-                payment.save()
-                
-                order.is_paid = True
-                order.status = 'placed'
-                order.save()
-                
-                # Notify buyer
-                if order.user:
-                    AppNotification.objects.create(
-                        user=order.user,
-                        title="Order Placed!",
-                        message=f"Your order {order.order_number} has been successfully placed and is being prepared."
-                    )
-
-                # Notify each seller about their new sub-order (non-blocking bulk create)
-                seller_notifs = []
-                for sub in order.sub_orders.select_related('seller').all():
-                    item_count = sub.items.count()
-                    seller_notifs.append(AppNotification(
-                        user=sub.seller,
-                        title="New Order Received!",
-                        message=(
-                            f"Sub-order {sub.sub_order_number} has been placed with "
-                            f"{item_count} item{'s' if item_count != 1 else ''}. "
-                            f"Please confirm within 48 hours."
-                        ),
-                    ))
-                if seller_notifs:
-                    AppNotification.objects.bulk_create(seller_notifs)
-
-                for item in order.items.all():
-                    if item.variant:
-                        item.variant.stock -= item.quantity
-                        item.variant.save()
-
-                # Clear the buyer's cart
-                if order.user:
-                    Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
-                    from cart.models import CartItem
-                    CartItem.objects.filter(cart__user=order.user).delete()
+                _finalize_order(order, payment, {
+                    'razorpay_payment_id': razorpay_payment_id,
+                    'razorpay_signature': razorpay_signature,
+                })
 
                 return Response({"message": "Payment verified and order placed"}, status=200)
             except Payment.DoesNotExist:
@@ -309,30 +334,49 @@ class VerifyPaymentView(generics.GenericAPIView):
             return Response({"error": "Invalid payment signature"}, status=400)
 
 class OrderListView(generics.ListAPIView):
-    serializer_class = OrderSerializer
+    serializer_class = OrderListSerializer
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
         user = self.request.user
         if user.role == 'grower':
-            # For growers, return orders that contain their items
-            return Order.objects.filter(items__seller=user).distinct()
-        if user.is_staff or user.role == 'admin':
-            return Order.objects.all()
-        # For collectors, return their own orders
-        return Order.objects.filter(user=user)
+            qs = Order.objects.filter(items__seller=user).distinct()
+        elif user.is_staff or user.role == 'admin':
+            qs = Order.objects.all()
+        else:
+            qs = Order.objects.filter(user=user)
+
+        # Single query for items + their product images — eliminates all N+1
+        items_qs = OrderItem.objects.select_related('product').prefetch_related('product__images')
+        return qs.prefetch_related(
+            Prefetch('items', queryset=items_qs),
+        ).order_by('-created_at')
+
 
 class OrderDetailView(generics.RetrieveAPIView):
-    serializer_class = OrderSerializer
+    serializer_class = OrderDetailSerializer
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
         user = self.request.user
         if user.role == 'grower':
-            return Order.objects.filter(items__seller=user).distinct()
-        if user.is_staff or user.role == 'admin':
-            return Order.objects.all()
-        return Order.objects.filter(user=user)
+            qs = Order.objects.filter(items__seller=user).distinct()
+        elif user.is_staff or user.role == 'admin':
+            qs = Order.objects.all()
+        else:
+            qs = Order.objects.filter(user=user)
+
+        items_qs = OrderItem.objects.select_related('product', 'variant').prefetch_related('product__images')
+        sub_orders_qs = SubOrder.objects.select_related(
+            'seller', 'seller__seller_profile'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+        )
+        return qs.prefetch_related(
+            Prefetch('items', queryset=items_qs),
+            Prefetch('sub_orders', queryset=sub_orders_qs),
+            Prefetch('shipments', to_attr='shipments_prefetched'),
+        )
 
 
 class SellerOrderListView(generics.ListAPIView):

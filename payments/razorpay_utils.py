@@ -1,8 +1,12 @@
 import razorpay
 from django.conf import settings
 
+
 def get_razorpay_client():
+    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+        raise ValueError('Razorpay gateway is not configured. Please set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.')
     return razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
+
 
 def create_razorpay_order(amount_in_paise, currency="INR"):
     client = get_razorpay_client()
@@ -11,7 +15,10 @@ def create_razorpay_order(amount_in_paise, currency="INR"):
         "currency": currency,
         "payment_capture": 1 # Auto capture
     }
-    return client.order.create(data=data)
+    try:
+        return client.order.create(data=data)
+    except Exception as exc:
+        raise RuntimeError(f"Razorpay order creation failed: {exc}") from exc
 
 def verify_payment_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature):
     client = get_razorpay_client()

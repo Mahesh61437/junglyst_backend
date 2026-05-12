@@ -6,14 +6,20 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, ProductVariant, ProductImage, WishlistItem
+from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem
 from cart.models import Cart, CartItem
 from orders.models import Order
 from .serializers import (
     RegisterSerializer, CustomTokenObtainPairSerializer, UserSerializer,
-    ProductSerializer, CategorySerializer, SubCategorySerializer, CartSerializer
+    ProductSerializer, ProductListSerializer, ProductReviewSerializer, CategorySerializer, SubCategorySerializer,
+    CategoryShippingRateSerializer, CartSerializer
 )
 from .storage import upload_to_firebase
+
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+from django.views.decorators.vary import vary_on_cookie
+from django.core.cache import cache
 
 User = get_user_model()
 
@@ -76,16 +82,30 @@ def _product_queryset():
     )
 
 
+def _product_list_queryset():
+    """Lighter queryset for the shop list page"""
+    return Product.objects.select_related(
+        'seller', 'seller__seller_profile', 'sub_category'
+    ).prefetch_related(
+        'variants', 'images', 'categories'
+    )
+
+
 class ProductListView(generics.ListAPIView):
-    serializer_class = ProductSerializer
+    serializer_class = ProductListSerializer
     permission_classes = (permissions.AllowAny,)
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
     filterset_fields = ('categories', 'sub_category', 'seller', 'is_active', 'is_rare')
-    search_fields = ('name', 'description', 'tags__name')
+    search_fields = ('name', 'tags__name', 'scientific_name')
     ordering_fields = ('created_at', 'rating')
+    
+    @method_decorator(cache_page(60 * 60)) # Cache for 1 hour
+    @method_decorator(vary_on_cookie)
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
-        queryset = _product_queryset()
+        queryset = _product_list_queryset()
 
         seller_slug = self.request.query_params.get('seller_slug')
         if seller_slug:
@@ -101,10 +121,25 @@ class ProductListView(generics.ListAPIView):
 
         return queryset
 
+class ProductReviewListCreateView(generics.ListCreateAPIView):
+    serializer_class = ProductReviewSerializer
+    permission_classes = (permissions.AllowAny,)
+
+    def get_queryset(self):
+        queryset = ProductReview.objects.all()
+        product_id = self.request.query_params.get('productId')
+        if product_id:
+            queryset = queryset.filter(product__id=product_id)
+        return queryset.order_by('-created_at')
+
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
     permission_classes = (permissions.IsAuthenticatedOrReadOnly,)
     lookup_field = 'id'
+
+    @method_decorator(cache_page(60 * 60)) # Cache for 1 hour
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
         return _product_queryset()
@@ -230,17 +265,140 @@ class ProductCopyView(generics.GenericAPIView):
         from .serializers import ProductSerializer as PS
         return Response(PS(new_product, context={'request': request}).data, status=201)
 
+class IsAdminOrSuperAdmin(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return request.user and request.user.is_authenticated and (
+            request.user.is_staff or request.user.is_superuser or
+            request.user.role == 'admin'
+        )
+
+
+# ── Public read ───────────────────────────────────────────────────────────────
+
 class CategoryListView(generics.ListAPIView):
-    queryset = Category.objects.all()
+    queryset = Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
     serializer_class = CategorySerializer
     permission_classes = (permissions.AllowAny,)
 
+    @method_decorator(cache_page(60 * 60 * 24)) # Cache for 24 hours
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+
 class SubCategoryListView(generics.ListAPIView):
-    queryset = SubCategory.objects.all()
+    queryset = SubCategory.objects.select_related('category').prefetch_related('shipping_rates').all()
     serializer_class = SubCategorySerializer
     permission_classes = (permissions.AllowAny,)
     filter_backends = (DjangoFilterBackend,)
     filterset_fields = ('category',)
+
+
+# ── Admin CRUD — Categories ───────────────────────────────────────────────────
+
+class CategoryAdminView(generics.ListCreateAPIView):
+    """GET all categories (public) / POST new category (admin)."""
+    serializer_class = CategorySerializer
+    permission_classes = (permissions.AllowAny,)
+
+    def get_queryset(self):
+        return Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
+
+    def post(self, request, *args, **kwargs):
+        self.permission_classes = (IsAdminOrSuperAdmin,)
+        self.check_permissions(request)
+        data = request.data.copy()
+        if not data.get('slug') and data.get('name'):
+            data['slug'] = slugify(data['name'])
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class CategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """GET /PUT /PATCH /DELETE a single category (admin only for write)."""
+    serializer_class = CategorySerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+
+    def get_queryset(self):
+        return Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
+
+    def perform_update(self, serializer):
+        data = self.request.data
+        if not data.get('slug') and data.get('name'):
+            serializer.save(slug=slugify(data['name']))
+        else:
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        instance.delete()  # soft-delete via SoftDeleteModel
+
+
+# ── Admin CRUD — SubCategories ────────────────────────────────────────────────
+
+class SubCategoryAdminView(generics.ListCreateAPIView):
+    serializer_class = SubCategorySerializer
+    filter_backends = (DjangoFilterBackend,)
+    filterset_fields = ('category',)
+
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return [permissions.AllowAny()]
+        return [IsAdminOrSuperAdmin()]
+
+    def get_queryset(self):
+        return SubCategory.objects.select_related('category').prefetch_related('shipping_rates').all()
+
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        if not data.get('slug') and data.get('name'):
+            base = slugify(data['name'])
+            slug = base
+            counter = 1
+            while SubCategory.objects.filter(slug=slug).exists():
+                slug = f"{base}-{counter}"
+                counter += 1
+            data['slug'] = slug
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class SubCategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = SubCategorySerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+
+    def get_queryset(self):
+        return SubCategory.objects.select_related('category').prefetch_related('shipping_rates').all()
+
+    def perform_update(self, serializer):
+        data = self.request.data
+        if not data.get('slug') and data.get('name'):
+            serializer.save(slug=slugify(data['name']))
+        else:
+            serializer.save()
+
+    def perform_destroy(self, instance):
+        instance.delete()
+
+
+# ── Admin CRUD — Shipping Rates ───────────────────────────────────────────────
+
+class ShippingRateAdminView(generics.ListCreateAPIView):
+    serializer_class = CategoryShippingRateSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+    filter_backends = (DjangoFilterBackend,)
+    filterset_fields = ('category', 'sub_category')
+
+    def get_queryset(self):
+        return CategoryShippingRate.objects.select_related('category', 'sub_category').all()
+
+
+class ShippingRateAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
+    serializer_class = CategoryShippingRateSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+    queryset = CategoryShippingRate.objects.all()
 
 class ImageUploadView(generics.GenericAPIView):
     permission_classes = (permissions.IsAuthenticated,)
@@ -342,6 +500,7 @@ class HomeDataView(generics.GenericAPIView):
     """
     permission_classes = (permissions.AllowAny,)
 
+    @method_decorator(cache_page(60 * 10)) # Cache for 10 minutes
     def get(self, request):
         from sellers.models import SellerProfile
         from sellers.serializers import SellerProfileSerializer

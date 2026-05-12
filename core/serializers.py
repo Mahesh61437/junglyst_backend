@@ -3,7 +3,7 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from core.models import (
-    Category, SubCategory, Tag, Product, ProductVariant, ProductImage
+    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview
 )
 from cart.models import Cart, CartItem
 
@@ -57,17 +57,34 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         data['user'] = UserSerializer(self.user).data
         return data
 
+class CategoryShippingRateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CategoryShippingRate
+        fields = ('id', 'category', 'sub_category', 'min_weight_grams', 'max_weight_grams',
+                  'rate', 'free_above_order_value')
+
+
 class SubCategorySerializer(serializers.ModelSerializer):
+    effective_gst = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    effective_commission = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    shipping_rates = CategoryShippingRateSerializer(many=True, read_only=True)
+
     class Meta:
         model = SubCategory
-        fields = ('id', 'name', 'slug', 'description', 'image_url')
+        fields = ('id', 'name', 'slug', 'description', 'image_url',
+                  'gst_percentage', 'commission_rate',
+                  'effective_gst', 'effective_commission', 'shipping_rates')
+
 
 class CategorySerializer(serializers.ModelSerializer):
     subcategories = SubCategorySerializer(many=True, read_only=True)
-    
+    shipping_rates = CategoryShippingRateSerializer(many=True, read_only=True)
+
     class Meta:
         model = Category
-        fields = ('id', 'name', 'slug', 'description', 'image_url', 'gst_percentage', 'commission_rate', 'subcategories')
+        fields = ('id', 'name', 'slug', 'description', 'image_url',
+                  'gst_percentage', 'commission_rate', 'shipping_type',
+                  'subcategories', 'shipping_rates')
 
 class TagSerializer(serializers.ModelSerializer):
     class Meta:
@@ -106,6 +123,37 @@ class ProductImageSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ['product']
 
+class ProductReviewSerializer(serializers.ModelSerializer):
+    product_id = serializers.UUIDField(write_only=True, required=True)
+    product = serializers.PrimaryKeyRelatedField(read_only=True)
+    date = serializers.SerializerMethodField()
+    image = serializers.ImageField(required=False, allow_null=True)
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductReview
+        fields = ('id', 'product', 'product_id', 'author', 'comment', 'plants', 'packaging', 'responsiveness', 'created_at', 'date', 'image', 'image_url')
+        read_only_fields = ('id', 'created_at', 'date', 'image_url')
+
+    def get_date(self, obj):
+        return obj.created_at.strftime('%Y-%m-%d') if obj.created_at else None
+
+    def get_image_url(self, obj):
+        if obj.image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+        return None
+
+    def create(self, validated_data):
+        product_id = validated_data.pop('product_id')
+        try:
+            product = Product.objects.get(id=product_id)
+        except Product.DoesNotExist:
+            raise serializers.ValidationError({'product_id': 'Product not found'})
+        return ProductReview.objects.create(product=product, **validated_data)
+
 class ProductSerializer(serializers.ModelSerializer):
     variants = ProductVariantSerializer(many=True, required=False)
     images = ProductImageSerializer(many=True, required=False)
@@ -133,6 +181,120 @@ class ProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = '__all__'
         read_only_fields = ['slug']
+
+    def get_image(self, obj):
+        images = obj.images.all()
+        return images[0].image_url if images else None
+
+    def get_category(self, obj):
+        categories = obj.categories.all()
+        return categories[0].name if categories else None
+
+    def _first_variant(self, obj):
+        # Uses prefetch cache — avoids 9 separate DB hits per product
+        if not hasattr(obj, '_cached_first_variant'):
+            variants = obj.variants.all()
+            obj._cached_first_variant = variants[0] if variants else None
+        return obj._cached_first_variant
+
+    def get_variant(self, obj):
+        return self._first_variant(obj)
+
+    def get_price(self, obj):
+        v = self._first_variant(obj)
+        return v.price if v else 0
+
+    def get_base_price(self, obj):
+        v = self._first_variant(obj)
+        return v.base_price if v else 0
+
+    def get_gst_rate(self, obj):
+        v = self._first_variant(obj)
+        return v.gst_rate if v else 0
+
+    def get_commission_rate(self, obj):
+        v = self._first_variant(obj)
+        return v.commission_rate if v else 0
+
+    def get_stock(self, obj):
+        v = self._first_variant(obj)
+        return v.stock if v else 0
+
+    def get_weight(self, obj):
+        v = self._first_variant(obj)
+        return v.weight if v else 0
+
+    def get_length(self, obj):
+        v = self._first_variant(obj)
+        return v.length if v else 0
+
+    def get_width(self, obj):
+        v = self._first_variant(obj)
+        return v.width if v else 0
+
+    def get_height(self, obj):
+        v = self._first_variant(obj)
+        return v.height if v else 0
+
+class ProductListSerializer(serializers.ModelSerializer):
+    """
+    Optimized version of ProductSerializer for listing pages.
+    Provides necessary fields for ProductCard while minimizing database hits.
+    """
+    image = serializers.SerializerMethodField()
+    seller = serializers.SerializerMethodField()
+    category_name = serializers.SerializerMethodField()
+    price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    
+    # We include minimal variant info for cart compatibility
+    variants = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = (
+            'id', 'name', 'slug', 'scientific_name', 'care_level', 
+            'growth_rate', 'origin', 'is_rare', 'is_active',
+            'price', 'image', 'seller', 'category_name', 'rating',
+            'variants'
+        )
+
+    def get_image(self, obj):
+        images = obj.images.all()
+        return images[0].image_url if images else None
+
+    def get_seller(self, obj):
+        # Return minimal seller info
+        try:
+            profile = obj.seller.seller_profile
+            return {
+                'id': str(obj.seller.id),
+                'full_name': obj.seller.get_full_name() or obj.seller.username,
+                'seller_profile': {
+                    'store_name': profile.store_name,
+                    'slug': profile.slug,
+                    'brand_color': profile.brand_color
+                }
+            }
+        except:
+            return {'id': str(obj.seller.id), 'full_name': obj.seller.username}
+
+    def get_category_name(self, obj):
+        return obj.sub_category.name if obj.sub_category else (obj.categories.all()[0].name if obj.categories.exists() else None)
+
+    def get_variants(self, obj):
+        # Return only what ProductCard needs: id, price, stock
+        return [
+            {'id': str(v.id), 'price': str(v.price), 'stock': v.stock}
+            for v in obj.variants.all()
+        ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Fallback price if DecimalField doesn't pick it up (though it should via @property or prefetched field)
+        if not data.get('price'):
+            v = instance.variants.all()
+            data['price'] = str(v[0].price) if v else "0"
+        return data
 
     def create(self, validated_data):
         variants_data = validated_data.pop('variants', [])
@@ -301,60 +463,6 @@ class ProductSerializer(serializers.ModelSerializer):
                     img_obj.delete()
 
         return instance
-
-    def _first_variant(self, obj):
-        # Uses prefetch cache — avoids 9 separate DB hits per product
-        if not hasattr(obj, '_cached_first_variant'):
-            variants = obj.variants.all()
-            obj._cached_first_variant = variants[0] if variants else None
-        return obj._cached_first_variant
-
-    def get_variant(self, obj):
-        return self._first_variant(obj)
-
-    def get_price(self, obj):
-        v = self._first_variant(obj)
-        return v.price if v else 0
-
-    def get_base_price(self, obj):
-        v = self._first_variant(obj)
-        return v.base_price if v else 0
-
-    def get_gst_rate(self, obj):
-        v = self._first_variant(obj)
-        return v.gst_rate if v else 0
-
-    def get_commission_rate(self, obj):
-        v = self._first_variant(obj)
-        return v.commission_rate if v else 0
-
-    def get_stock(self, obj):
-        v = self._first_variant(obj)
-        return v.stock if v else 0
-
-    def get_weight(self, obj):
-        v = self._first_variant(obj)
-        return v.weight if v else 0
-
-    def get_length(self, obj):
-        v = self._first_variant(obj)
-        return v.length if v else 0
-
-    def get_width(self, obj):
-        v = self._first_variant(obj)
-        return v.width if v else 0
-
-    def get_height(self, obj):
-        v = self._first_variant(obj)
-        return v.height if v else 0
-
-    def get_image(self, obj):
-        images = obj.images.all()
-        return images[0].image_url if images else None
-
-    def get_category(self, obj):
-        categories = obj.categories.all()
-        return categories[0].name if categories else None
 
 class CartItemSerializer(serializers.ModelSerializer):
     product = ProductSerializer(read_only=True)

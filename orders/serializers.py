@@ -3,20 +3,61 @@ from .models import Order, OrderItem, SubOrder
 from shipping.serializers import ShipmentSerializer
 
 
-class OrderItemSerializer(serializers.ModelSerializer):
+# ── Item serializers ──────────────────────────────────────────────────────────
+
+class OrderItemListSerializer(serializers.ModelSerializer):
+    """Lean item serializer for the order list endpoint — no extra DB hits."""
     product_image = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
-        fields = '__all__'
+        fields = ('id', 'product_name', 'variant_name', 'unit_price', 'quantity', 'product_image')
 
     def get_product_image(self, obj):
-        if obj.product:
-            image = obj.product.images.filter(is_primary=True).first() or obj.product.images.first()
-            if image:
-                return image.image_url
-        return None
+        if not obj.product:
+            return None
+        # Reads from prefetch cache — no extra query when called from OrderListView
+        images = obj.product.images.all()
+        img = next((i for i in images if i.is_primary), None) or next(iter(images), None)
+        return img.image_url if img else None
 
+
+class OrderItemSerializer(serializers.ModelSerializer):
+    """Full item serializer for the order detail endpoint."""
+    product_image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderItem
+        fields = (
+            'id', 'product', 'variant', 'product_name', 'variant_name',
+            'unit_price', 'gst_percentage', 'quantity', 'seller', 'product_image',
+        )
+
+    def get_product_image(self, obj):
+        if not obj.product:
+            return None
+        images = obj.product.images.all()
+        img = next((i for i in images if i.is_primary), None) or next(iter(images), None)
+        return img.image_url if img else None
+
+
+# ── Order list serializer ─────────────────────────────────────────────────────
+
+class OrderListSerializer(serializers.ModelSerializer):
+    """Minimal serializer for GET /orders/ — only what the profile history tab needs."""
+    items = OrderItemListSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Order
+        fields = (
+            'id', 'order_number', 'status', 'payment_status',
+            'subtotal', 'shipping_fee', 'total_amount',
+            'is_paid', 'created_at',
+            'items',
+        )
+
+
+# ── Order detail serializer ───────────────────────────────────────────────────
 
 class SubOrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
@@ -44,7 +85,12 @@ class SubOrderSerializer(serializers.ModelSerializer):
             return obj.seller.get_full_name() or obj.seller.username
 
     def get_shipment(self, obj):
-        shipment = obj.order.shipments.filter(seller=obj.seller).first()
+        # Use the prefetched attr set by OrderDetailView — avoids one query per sub-order
+        shipments = getattr(obj.order, 'shipments_prefetched', None)
+        if shipments is not None:
+            shipment = next((s for s in shipments if s.seller_id == obj.seller_id), None)
+        else:
+            shipment = obj.order.shipments.filter(seller=obj.seller).first()
         return ShipmentSerializer(shipment).data if shipment else None
 
     def get_dispatch_hours_remaining(self, obj):
@@ -52,19 +98,33 @@ class SubOrderSerializer(serializers.ModelSerializer):
             return None
         from django.utils import timezone
         delta = obj.dispatch_deadline - timezone.now()
-        hours = delta.total_seconds() / 3600
-        return max(0, round(hours, 1))
+        return max(0, round(delta.total_seconds() / 3600, 1))
 
 
-class OrderSerializer(serializers.ModelSerializer):
+class OrderDetailSerializer(serializers.ModelSerializer):
+    """Full serializer for GET /orders/<pk>/ — all nested data."""
     items = OrderItemSerializer(many=True, read_only=True)
     sub_orders = SubOrderSerializer(many=True, read_only=True)
     shipments = ShipmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
-        fields = '__all__'
+        fields = (
+            'id', 'order_number', 'status', 'payment_status',
+            'user', 'guest_email', 'guest_phone',
+            'shipping_address',
+            'subtotal', 'shipping_fee', 'gst_total', 'total_amount',
+            'awb_number', 'courier_name', 'estimated_delivery',
+            'is_paid', 'created_at', 'updated_at',
+            'items', 'sub_orders', 'shipments',
+        )
 
+
+# Alias so checkout response (which serializes after create) keeps working
+OrderSerializer = OrderDetailSerializer
+
+
+# ── Seller serializers ────────────────────────────────────────────────────────
 
 class SellerSubOrderSerializer(serializers.ModelSerializer):
     """Sub-order view for the seller dashboard — seller sees only their sub-order."""
