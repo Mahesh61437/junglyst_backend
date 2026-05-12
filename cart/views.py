@@ -1,9 +1,27 @@
 from rest_framework import viewsets, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from django.db.models import Prefetch
 from core.models import ProductVariant
 from .models import Cart, CartItem
 from .serializers import CartSerializer
+
+
+def _cart_with_prefetch(cart):
+    """Re-fetch cart with all related data in a fixed number of queries."""
+    return (
+        Cart.objects.prefetch_related(
+            Prefetch(
+                'items',
+                queryset=CartItem.objects.select_related(
+                    'variant',
+                    'product',
+                    'product__seller',
+                    'product__seller__seller_profile',
+                ).prefetch_related('product__images'),
+            )
+        ).get(pk=cart.pk)
+    )
 
 class CartViewSet(viewsets.ModelViewSet):
     serializer_class = CartSerializer
@@ -25,7 +43,7 @@ class CartViewSet(viewsets.ModelViewSet):
 
     def list(self, request):
         cart = self.get_cart(request)
-        serializer = self.get_serializer(cart)
+        serializer = self.get_serializer(_cart_with_prefetch(cart))
         return Response(serializer.data)
 
     @action(detail=False, methods=['post'])
@@ -63,8 +81,8 @@ class CartViewSet(viewsets.ModelViewSet):
             
         item.quantity = new_quantity
         item.save()
-            
-        serializer = self.get_serializer(cart)
+
+        serializer = self.get_serializer(_cart_with_prefetch(cart))
         return Response(serializer.data)
 
     @action(detail=False, methods=['post'])
@@ -92,4 +110,4 @@ class CartViewSet(viewsets.ModelViewSet):
             return Response({"error": "Item not found"}, status=404)
             
         cart = self.get_cart(request)
-        return Response(self.get_serializer(cart).data)
+        return Response(self.get_serializer(_cart_with_prefetch(cart)).data)
