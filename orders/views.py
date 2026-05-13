@@ -264,12 +264,15 @@ class CheckoutView(generics.GenericAPIView):
             razorpay_order = create_razorpay_order(int(total_amount * 100))
             Payment.objects.create(
                 order=order,
+                gateway='razorpay',
                 razorpay_order_id=razorpay_order['id'],
                 amount=total_amount,
             )
             return Response({
                 "order": OrderSerializer(order).data,
+                "gateway": "razorpay",
                 "razorpay_order_id": razorpay_order['id'],
+                "razorpay_key_id": settings.RAZORPAY_KEY_ID,
                 "amount": total_amount,
                 "currency": "INR",
             }, status=201)
@@ -278,6 +281,7 @@ class CheckoutView(generics.GenericAPIView):
                 mock_order_id = f"mock-{uuid.uuid4().hex[:12]}"
                 payment = Payment.objects.create(
                     order=order,
+                    gateway='razorpay',
                     razorpay_order_id=mock_order_id,
                     amount=total_amount,
                     status='captured',

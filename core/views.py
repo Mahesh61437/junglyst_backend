@@ -126,11 +126,30 @@ class ProductReviewListCreateView(generics.ListCreateAPIView):
     permission_classes = (permissions.AllowAny,)
 
     def get_queryset(self):
-        queryset = ProductReview.objects.all()
+        queryset = ProductReview.objects.select_related('product').all()
         product_id = self.request.query_params.get('productId')
         if product_id:
             queryset = queryset.filter(product__id=product_id)
         return queryset.order_by('-created_at')
+
+    def list(self, request, *args, **kwargs):
+        product_id = request.query_params.get('productId')
+        if not product_id:
+            return super().list(request, *args, **kwargs)
+
+        cache_key = f'reviews_{product_id}'
+        data = cache.get(cache_key)
+        if data is None:
+            response = super().list(request, *args, **kwargs)
+            cache.set(cache_key, response.data, 60 * 5)  # 5-minute TTL
+            return response
+        return Response(data)
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        # Bust the cache when a new review is posted
+        cache.delete(f'reviews_{instance.product_id}')
+        return instance
 
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ProductSerializer
@@ -280,9 +299,18 @@ class CategoryListView(generics.ListAPIView):
     serializer_class = CategorySerializer
     permission_classes = (permissions.AllowAny,)
 
-    @method_decorator(cache_page(60 * 60 * 24)) # Cache for 24 hours
+    _CACHE_KEY = 'categories_list_v1'
+    _CACHE_TTL = 60 * 60 * 24  # 24 hours
+
     def get(self, request, *args, **kwargs):
-        return super().get(request, *args, **kwargs)
+        # Explicit cache.get/set — cache_page is incompatible with DRF's
+        # Vary: Accept header and never produces cache hits.
+        data = cache.get(self._CACHE_KEY)
+        if data is None:
+            response = super().get(request, *args, **kwargs)
+            cache.set(self._CACHE_KEY, response.data, self._CACHE_TTL)
+            return response
+        return Response(data)
 
 
 class SubCategoryListView(generics.ListAPIView):

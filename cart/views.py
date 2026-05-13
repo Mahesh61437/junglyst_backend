@@ -18,7 +18,7 @@ def _cart_with_prefetch(cart):
                     'product',
                     'product__seller',
                     'product__seller__seller_profile',
-                ).prefetch_related('product__images'),
+                ).prefetch_related('product__images', 'variant__images'),
             )
         ).get(pk=cart.pk)
     )
