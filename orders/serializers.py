@@ -222,10 +222,14 @@ class OrderSuccessSerializer(serializers.ModelSerializer):
     Optimized to reduce API response time.
     """
     total_quantity = serializers.SerializerMethodField()
+    items = OrderItemListSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
-        fields = ('id', 'order_number', 'total_quantity', 'total_amount', 'is_paid')
+        fields = (
+            'id', 'order_number', 'total_quantity', 'total_amount', 'is_paid',
+            'shipping_address', 'subtotal', 'shipping_fee', 'items'
+        )
 
     def get_total_quantity(self, obj):
         """Calculate total items ordered across all order items."""

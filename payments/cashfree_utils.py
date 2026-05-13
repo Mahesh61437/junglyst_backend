@@ -24,7 +24,7 @@ def create_cashfree_order(order_id, order_amount, customer_details, order_curren
     
     payload = {
         "order_id": order_id,
-        "order_amount": order_amount,
+        "order_amount": round(float(order_amount), 2),
         "order_currency": order_currency,
         "customer_details": {
             "customer_id": customer_details.get("customer_id", "guest"),
@@ -34,15 +34,12 @@ def create_cashfree_order(order_id, order_amount, customer_details, order_curren
         },
         "order_meta": {
             "return_url": f"{frontend_url}/payment-status?order_id={order_id}",
-            "notify_url": f"{backend_url}/api/payments/webhook/cashfree/",
-            "payment_methods_filters": {
-                "methods": {
-                    "action": "ALLOW",
-                    "values": ["upi"]
-                }
-            }
+            "payment_methods": "upi"
         }
     }
+    
+    if "localhost" not in backend_url and "127.0.0.1" not in backend_url:
+        payload["order_meta"]["notify_url"] = f"{backend_url}/api/payments/webhook/cashfree/"
     
     response = requests.post(url, json=payload, headers=headers, timeout=25)
     if response.status_code == 200:

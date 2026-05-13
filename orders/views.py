@@ -212,7 +212,7 @@ class CheckoutView(generics.GenericAPIView):
         )
         has_heavy = any(b['has_heavy'] for b in seller_buckets.values())
         total_shipping = _shipping_fee_for_seller(subtotal, has_heavy)
-        total_amount = subtotal + gst_total + total_shipping
+        total_amount = subtotal + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
         order_number = _generate_order_number()
@@ -275,8 +275,8 @@ class CheckoutView(generics.GenericAPIView):
                     customer_details={
                         "customer_id": str(request.user.id) if request.user.is_authenticated else "guest",
                         "customer_email": email or "guest@example.com",
-                        "customer_phone": str(phone) if phone else "9999999999",
-                        "customer_name": request.user.get_full_name() if request.user.is_authenticated else "Guest User"
+                        "customer_phone": ''.join(filter(str.isdigit, str(phone)))[-10:] if phone else "9999999999",
+                        "customer_name": request.user.get_full_name().strip() if (request.user.is_authenticated and request.user.get_full_name().strip()) else "Guest User"
                     }
                 )
                 payment = Payment.objects.create(
