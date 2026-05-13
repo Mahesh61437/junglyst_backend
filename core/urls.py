@@ -8,6 +8,7 @@ from .views import (
     ShippingRateAdminView, ShippingRateAdminDetailView,
     ImageUploadView, GrowerProductCreateView, AdminProductCreateView,
     ProductCopyView, SyncCartView, WishlistView, HomeDataView,
+    ForgotPasswordView, ResetPasswordView
 )
 
 urlpatterns = [
@@ -15,6 +16,8 @@ urlpatterns = [
     path('register/', RegisterView.as_view(), name='auth_register'),
     path('login/', CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('forgot-password/', ForgotPasswordView.as_view(), name='forgot_password'),
+    path('reset-password/', ResetPasswordView.as_view(), name='reset_password'),
     path('me/', UserProfileView.as_view(), name='user_profile'),
     path('sync-cart/', SyncCartView.as_view(), name='sync_cart'),
 

@@ -8,6 +8,7 @@ from django.utils import timezone
 from datetime import timedelta
 from types import SimpleNamespace
 import uuid
+from decimal import Decimal
 from cart.models import Cart
 from core.models import ProductVariant
 from shipping.models import ShippingAddress
@@ -15,12 +16,15 @@ from shipping.serializers import ShippingAddressSerializer
 from shipping.pincode_zones import classify_pincode
 from notifications.models import AppNotification
 from payments.models import Payment
-from payments.razorpay_utils import create_razorpay_order, verify_payment_signature
+from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
+from payments.models import PaymentGatewaySettings, PaymentGateway
+from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
 from .models import Order, OrderItem, SubOrder
 from .serializers import (
     OrderSerializer, OrderListSerializer, OrderDetailSerializer,
     SellerOrderSerializer, SellerSubOrderSerializer,
-)
+    OrderSuccessSerializer, OrderTrackingSerializer)
+from .email_utils import send_order_confirmation_emails
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -159,8 +163,8 @@ class CheckoutView(generics.GenericAPIView):
                 }
                 email = request.user.email
                 phone = request.user.phone
-            except ShippingAddress.DoesNotExist:
-                return Response({"error": "Shipping address not found"}, status=400)
+            except (ShippingAddress.DoesNotExist, ValueError):
+                return Response({"error": "Shipping address not found or invalid"}, status=400)
         else:
             # Guest checkout OR logged-in user with a one-time address
             if not guest_info:
@@ -202,12 +206,13 @@ class CheckoutView(generics.GenericAPIView):
         subtotal = sum(float(item.variant.price) * item.quantity for item in cart_items)
         gst_total = sum(
             float(item.variant.price) * item.quantity *
-            float(item.product.categories.first().gst_percentage if item.product.categories.exists() else 0) / 100
+            (float(item.product.categories.first().gst_percentage) / (100 + float(item.product.categories.first().gst_percentage)))
+            if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
         has_heavy = any(b['has_heavy'] for b in seller_buckets.values())
         total_shipping = _shipping_fee_for_seller(subtotal, has_heavy)
-        total_amount = subtotal + gst_total + total_shipping
+        total_amount = subtotal + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
         order_number = _generate_order_number()
@@ -240,7 +245,7 @@ class CheckoutView(generics.GenericAPIView):
                 subtotal=bucket['subtotal'],
                 shipping_fee=seller_shipping,
                 seller_total=bucket['subtotal'] + seller_shipping,
-                status='placed',
+                status='pending',
                 dispatch_deadline=dispatch_deadline,
             )
 
@@ -259,60 +264,105 @@ class CheckoutView(generics.GenericAPIView):
                     seller=bucket['seller'],
                 )
 
+        active_gateway = PaymentGatewaySettings.get_solo().active_gateway
+
+        # Cashfree
+        if active_gateway == PaymentGateway.CASHFREE:
+            try:
+                cashfree_order = create_cashfree_order(
+                    order_id=order.order_number,
+                    order_amount=float(total_amount),
+                    customer_details={
+                        "customer_id": str(request.user.id) if request.user.is_authenticated else "guest",
+                        "customer_email": email or "guest@example.com",
+                        "customer_phone": ''.join(filter(str.isdigit, str(phone)))[-10:] if phone else "9999999999",
+                        "customer_name": request.user.get_full_name().strip() if (request.user.is_authenticated and request.user.get_full_name().strip()) else "Guest User"
+                    }
+                )
+                payment = Payment.objects.create(
+                    order=order,
+                    gateway=PaymentGateway.CASHFREE,
+                    cashfree_order_id=cashfree_order['order_id'],
+                    cashfree_session_id=cashfree_order['payment_session_id'],
+                    amount=total_amount,
+                )
+                # Schedule delayed reconciliation checks at 15min, 30min, 1hr, 24hr
+                try:
+                    from payments.tasks import schedule_payment_checks
+                    schedule_payment_checks(payment.id)
+                except Exception:
+                    pass  # Don't block checkout if Celery is down
+                return Response({
+                    "gateway": PaymentGateway.CASHFREE,
+                    "order": OrderSuccessSerializer(order).data,
+                    "payment_session_id": cashfree_order['payment_session_id'],
+                    "cashfree_order_id": cashfree_order['order_id'],
+                    "amount": total_amount,
+                    "currency": "INR",
+                }, status=201)
+            except Exception as e:
+                print(f"DEBUG: Cashfree failed: {str(e)}")
+                return Response({
+                    "error": f"Failed to initialize payment gateway: {str(e)}"
+                }, status=400)
+
         # Razorpay
         try:
-            razorpay_order = create_razorpay_order(int(total_amount * 100))
-            Payment.objects.create(
+            rzp_order = create_razorpay_order(
+                receipt=order.order_number,
+                amount_inr=float(total_amount),
+                currency="INR",
+            )
+            payment = Payment.objects.create(
                 order=order,
-                gateway='razorpay',
-                razorpay_order_id=razorpay_order['id'],
+                gateway=PaymentGateway.RAZORPAY,
+                razorpay_order_id=rzp_order["id"],
                 amount=total_amount,
             )
+            # Schedule delayed reconciliation checks at 15min, 30min, 1hr, 24hr
+            try:
+                from payments.tasks import schedule_payment_checks
+                schedule_payment_checks(payment.id)
+            except Exception:
+                pass  # Don't block checkout if Celery is down
             return Response({
-                "order": OrderSerializer(order).data,
-                "gateway": "razorpay",
-                "razorpay_order_id": razorpay_order['id'],
-                "razorpay_key_id": settings.RAZORPAY_KEY_ID,
+                "gateway": PaymentGateway.RAZORPAY,
+                "order": OrderSuccessSerializer(order).data,
+                "razorpay_order_id": rzp_order["id"],
+                "razorpay_key_id": getattr(settings, "RAZORPAY_KEY_ID", ""),
                 "amount": total_amount,
                 "currency": "INR",
             }, status=201)
-        except ValueError as e:
-            if settings.DEBUG:
-                mock_order_id = f"mock-{uuid.uuid4().hex[:12]}"
-                payment = Payment.objects.create(
-                    order=order,
-                    gateway='razorpay',
-                    razorpay_order_id=mock_order_id,
-                    amount=total_amount,
-                    status='captured',
-                )
-                _finalize_order(order, payment)
-                return Response({
-                    "order": OrderSerializer(order).data,
-                    "razorpay_order_id": mock_order_id,
-                    "amount": total_amount,
-                    "currency": "INR",
-                    "mock_payment": True,
-                    "message": "Razorpay is not configured. Checkout completed in development fallback mode."
-                }, status=201)
-            return Response({"error": str(e)}, status=400)
         except Exception as e:
-            return Response({"error": f"Payment initiation failed: {str(e)}"}, status=500)
+            print(f"DEBUG: Razorpay failed: {str(e)}")
+            return Response({
+                "error": f"Failed to initialize payment gateway: {str(e)}"
+            }, status=400)
 
 class VerifyPaymentView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
 
     def post(self, request):
-        razorpay_order_id = request.data.get('razorpay_order_id')
-        razorpay_payment_id = request.data.get('razorpay_payment_id')
-        razorpay_signature = request.data.get('razorpay_signature')
-        
-        if verify_payment_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature):
+        gateway = request.data.get("gateway") or PaymentGateway.CASHFREE
+
+        if gateway == PaymentGateway.RAZORPAY:
+            razorpay_order_id = request.data.get("razorpay_order_id")
+            razorpay_payment_id = request.data.get("razorpay_payment_id")
+            razorpay_signature = request.data.get("razorpay_signature")
+
+            if not (razorpay_order_id and razorpay_payment_id and razorpay_signature):
+                return Response({"error": "razorpay_order_id, razorpay_payment_id, razorpay_signature are required"}, status=400)
+
+            if not verify_razorpay_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature):
+                return Response({"error": "Invalid payment signature"}, status=400)
+
             try:
                 payment = Payment.objects.get(razorpay_order_id=razorpay_order_id)
                 order = payment.order
-                
-                # Final Stock Check before capture
+
+                # Idempotency guard: already captured → return success, skip double processing
+                if payment.status == 'captured':
+                    return Response({"message": "Payment already verified"}, status=200)
                 insufficient_items = []
                 for item in order.items.all():
                     if item.variant and item.variant.stock < item.quantity:
@@ -321,21 +371,360 @@ class VerifyPaymentView(generics.GenericAPIView):
                 if insufficient_items:
                     # In a real scenario, we would trigger a refund here
                     order.status = 'failed'
+                    order.payment_status = 'failed'
                     order.save()
                     return Response({
                         "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
                     }, status=400)
 
-                _finalize_order(order, payment, {
-                    'razorpay_payment_id': razorpay_payment_id,
-                    'razorpay_signature': razorpay_signature,
-                })
+                payment.gateway = PaymentGateway.RAZORPAY
+                payment.razorpay_payment_id = razorpay_payment_id
+                payment.razorpay_signature = razorpay_signature
+                payment.status = 'captured'
+                payment.gateway_status = 'captured'
+                payment.paid_at = timezone.now()
+                # Fetch payment details from Razorpay for method & bank reference
+                try:
+                    import requests as req
+                    from payments.razorpay_utils import _auth
+                    key_id, key_secret = _auth()
+                    rzp_resp = req.get(
+                        f'https://api.razorpay.com/v1/payments/{razorpay_payment_id}',
+                        auth=(key_id, key_secret), timeout=10,
+                    ).json()
+                    payment.method = rzp_resp.get('method', '')
+                    payment.bank_reference = (
+                        rzp_resp.get('acquirer_data', {}).get('upi_transaction_id', '')
+                        or rzp_resp.get('acquirer_data', {}).get('bank_transaction_id', '')
+                    )
+                    payment.gateway_response = rzp_resp
+                except Exception:
+                    pass  # Don't block capture if detail fetch fails
+                payment.save()
+                
+                order.is_paid = True
+                order.payment_status = 'completed'
+                order.status = 'placed'
+                order.payment_gateway = PaymentGateway.RAZORPAY
+                order.save()
+                
+                # Notify buyer
+                if order.user:
+                    AppNotification.objects.create(
+                        user=order.user,
+                        title="Order Placed!",
+                        message=f"Your order {order.order_number} has been successfully placed and is being prepared."
+                    )
 
-                return Response({"message": "Payment verified and order placed"}, status=200)
+                # Notify each seller about their new sub-order (non-blocking bulk create)
+                seller_notifs = []
+                for sub in order.sub_orders.select_related('seller').all():
+                    sub.status = 'placed'
+                    sub.save()
+                    item_count = sub.items.count()
+                    seller_notifs.append(AppNotification(
+                        user=sub.seller,
+                        title="New Order Received!",
+                        message=(
+                            f"Sub-order {sub.sub_order_number} has been placed with "
+                            f"{item_count} item{'s' if item_count != 1 else ''}. "
+                            f"Please confirm within 48 hours."
+                        ),
+                    ))
+                if seller_notifs:
+                    AppNotification.objects.bulk_create(seller_notifs)
+
+                for item in order.items.all():
+                    if item.variant:
+                        item.variant.stock -= item.quantity
+                        item.variant.save()
+
+                # Clear the buyer's cart
+                if order.user:
+                    Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user=order.user).delete()
+
+                # Send confirmation emails to customer, admins, and sellers
+                send_order_confirmation_emails(order)
+
+                return Response({
+                    "message": "Payment verified and order placed",
+                    "order": OrderSuccessSerializer(order).data
+                }, status=200)
             except Payment.DoesNotExist:
                 return Response({"error": "Payment record not found"}, status=404)
-        else:
-            return Response({"error": "Invalid payment signature"}, status=400)
+
+        # Default: Cashfree
+        cashfree_order_id = request.data.get('cashfree_order_id')
+        if not cashfree_order_id:
+            return Response({"error": "cashfree_order_id is required"}, status=400)
+        is_verified, cf_payment_id, cf_payment_data = verify_cashfree_payment(cashfree_order_id)
+        if is_verified:
+            try:
+                payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
+                order = payment.order
+
+                # Idempotency guard: already captured → return success, skip double processing
+                if payment.status == 'captured':
+                    return Response({"message": "Payment already verified"}, status=200)
+                insufficient_items = []
+                for item in order.items.all():
+                    if item.variant and item.variant.stock < item.quantity:
+                        insufficient_items.append(item.product_name)
+                
+                if insufficient_items:
+                    order.status = 'failed'
+                    order.payment_status = 'failed'
+                    order.save()
+                    return Response({
+                        "error": f"Fulfillment integrity compromised. The following specimens went out of stock during your transaction: {', '.join(insufficient_items)}. Please contact support for a refund."
+                    }, status=400)
+
+                payment.gateway = PaymentGateway.CASHFREE
+                payment.cashfree_payment_id = cf_payment_id
+                payment.status = 'captured'
+                payment.gateway_status = 'SUCCESS'
+                payment.paid_at = timezone.now()
+                # Capture method & bank reference from gateway response
+                if cf_payment_data:
+                    payment.method = cf_payment_data.get('payment_group', '')
+                    payment.bank_reference = (
+                        cf_payment_data.get('bank_reference', '')
+                        or cf_payment_data.get('utr', '')
+                    )
+                    payment.gateway_response = cf_payment_data
+                payment.save()
+                
+                order.is_paid = True
+                order.payment_status = 'completed'
+                order.status = 'placed'
+                order.payment_gateway = PaymentGateway.CASHFREE
+                order.save()
+                
+                # Notify buyer
+                if order.user:
+                    AppNotification.objects.create(
+                        user=order.user,
+                        title="Order Placed!",
+                        message=f"Your order {order.order_number} has been successfully placed and is being prepared."
+                    )
+
+                # Notify each seller about their new sub-order (non-blocking bulk create)
+                seller_notifs = []
+                for sub in order.sub_orders.select_related('seller').all():
+                    sub.status = 'placed'
+                    sub.save()
+                    item_count = sub.items.count()
+                    seller_notifs.append(AppNotification(
+                        user=sub.seller,
+                        title="New Order Received!",
+                        message=(
+                            f"Sub-order {sub.sub_order_number} has been placed with "
+                            f"{item_count} item{'s' if item_count != 1 else ''}. "
+                            f"Please confirm within 48 hours."
+                        ),
+                    ))
+                if seller_notifs:
+                    AppNotification.objects.bulk_create(seller_notifs)
+
+                for item in order.items.all():
+                    if item.variant:
+                        item.variant.stock -= item.quantity
+                        item.variant.save()
+
+                # Clear the buyer's cart
+                if order.user:
+                    Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user=order.user).delete()
+
+                # Send confirmation emails to customer, admins, and sellers
+                send_order_confirmation_emails(order)
+
+                return Response({
+                    "message": "Payment verified and order placed",
+                    "order": OrderSuccessSerializer(order).data
+                }, status=200)
+            except Payment.DoesNotExist:
+                return Response({"error": "Payment record not found"}, status=404)
+
+        # Payment not yet confirmed — could be still processing or failed
+        # Check the actual payment status at Cashfree to give a useful response
+        try:
+            import requests as req
+            from payments.cashfree_utils import get_cashfree_url, get_cashfree_headers
+            cf_url = f"{get_cashfree_url()}/{cashfree_order_id}/payments"
+            cf_resp = req.get(cf_url, headers=get_cashfree_headers(), timeout=10)
+            if cf_resp.status_code == 200:
+                for p in cf_resp.json():
+                    pstatus = (p.get("payment_status") or "").upper()
+                    if pstatus in ("PENDING", "PROCESSING"):
+                        return Response({
+                            "error": "Payment is still being processed by your bank. Please check My Orders in a few minutes.",
+                            "status": "processing",
+                        }, status=202)
+        except Exception:
+            pass
+
+        return Response({"error": "Payment could not be verified. If money was debited, please check My Orders or contact support."}, status=400)
+
+
+class PaymentStatusView(APIView):
+    """
+    GET /api/orders/payment-status/?cashfree_order_id=xxx
+    GET /api/orders/payment-status/?razorpay_order_id=xxx
+
+    Real-time payment status check — called by the frontend when the
+    payment modal closes in an ambiguous state (user entered PIN but
+    modal closed before the bank response arrived).
+
+    Returns:
+      { status: 'success' | 'processing' | 'failed', order_number? }
+
+    If the gateway confirms success and our DB hasn't captured yet,
+    this view captures the payment immediately (same as VerifyPaymentView),
+    so the reconcile task doesn't need to wait an hour.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        cashfree_order_id = request.query_params.get('cashfree_order_id')
+        razorpay_order_id = request.query_params.get('razorpay_order_id')
+
+        if not cashfree_order_id and not razorpay_order_id:
+            return Response({"error": "cashfree_order_id or razorpay_order_id required"}, status=400)
+
+        # ── Cashfree ────────────────────────────────────────────────────────
+        if cashfree_order_id:
+            try:
+                payment = Payment.objects.select_related('order').get(
+                    cashfree_order_id=cashfree_order_id
+                )
+            except Payment.DoesNotExist:
+                return Response({"status": "failed"}, status=404)
+
+            # Already captured in our DB → success
+            if payment.status == 'captured':
+                return Response({
+                    "status": "success",
+                    "order_number": payment.order.order_number,
+                    "order": OrderSerializer(payment.order).data,
+                })
+
+            # Query Cashfree API for real-time status
+            try:
+                is_paid, cf_payment_id, cf_payment_data = verify_cashfree_payment(cashfree_order_id)
+            except Exception:
+                # Gateway unreachable → tell frontend to keep polling
+                return Response({"status": "processing"})
+
+            if is_paid:
+                # Capture immediately (don't wait for reconcile task)
+                try:
+                    from payments.tasks import _capture_payment
+                    _capture_payment(payment, cf_payment_id, cf_payment_data)
+                except Exception:
+                    pass  # reconcile task will catch it
+                return Response({
+                    "status": "success",
+                    "order_number": payment.order.order_number,
+                    "order": OrderSerializer(payment.order).data,
+                })
+
+            # Check if Cashfree confirms a failure
+            # (verify_cashfree_payment returns False for both PENDING and FAILED)
+            # We need to distinguish — call the payments list endpoint directly
+            try:
+                import requests as req
+                from payments.cashfree_utils import get_cashfree_url, get_cashfree_headers
+                url = f"{get_cashfree_url()}/{cashfree_order_id}/payments"
+                r = req.get(url, headers=get_cashfree_headers(), timeout=10)
+                if r.status_code == 200:
+                    for p in r.json():
+                        pstatus = p.get("payment_status", "").upper()
+                        if pstatus in ("FAILED", "CANCELLED", "VOID", "NOT_ATTEMPTED"):
+                            return Response({"status": "failed"})
+                        if pstatus == "SUCCESS":
+                            return Response({
+                                "status": "success",
+                                "order_number": payment.order.order_number,
+                                "order": OrderSerializer(payment.order).data,
+                            })
+            except Exception:
+                pass
+
+            return Response({"status": "processing"})
+
+        # ── Razorpay ─────────────────────────────────────────────────────────
+        if razorpay_order_id:
+            try:
+                payment = Payment.objects.select_related('order').get(
+                    razorpay_order_id=razorpay_order_id
+                )
+            except Payment.DoesNotExist:
+                return Response({"status": "failed"}, status=404)
+
+            if payment.status == 'captured':
+                return Response({
+                    "status": "success",
+                    "order_number": payment.order.order_number,
+                    "order": OrderSerializer(payment.order).data,
+                })
+
+            # Query Razorpay API
+            try:
+                import requests as req
+                from payments.razorpay_utils import _auth
+                key_id, key_secret = _auth()
+                url = f"https://api.razorpay.com/v1/orders/{razorpay_order_id}/payments"
+                r = req.get(url, auth=(key_id, key_secret), timeout=10)
+                if r.status_code == 200:
+                    for p in r.json().get('items', []):
+                        pstatus = p.get('status', '')
+                        if pstatus == 'captured':
+                            try:
+                                from payments.tasks import _capture_payment
+                                payment.razorpay_payment_id = p.get('id')
+                                _capture_payment(payment, p.get('id'))
+                            except Exception:
+                                pass
+                            return Response({
+                                "status": "success",
+                                "order_number": payment.order.order_number,
+                                "order": OrderSerializer(payment.order).data,
+                            })
+                        if pstatus == 'failed':
+                            return Response({"status": "failed"})
+            except Exception:
+                pass
+
+            return Response({"status": "processing"})
+
+
+class CancelOrderView(APIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request, pk):
+        try:
+            order = Order.objects.get(id=pk, user=request.user)
+        except Order.DoesNotExist:
+            return Response({'error': 'Order not found'}, status=404)
+
+        if order.status != 'pending':
+            return Response({'error': f'Cannot cancel order with status {order.status}'}, status=400)
+
+        order.status = 'cancelled'
+        order.payment_status = 'failed'
+        order.save()
+
+        # Cancel sub-orders
+        for sub in order.sub_orders.all():
+            sub.status = 'cancelled'
+            sub.save()
+
+        return Response({'message': 'Order cancelled successfully'})
+
 
 class PaymentStatusView(APIView):
     permission_classes = (permissions.AllowAny,)
@@ -415,6 +804,53 @@ class OrderDetailView(generics.RetrieveAPIView):
         )
 
 
+class OrderTrackView(APIView):
+    """
+    GET /api/orders/track/?order_id=<uuid>
+    Public order tracking endpoint.
+    Anyone with a valid order_id can track the order status.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        order_id = request.query_params.get('order_id')
+        order_number = request.query_params.get('order_number')
+        
+        if not order_id and not order_number:
+            return Response({'error': 'order_id or order_number query parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        order_uuid = None
+        if order_id:
+            try:
+                order_uuid = uuid.UUID(str(order_id))
+            except ValueError:
+                return Response({'error': 'Invalid order_id format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Build optimised queryset with all prefetches the serializer needs
+        items_qs = OrderItem.objects.select_related('product', 'variant').prefetch_related('product__images')
+        sub_orders_qs = SubOrder.objects.select_related(
+            'seller', 'seller__seller_profile'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+        )
+        qs = Order.objects.prefetch_related(
+            Prefetch('items', queryset=items_qs),
+            Prefetch('sub_orders', queryset=sub_orders_qs),
+            'shipments',
+            'payments',
+        )
+
+        if order_uuid:
+            order = qs.filter(id=order_uuid).first()
+        else:
+            order = qs.filter(order_number=order_number).first()
+
+        if not order:
+            return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(OrderTrackingSerializer(order).data)
+
+
 class SellerOrderListView(generics.ListAPIView):
     """Grower-scoped order list — items and shipment pre-filtered to the seller."""
     serializer_class = SellerOrderSerializer
@@ -423,7 +859,7 @@ class SellerOrderListView(generics.ListAPIView):
     def get_queryset(self):
         return (
             Order.objects
-            .filter(items__seller=self.request.user)
+            .filter(items__seller=self.request.user, is_paid=True)
             .distinct()
             .prefetch_related('items', 'shipments')
             .order_by('-created_at')
@@ -436,11 +872,16 @@ class SellerSubOrderListView(generics.ListAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        qs = SubOrder.objects.filter(seller=self.request.user).select_related('order').prefetch_related('items')
+        qs = SubOrder.objects.filter(seller=self.request.user, order__is_paid=True).select_related('order').prefetch_related('items')
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
         return qs.order_by('-created_at')
+
+    def paginate_queryset(self, queryset):
+        if self.request.query_params.get('no_pagination'):
+            return None
+        return super().paginate_queryset(queryset)
 
 
 class ConfirmSubOrderView(APIView):

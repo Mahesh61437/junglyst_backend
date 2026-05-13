@@ -12,6 +12,12 @@ class OrderStatus(models.TextChoices):
     CANCELLED = 'cancelled', _('Cancelled')
     RETURNED = 'returned', _('Returned')
 
+class PaymentStatus(models.TextChoices):
+    PENDING = 'pending', _('Pending')
+    FAILED = 'failed', _('Failed')
+    COMPLETED = 'completed', _('Completed')
+    REFUNDED = 'refunded', _('Refunded')
+
 class Order(SoftDeleteModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     order_number = models.CharField(max_length=20, unique=True)
@@ -33,7 +39,8 @@ class Order(SoftDeleteModel):
     estimated_delivery = models.DateField(null=True, blank=True)
     
     is_paid = models.BooleanField(default=False)
-    payment_status = models.CharField(max_length=50, default='pending')
+    payment_status = models.CharField(max_length=20, choices=PaymentStatus.choices, default=PaymentStatus.PENDING)
+    payment_gateway = models.CharField(max_length=20, blank=True, null=True)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -42,6 +49,7 @@ class Order(SoftDeleteModel):
         return f"Order {self.order_number}"
 
 class SubOrderStatus(models.TextChoices):
+    PENDING = 'pending', _('Pending')
     PLACED = 'placed', _('Placed')
     CONFIRMED = 'confirmed', _('Confirmed')
     PACKING = 'packing', _('Packing')
@@ -61,7 +69,7 @@ class SubOrder(SoftDeleteModel):
     sub_order_number = models.CharField(max_length=30, unique=True)  # e.g. JNG-2026-00123-A
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sub_orders')
 
-    status = models.CharField(max_length=30, choices=SubOrderStatus.choices, default=SubOrderStatus.PLACED)
+    status = models.CharField(max_length=30, choices=SubOrderStatus.choices, default=SubOrderStatus.PENDING)
 
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)

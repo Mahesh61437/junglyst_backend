@@ -18,6 +18,18 @@ class ShippingAddress(SoftDeleteModel):
     is_default = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    def save(self, *args, **kwargs):
+        if self.is_default and self.user:
+            ShippingAddress.objects.filter(user=self.user).update(is_default=False)
+        elif not self.is_default and self.user:
+            # If no other addresses exist, make this the default
+            if not ShippingAddress.objects.filter(user=self.user).exists():
+                self.is_default = True
+        super().save(*args, **kwargs)
+
+    class Meta:
+        ordering = ['-is_default', '-created_at']
+
     def __str__(self):
         return f"{self.full_name} - {self.city}"
 

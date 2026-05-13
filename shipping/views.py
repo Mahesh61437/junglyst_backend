@@ -2,6 +2,7 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.views import APIView
+from rest_framework.exceptions import ValidationError
 from .models import ShippingAddress, Shipment
 from .serializers import ShippingAddressSerializer, ShipmentSerializer
 from .services import NimbuspostService
@@ -16,6 +17,8 @@ class ShippingAddressViewSet(viewsets.ModelViewSet):
         return ShippingAddress.objects.filter(user=self.request.user)
 
     def perform_create(self, serializer):
+        if ShippingAddress.objects.filter(user=self.request.user).count() >= 5:
+            raise ValidationError("You can only save up to 5 addresses.")
         serializer.save(user=self.request.user)
 
 

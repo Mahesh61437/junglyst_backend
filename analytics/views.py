@@ -78,39 +78,39 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 'is_verified': seller.is_verified_seller,
             })
 
-        # Categorized Orders
-        all_orders_qs = Order.objects.prefetch_related('items__seller').all().order_by('-created_at')
+        # Categorized Orders (grouped by seller via SubOrders)
+        from orders.models import SubOrder
+        all_sub_orders_qs = SubOrder.objects.select_related('order', 'order__user', 'seller').all().order_by('-created_at')
         
         all_orders = []
-        for o in all_orders_qs:
-            sellers_in_order = list({item.seller for item in o.items.all() if item.seller})
-            if sellers_in_order:
-                seller_name = ", ".join([s.get_full_name() or s.username for s in sellers_in_order])
-                # Prefer phone, fallback to email
-                contacts = []
-                for s in sellers_in_order:
-                    contacts.append(s.phone if s.phone else s.email)
-                seller_contact = ", ".join(contacts)
-            else:
-                seller_name = "N/A"
-                seller_contact = "N/A"
+        for so in all_sub_orders_qs:
+            user = so.order.user
+            try:
+                pg = so.order.payment.gateway
+            except Exception:
+                pg = None
+            try:
+                seller_store = so.seller.seller_profile.store_name
+            except Exception:
+                seller_store = so.seller.get_full_name() or so.seller.username
 
             all_orders.append({
-                'id': o.id,
-                'order_number': o.order_number,
-                'total_amount': o.total_amount,
-                'status': o.status,
-                'created_at': o.created_at,
-                'guest_email': o.guest_email,
-                'guest_phone': o.guest_phone,
-                'user__email': o.user.email if o.user else None,
-                'user__phone': o.user.phone if o.user else None,
-                'seller_name': seller_name,
-                'seller_contact': seller_contact,
+                'id': so.id,
+                'order_number': so.sub_order_number,  # Use sub-order number
+                'total_amount': so.seller_total,
+                'status': so.status,
+                'created_at': so.created_at,
+                'payment_gateway': so.order.payment_gateway or pg,
+                'guest_email': so.order.guest_email,
+                'guest_phone': so.order.guest_phone,
+                'user__email': user.email if user else None,
+                'user__phone': user.phone if user else None,
+                'seller_name': seller_store,
+                'seller_contact': so.seller.phone or so.seller.email,
             })
         
-        pending_orders = [o for o in all_orders if o['status'] in ['pending', 'placed', 'processing']]
-        transit_orders = [o for o in all_orders if o['status'] == 'shipped']
+        pending_orders = [o for o in all_orders if o['status'] in ['placed', 'confirmed', 'packing']]
+        transit_orders = [o for o in all_orders if o['status'] in ['shipped', 'in_transit', 'out_for_delivery']]
         delivered_orders = [o for o in all_orders if o['status'] == 'delivered']
 
         metrics = {
@@ -318,7 +318,6 @@ class AuthorizeGrowerView(APIView):
             user.is_verified_seller = True
             user.is_staff = True
             user.save()
-            print(f"debug: here.....")
             return Response({"message": "User authorized successfully. Role updated to admin."}, status=200)
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=404)

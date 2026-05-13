@@ -248,6 +248,8 @@ class ProductListSerializer(serializers.ModelSerializer):
     
     # We include minimal variant info for cart compatibility
     variants = serializers.SerializerMethodField()
+    base_price = serializers.SerializerMethodField()
+    stock = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -255,12 +257,26 @@ class ProductListSerializer(serializers.ModelSerializer):
             'id', 'name', 'slug', 'scientific_name', 'care_level', 
             'growth_rate', 'origin', 'is_rare', 'is_active',
             'price', 'image', 'seller', 'category_name', 'rating',
-            'variants'
+            'variants', 'base_price', 'stock'
         )
 
     def get_image(self, obj):
         images = obj.images.all()
         return images[0].image_url if images else None
+
+    def _first_variant(self, obj):
+        if not hasattr(obj, '_cached_first_variant'):
+            variants = obj.variants.all()
+            obj._cached_first_variant = variants[0] if variants else None
+        return obj._cached_first_variant
+
+    def get_base_price(self, obj):
+        v = self._first_variant(obj)
+        return v.base_price if v else 0
+
+    def get_stock(self, obj):
+        v = self._first_variant(obj)
+        return v.stock if v else 0
 
     def get_seller(self, obj):
         # Return minimal seller info

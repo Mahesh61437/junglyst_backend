@@ -20,6 +20,9 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
 from django.views.decorators.vary import vary_on_cookie
 from django.core.cache import cache
+import random
+from django.core.mail import send_mail
+from django.conf import settings
 
 User = get_user_model()
 
@@ -65,6 +68,70 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                 pass
         return response
 
+class ForgotPasswordView(generics.GenericAPIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        email = request.data.get('email')
+        if not email:
+            return Response({"error": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            print('-------------------')
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            # Return success even if user doesn't exist for security reasons (prevent email enumeration)
+            return Response({"message": "If an account with that email exists, an OTP has been sent."}, status=status.HTTP_200_OK)
+
+        # Generate OTP
+        otp = str(random.randint(100000, 999999))
+        print(f"debug:generated otp {otp} for {email}")
+        
+        # Save to cache (valid for 10 minutes)
+        cache_key = f"password_reset_otp_{email}"
+        cache.set(cache_key, otp, timeout=600)
+
+        # Send Email
+        try:
+            send_mail(
+                subject='Your Password Reset OTP - JungLyst',
+                message=f'Your OTP for password reset is: {otp}. This code is valid for 10 minutes.',
+                from_email=settings.EMAIL_HOST_USER or 'noreply@junglyst.com',
+                recipient_list=[email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            return Response({"error": "Failed to send email. Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({"message": "If an account with that email exists, an OTP has been sent."}, status=status.HTTP_200_OK)
+
+class ResetPasswordView(generics.GenericAPIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        email = request.data.get('email')
+        otp = request.data.get('otp')
+        new_password = request.data.get('new_password')
+
+        if not all([email, otp, new_password]):
+            return Response({"error": "Email, OTP, and new password are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        cache_key = f"password_reset_otp_{email}"
+        cached_otp = cache.get(cache_key)
+
+        if not cached_otp or cached_otp != str(otp):
+            return Response({"error": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(email=email)
+            user.set_password(new_password)
+            user.save()
+            # Delete OTP from cache after successful reset
+            cache.delete(cache_key)
+            return Response({"message": "Password reset successfully."}, status=status.HTTP_200_OK)
+        except User.DoesNotExist:
+            return Response({"error": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
 class UserProfileView(generics.RetrieveUpdateAPIView):
     serializer_class = UserSerializer
     permission_classes = (permissions.IsAuthenticated,)
@@ -98,6 +165,28 @@ class ProductListView(generics.ListAPIView):
     filterset_fields = ('categories', 'sub_category', 'seller', 'is_active', 'is_rare')
     search_fields = ('name', 'tags__name', 'scientific_name')
     ordering_fields = ('created_at', 'rating')
+    
+    def get(self, request, *args, **kwargs):
+        # We only cache the main list. If there are seller queries, we do not cache.
+        if request.query_params.get('seller') or request.query_params.get('seller_slug'):
+            return super().get(request, *args, **kwargs)
+        
+        # Manually cache the response
+        from django.core.cache import cache
+        from django.utils.cache import get_cache_key
+        
+        cache_key = get_cache_key(request)
+        if cache_key:
+            cached_response = cache.get(cache_key)
+            if cached_response:
+                return cached_response
+
+        response = super().get(request, *args, **kwargs)
+        if cache_key and response.status_code == 200:
+            if hasattr(response, 'render') and callable(response.render):
+                response.render()
+            cache.set(cache_key, response, 60 * 60)
+        return response
 
     def get_queryset(self):
         queryset = _product_list_queryset()
@@ -115,6 +204,11 @@ class ProductListView(generics.ListAPIView):
                 queryset = queryset.filter(is_active=True)
 
         return queryset
+
+    def paginate_queryset(self, queryset):
+        if self.request.query_params.get('no_pagination'):
+            return None
+        return super().paginate_queryset(queryset)
 
 class ProductReviewListCreateView(generics.ListCreateAPIView):
     serializer_class = ProductReviewSerializer
