@@ -725,6 +725,39 @@ class CancelOrderView(APIView):
 
         return Response({'message': 'Order cancelled successfully'})
 
+
+class PaymentStatusView(APIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        razorpay_order_id = request.query_params.get('razorpay_order_id')
+        cashfree_order_id = request.query_params.get('cashfree_order_id')
+
+        if razorpay_order_id:
+            payment = Payment.objects.filter(razorpay_order_id=razorpay_order_id).select_related('order').first()
+        elif cashfree_order_id:
+            if not hasattr(Payment, 'cashfree_order_id'):
+                return Response(
+                    {"error": "Cashfree payment lookup is not available on this backend."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            payment = Payment.objects.filter(cashfree_order_id=cashfree_order_id).select_related('order').first()
+        else:
+            return Response(
+                {"error": "Provide razorpay_order_id or cashfree_order_id."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not payment:
+            return Response({"error": "Payment not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        order = payment.order
+        if payment.status in ('captured', 'completed') or order.payment_status in ('captured', 'completed') or order.is_paid:
+            return Response({"status": "success", "order": OrderSerializer(order).data})
+        if payment.status in ('failed', 'cancelled'):
+            return Response({"status": "failed"})
+        return Response({"status": "processing"})
+
 class OrderListView(generics.ListAPIView):
     serializer_class = OrderListSerializer
     permission_classes = (permissions.IsAuthenticated,)

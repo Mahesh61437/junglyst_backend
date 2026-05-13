@@ -27,6 +27,11 @@ class CartVariantSerializer(serializers.Serializer):
     compare_at_price = serializers.DecimalField(max_digits=10, decimal_places=2, allow_null=True)
     stock = serializers.IntegerField()
     item_category = serializers.CharField(allow_null=True)
+    image_url = serializers.SerializerMethodField()
+
+    def get_image_url(self, obj):
+        img = obj.images.first()
+        return img.image_url if img else None
 
 
 class CartProductSerializer(serializers.Serializer):
@@ -36,6 +41,11 @@ class CartProductSerializer(serializers.Serializer):
     rating = serializers.FloatField(allow_null=True)
     seller = CartSellerSerializer()
     images = CartImageSerializer(many=True)
+    image_url = serializers.SerializerMethodField()
+
+    def get_image_url(self, obj):
+        first = obj.images.first()
+        return first.image_url if first else None
 
 
 class CartItemSerializer(serializers.ModelSerializer):
