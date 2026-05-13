@@ -98,11 +98,6 @@ class ProductListView(generics.ListAPIView):
     filterset_fields = ('categories', 'sub_category', 'seller', 'is_active', 'is_rare')
     search_fields = ('name', 'tags__name', 'scientific_name')
     ordering_fields = ('created_at', 'rating')
-    
-    @method_decorator(cache_page(60 * 60)) # Cache for 1 hour
-    @method_decorator(vary_on_cookie)
-    def get(self, request, *args, **kwargs):
-        return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
         queryset = _product_list_queryset()
