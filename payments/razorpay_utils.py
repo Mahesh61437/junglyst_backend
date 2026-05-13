@@ -5,6 +5,7 @@ import requests
 from django.conf import settings
 
 
+
 def _auth():
     key_id = getattr(settings, "RAZORPAY_KEY_ID", None)
     key_secret = getattr(settings, "RAZORPAY_KEY_SECRET", None)
@@ -12,6 +13,10 @@ def _auth():
         raise Exception("Razorpay keys are not configured (RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET).")
     return key_id, key_secret
 
+def get_razorpay_client():
+    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
+        raise ValueError('Razorpay gateway is not configured. Please set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.')
+    return razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
 
 def create_razorpay_order(receipt: str, amount_inr: float, currency: str = "INR"):
     """
