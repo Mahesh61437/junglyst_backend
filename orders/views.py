@@ -771,6 +771,53 @@ class OrderDetailView(generics.RetrieveAPIView):
         )
 
 
+class OrderTrackView(APIView):
+    """
+    GET /api/orders/track/?order_id=<uuid>
+    Public order tracking endpoint.
+    Anyone with a valid order_id can track the order status.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        order_id = request.query_params.get('order_id')
+        order_number = request.query_params.get('order_number')
+        
+        if not order_id and not order_number:
+            return Response({'error': 'order_id or order_number query parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        order_uuid = None
+        if order_id:
+            try:
+                order_uuid = uuid.UUID(str(order_id))
+            except ValueError:
+                return Response({'error': 'Invalid order_id format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Build optimised queryset with all prefetches the serializer needs
+        items_qs = OrderItem.objects.select_related('product', 'variant').prefetch_related('product__images')
+        sub_orders_qs = SubOrder.objects.select_related(
+            'seller', 'seller__seller_profile'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+        )
+        qs = Order.objects.prefetch_related(
+            Prefetch('items', queryset=items_qs),
+            Prefetch('sub_orders', queryset=sub_orders_qs),
+            'shipments',
+            'payments',
+        )
+
+        if order_uuid:
+            order = qs.filter(id=order_uuid).first()
+        else:
+            order = qs.filter(order_number=order_number).first()
+
+        if not order:
+            return Response({'error': 'Order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(OrderTrackingSerializer(order).data)
+
+
 class SellerOrderListView(generics.ListAPIView):
     """Grower-scoped order list — items and shipment pre-filtered to the seller."""
     serializer_class = SellerOrderSerializer

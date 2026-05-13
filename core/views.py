@@ -166,10 +166,27 @@ class ProductListView(generics.ListAPIView):
     search_fields = ('name', 'tags__name', 'scientific_name')
     ordering_fields = ('created_at', 'rating')
     
-    @method_decorator(cache_page(60 * 60)) # Cache for 1 hour
-    @method_decorator(vary_on_cookie)
     def get(self, request, *args, **kwargs):
-        return super().get(request, *args, **kwargs)
+        # We only cache the main list. If there are seller queries, we do not cache.
+        if request.query_params.get('seller') or request.query_params.get('seller_slug'):
+            return super().get(request, *args, **kwargs)
+        
+        # Manually cache the response
+        from django.core.cache import cache
+        from django.utils.cache import get_cache_key
+        
+        cache_key = get_cache_key(request)
+        if cache_key:
+            cached_response = cache.get(cache_key)
+            if cached_response:
+                return cached_response
+
+        response = super().get(request, *args, **kwargs)
+        if cache_key and response.status_code == 200:
+            if hasattr(response, 'render') and callable(response.render):
+                response.render()
+            cache.set(cache_key, response, 60 * 60)
+        return response
 
     def get_queryset(self):
         queryset = _product_list_queryset()
