@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.conf import settings
 from django.db import transaction
+from django.db import models
 from django.db.models import Prefetch
 from django.utils import timezone
 from datetime import timedelta
@@ -28,6 +29,7 @@ from .serializers import (
     SellerOrderSerializer, SellerSubOrderSerializer,
     OrderSuccessSerializer, OrderTrackingSerializer)
 from .email_utils import send_order_confirmation_emails
+from .tasks import send_order_confirmation_emails_task, create_order_notifications_task, clear_buyer_cart_task
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -410,46 +412,24 @@ class VerifyPaymentView(generics.GenericAPIView):
                 order.status = 'placed'
                 order.payment_gateway = PaymentGateway.RAZORPAY
                 order.save()
-                
-                # Notify buyer
-                if order.user:
-                    AppNotification.objects.create(
-                        user=order.user,
-                        title="Order Placed!",
-                        message=f"Your order {order.order_number} has been successfully placed and is being prepared."
-                    )
 
-                # Notify each seller about their new sub-order (non-blocking bulk create)
-                seller_notifs = []
-                for sub in order.sub_orders.select_related('seller').all():
+                # Update sub-order statuses (sync — part of core order state)
+                for sub in order.sub_orders.all():
                     sub.status = 'placed'
-                    sub.save()
-                    item_count = sub.items.count()
-                    seller_notifs.append(AppNotification(
-                        user=sub.seller,
-                        title="New Order Received!",
-                        message=(
-                            f"Sub-order {sub.sub_order_number} has been placed with "
-                            f"{item_count} item{'s' if item_count != 1 else ''}. "
-                            f"Please confirm within 48 hours."
-                        ),
-                    ))
-                if seller_notifs:
-                    AppNotification.objects.bulk_create(seller_notifs)
+                    sub.save(update_fields=['status', 'updated_at'])
 
-                for item in order.items.all():
+                # Deduct stock (sync — must be atomic)
+                for item in order.items.select_related('variant').all():
                     if item.variant:
-                        item.variant.stock -= item.quantity
-                        item.variant.save()
+                        item.variant.__class__.objects.filter(pk=item.variant.pk).update(
+                            stock=models.F('stock') - item.quantity
+                        )
 
-                # Clear the buyer's cart
-                if order.user:
-                    Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
-                    from cart.models import CartItem
-                    CartItem.objects.filter(cart__user=order.user).delete()
-
-                # Send confirmation emails to customer, admins, and sellers
-                send_order_confirmation_emails(order)
+                # Fire async tasks — do not block the API response
+                create_order_notifications_task.delay(str(order.id))
+                send_order_confirmation_emails_task.delay(str(order.id))
+                if order.user_id:
+                    clear_buyer_cart_task.delay(str(order.user_id))
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -511,49 +491,24 @@ class VerifyPaymentView(generics.GenericAPIView):
                 order.status = 'placed'
                 order.payment_gateway = PaymentGateway.CASHFREE
                 order.save()
-                
-                # Notify buyer
-                if order.user:
-                    AppNotification.objects.create(
-                        user=order.user,
-                        title="Order Placed!",
-                        message=f"Your order {order.order_number} has been successfully placed and is being prepared."
-                    )
 
-                # Notify each seller about their new sub-order (non-blocking bulk create)
-                seller_notifs = []
-                for sub in order.sub_orders.select_related('seller').all():
+                # Update sub-order statuses (sync — part of core order state)
+                for sub in order.sub_orders.all():
                     sub.status = 'placed'
-                    sub.save()
-                    item_count = sub.items.count()
-                    seller_notifs.append(AppNotification(
-                        user=sub.seller,
-                        title="New Order Received!",
-                        message=(
-                            f"Sub-order {sub.sub_order_number} has been placed with "
-                            f"{item_count} item{'s' if item_count != 1 else ''}. "
-                            f"Please confirm within 48 hours."
-                        ),
-                    ))
-                if seller_notifs:
-                    AppNotification.objects.bulk_create(seller_notifs)
+                    sub.save(update_fields=['status', 'updated_at'])
 
-                for item in order.items.all():
+                # Deduct stock (sync — must be atomic)
+                for item in order.items.select_related('variant').all():
                     if item.variant:
-                        item.variant.stock -= item.quantity
-                        item.variant.save()
+                        item.variant.__class__.objects.filter(pk=item.variant.pk).update(
+                            stock=models.F('stock') - item.quantity
+                        )
 
-                # Clear the buyer's cart
-                if order.user:
-                    Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
-                    from cart.models import CartItem
-                    CartItem.objects.filter(cart__user=order.user).delete()
-
-                # Send confirmation emails — non-blocking, don't fail the response if email errors
-                try:
-                    send_order_confirmation_emails(order)
-                except Exception as e:
-                    logger.error(f"[VERIFY] Email send failed for order {order.order_number}: {e}")
+                # Fire async tasks — do not block the API response
+                create_order_notifications_task.delay(str(order.id))
+                send_order_confirmation_emails_task.delay(str(order.id))
+                if order.user_id:
+                    clear_buyer_cart_task.delay(str(order.user_id))
 
                 return Response({
                     "message": "Payment verified and order placed",

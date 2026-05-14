@@ -198,9 +198,7 @@ def _capture_payment(payment, gateway_payment_id=None, gateway_data=None):
     Mark payment + order as captured; deduct stock; notify buyer.
     Idempotent — safe to call multiple times.
     """
-    from cart.models import Cart, CartItem
-    from notifications.models import AppNotification
-    from orders.email_utils import send_order_confirmation_emails
+    from orders.tasks import send_order_confirmation_emails_task, create_order_notifications_task, clear_buyer_cart_task
 
     order = payment.order
 
@@ -272,30 +270,13 @@ def _capture_payment(payment, gateway_payment_id=None, gateway_data=None):
             sub.status = 'placed'
             sub.save(update_fields=['status', 'updated_at'])
 
-    # Clear buyer cart
-    if order.user:
-        Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
-        CartItem.objects.filter(cart__user=order.user).delete()
-
-    # Notify buyer
-    if order.user:
-        AppNotification.objects.create(
-            user=order.user,
-            title="Order Placed!",
-            message=(
-                f"Your order {order.order_number} has been confirmed. "
-                f"Payment received — thank you!"
-            ),
-        )
-
     order_number = order.order_number
 
-    try:
-        send_order_confirmation_emails(order)
-    except Exception as exc:
-        logger.error(
-            "Reconcile: email failed for order %s: %s", order_number, exc
-        )
+    # Fire async tasks — notifications, emails, cart clearing are non-blocking
+    create_order_notifications_task.delay(str(order.id))
+    send_order_confirmation_emails_task.delay(str(order.id))
+    if order.user_id:
+        clear_buyer_cart_task.delay(str(order.user_id))
 
     logger.info("Reconcile: captured order %s via %s", order_number, payment.gateway)
 
