@@ -1,4 +1,7 @@
+import logging
 from rest_framework import generics, status, permissions
+
+logger = logging.getLogger(__name__)
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.conf import settings
@@ -459,15 +462,22 @@ class VerifyPaymentView(generics.GenericAPIView):
         cashfree_order_id = request.data.get('cashfree_order_id')
         if not cashfree_order_id:
             return Response({"error": "cashfree_order_id is required"}, status=400)
-        is_verified, cf_payment_id, cf_payment_data = verify_cashfree_payment(cashfree_order_id)
+        try:
+            is_verified, cf_payment_id, cf_payment_data = verify_cashfree_payment(cashfree_order_id)
+        except Exception as e:
+            logger.error(f"[VERIFY] Cashfree API error for {cashfree_order_id}: {e}")
+            return Response({"error": "Could not reach payment gateway. Please check My Orders or contact support."}, status=502)
         if is_verified:
             try:
                 payment = Payment.objects.get(cashfree_order_id=cashfree_order_id)
                 order = payment.order
 
-                # Idempotency guard: already captured → return success, skip double processing
+                # Idempotency guard: already captured → return order data so frontend can show success page
                 if payment.status == 'captured':
-                    return Response({"message": "Payment already verified"}, status=200)
+                    return Response({
+                        "message": "Payment already verified",
+                        "order": OrderSuccessSerializer(order).data
+                    }, status=200)
                 insufficient_items = []
                 for item in order.items.all():
                     if item.variant and item.variant.stock < item.quantity:
@@ -539,8 +549,11 @@ class VerifyPaymentView(generics.GenericAPIView):
                     from cart.models import CartItem
                     CartItem.objects.filter(cart__user=order.user).delete()
 
-                # Send confirmation emails to customer, admins, and sellers
-                send_order_confirmation_emails(order)
+                # Send confirmation emails — non-blocking, don't fail the response if email errors
+                try:
+                    send_order_confirmation_emails(order)
+                except Exception as e:
+                    logger.error(f"[VERIFY] Email send failed for order {order.order_number}: {e}")
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -548,6 +561,9 @@ class VerifyPaymentView(generics.GenericAPIView):
                 }, status=200)
             except Payment.DoesNotExist:
                 return Response({"error": "Payment record not found"}, status=404)
+            except Exception as e:
+                logger.error(f"[VERIFY] Unexpected error processing cashfree order {cashfree_order_id}: {e}")
+                return Response({"error": "Order processing failed. Your payment was received — please contact support."}, status=500)
 
         # Payment not yet confirmed — could be still processing or failed
         # Check the actual payment status at Cashfree to give a useful response
