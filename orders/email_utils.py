@@ -100,7 +100,7 @@ def send_customer_email(order):
                 
                 <p>Your order is being prepared by our sellers and will be dispatched soon. You can track your order status on our website.</p>
                 
-                <p>If you have any questions, please contact us at support@junglyst.com</p>
+                <p>If you have any questions, please contact us at admin@junglyst.com</p>
                 
                 <p>Thank you for shopping with Junglyst!</p>
             </body>
