@@ -100,7 +100,7 @@ def send_customer_email(order):
                 
                 <p>Your order is being prepared by our sellers and will be dispatched soon. You can track your order status on our website.</p>
                 
-                <p>If you have any questions, please contact us at {settings.EMAIL_HOST_USER}</p>
+                <p>If you have any questions, please contact us at support@junglyst.com</p>
                 
                 <p>Thank you for shopping with Junglyst!</p>
             </body>
@@ -111,7 +111,7 @@ def send_customer_email(order):
         send_mail(
             subject,
             message,
-            settings.EMAIL_HOST_USER,
+            settings.DEFAULT_FROM_EMAIL,
             [recipient_email],
             html_message=message,
             fail_silently=False,
@@ -169,7 +169,7 @@ def send_admin_email(order, admin_emails):
         send_mail(
             subject,
             message,
-            settings.EMAIL_HOST_USER,
+            settings.DEFAULT_FROM_EMAIL,
             admin_emails,
             html_message=message,
             fail_silently=False,
@@ -256,7 +256,7 @@ def send_seller_emails(order):
                 send_mail(
                     subject,
                     message,
-                    settings.EMAIL_HOST_USER,
+                    settings.DEFAULT_FROM_EMAIL,
                     [seller.email],
                     html_message=message,
                     fail_silently=False,

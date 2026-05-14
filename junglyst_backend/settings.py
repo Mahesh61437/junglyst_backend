@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     
     # 3rd Party
+    'anymail',
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
@@ -149,20 +150,17 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'junglyst_backend.wsgi.application'
 
-# Email Settings
-EMAIL_HOST = config('EMAIL_HOST', default='')
-EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
-EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
-# Port 465 + SSL avoids Railway's outbound port-587 block
-EMAIL_PORT = config('EMAIL_PORT', default=465, cast=int)
-EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=False, cast=bool)
-EMAIL_USE_SSL = config('EMAIL_USE_SSL', default=True, cast=bool)
-# Fall back to console backend if SMTP is not configured
+# Email — Resend via django-anymail (HTTPS, no SMTP port issues on Railway)
+RESEND_API_KEY = config('RESEND_API_KEY', default='')
 EMAIL_BACKEND = (
-    'django.core.mail.backends.smtp.EmailBackend'
-    if EMAIL_HOST
+    'anymail.backends.resend.EmailBackend'
+    if RESEND_API_KEY
     else 'django.core.mail.backends.console.EmailBackend'
 )
+ANYMAIL = {
+    'RESEND_API_KEY': RESEND_API_KEY,
+}
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='Junglyst <orders@junglyst.com>')
 
 # Database
 if config('DB_HOST', default=None):
