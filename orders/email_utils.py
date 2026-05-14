@@ -1,7 +1,10 @@
+import logging
 from django.core.mail import send_mail, send_mass_mail
 from django.conf import settings
 from django.template.loader import render_to_string
 from core.models import User
+
+logger = logging.getLogger(__name__)
 
 def send_order_confirmation_emails(order):
     """
@@ -30,7 +33,7 @@ def send_order_confirmation_emails(order):
         
         return True
     except Exception as e:
-        print(f"Error sending order confirmation emails: {str(e)}")
+        logger.error("Error sending order confirmation emails: %s", e)
         return False
 
 def send_customer_email(order):
@@ -114,7 +117,7 @@ def send_customer_email(order):
             fail_silently=False,
         )
     except Exception as e:
-        print(f"Error sending customer email: {str(e)}")
+        logger.error("Error sending customer email: %s", e)
 
 def send_guest_email(order):
     """Send order confirmation to guest customer"""
@@ -172,7 +175,7 @@ def send_admin_email(order, admin_emails):
             fail_silently=False,
         )
     except Exception as e:
-        print(f"Error sending admin email: {str(e)}")
+        logger.error("Error sending admin email: %s", e)
 
 def send_seller_emails(order):
     """Send order notification to sellers for their respective sub-orders"""
@@ -259,6 +262,6 @@ def send_seller_emails(order):
                     fail_silently=False,
                 )
             except Exception as e:
-                print(f"Error sending seller email to {sub_order.seller.email}: {str(e)}")
+                logger.error("Error sending seller email to %s: %s", sub_order.seller.email, e)
     except Exception as e:
-        print(f"Error in send_seller_emails: {str(e)}")
+        logger.error("Error in send_seller_emails: %s", e)
