@@ -71,36 +71,43 @@ class CustomTokenObtainPairView(TokenObtainPairView):
 class ForgotPasswordView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)
 
+    COOLDOWN = 60  # seconds between allowed OTP requests
+
     def post(self, request):
         email = request.data.get('email')
         if not email:
             return Response({"error": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # 60-second cooldown — reject if a request was made too recently
+        cooldown_key = f"otp_cooldown_{email}"
+        if cache.get(cooldown_key):
+            ttl = cache.ttl(cooldown_key) if hasattr(cache, 'ttl') else self.COOLDOWN
+            return Response(
+                {"error": f"Please wait {ttl} second(s) before requesting another OTP.", "retry_after": ttl},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         try:
-            print('-------------------')
             user = User.objects.get(email=email)
         except User.DoesNotExist:
-            # Return success even if user doesn't exist for security reasons (prevent email enumeration)
+            # Set cooldown even for unknown emails to prevent email enumeration via timing
+            cache.set(cooldown_key, True, timeout=self.COOLDOWN)
             return Response({"message": "If an account with that email exists, an OTP has been sent."}, status=status.HTTP_200_OK)
 
-        # Generate OTP
+        # Generate OTP and set both the OTP and cooldown in cache
         otp = str(random.randint(100000, 999999))
-        print(f"debug:generated otp {otp} for {email}")
-        
-        # Save to cache (valid for 10 minutes)
-        cache_key = f"password_reset_otp_{email}"
-        cache.set(cache_key, otp, timeout=600)
+        cache.set(f"password_reset_otp_{email}", otp, timeout=600)
+        cache.set(cooldown_key, True, timeout=self.COOLDOWN)
 
-        # Send Email
         try:
             send_mail(
-                subject='Your Password Reset OTP - JungLyst',
+                subject='Your Password Reset OTP - Junglyst',
                 message=f'Your OTP for password reset is: {otp}. This code is valid for 10 minutes.',
-                from_email=settings.EMAIL_HOST_USER or 'noreply@junglyst.com',
+                from_email=settings.DEFAULT_FROM_EMAIL,
                 recipient_list=[email],
                 fail_silently=False,
             )
-        except Exception as e:
+        except Exception:
             return Response({"error": "Failed to send email. Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response({"message": "If an account with that email exists, an OTP has been sent."}, status=status.HTTP_200_OK)
