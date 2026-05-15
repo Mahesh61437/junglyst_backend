@@ -1,7 +1,7 @@
 from django.urls import path
 from .views import (
     GrowerDashboardView, SellerStoreView, SellerProfileListView,
-    CheckSellerApprovalView, AllowedSellerListCreateView, AllowedSellerDestroyView,
+    CheckSellerApprovalView, CheckEmailAllowedView, AllowedSellerListCreateView, AllowedSellerDestroyView,
     PlatformStatsView, FeaturedCuratorView,
     SellerPromotionView, AdminSellerProfileEditView,
 )
@@ -15,6 +15,7 @@ urlpatterns = [
     path('profiles/', SellerProfileListView.as_view(), name='seller_profiles_list'),
 
     path('check-approval/', CheckSellerApprovalView.as_view(), name='check_seller_approval'),
+    path('check-email/', CheckEmailAllowedView.as_view(), name='check_email_allowed'),
     path('platform-stats/', PlatformStatsView.as_view(), name='platform_stats'),
     path('featured-curator/', FeaturedCuratorView.as_view(), name='featured-curator'),
 

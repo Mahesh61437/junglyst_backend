@@ -134,16 +134,18 @@ class GrowerDashboardView(generics.GenericAPIView):
         
         profile.save()
 
-        # Upgrade user role if they were a collector
-        if seller.role == 'collector':
+        # Upgrade user role and staff status
+        if seller.role != 'admin':
             seller.role = 'grower'
-            seller.save()
-        
+            seller.is_staff = True
+            seller.save(update_fields=['role', 'is_staff'])
+
         return Response({
             "message": "Sanctuary Identity updated successfully",
             "user": {
-                "id": seller.id,
+                "id": str(seller.id),
                 "role": seller.role,
+                "is_staff": seller.is_staff,
                 "username": seller.username
             }
         }, status=status.HTTP_200_OK)
@@ -210,9 +212,19 @@ class CheckSellerApprovalView(generics.GenericAPIView):
         is_allowed = AllowedSeller.objects.filter(email__iexact=email, is_active=True).exists() or \
                      (hasattr(seller, 'mobile') and AllowedSeller.objects.filter(phone=seller.mobile, is_active=True).exists())
         return Response({
-            "is_approved": is_allowed or seller.role == 'admin',
+            "is_approved": is_allowed or seller.role in ['grower', 'admin'],
             "email_checked": email
         })
+
+class CheckEmailAllowedView(generics.GenericAPIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        email = (request.data.get('email') or '').strip()
+        if not email:
+            return Response({'is_allowed': False})
+        is_allowed = AllowedSeller.objects.filter(email__iexact=email, is_active=True).exists()
+        return Response({'is_allowed': is_allowed})
 
 class PlatformStatsView(generics.GenericAPIView):
     permission_classes = (permissions.AllowAny,)

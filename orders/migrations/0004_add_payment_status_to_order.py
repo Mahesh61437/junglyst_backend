@@ -1,6 +1,14 @@
 from django.db import migrations, models
 
+
 class Migration(migrations.Migration):
+    """
+    Legacy branch migration kept for graph merge (0007).
+
+    Schema changes live in 0004_order_payment_status (portable AddField).
+    The previous version used PostgreSQL-only ALTER COLUMN SQL, which breaks
+    on SQLite when DB_HOST is unset.
+    """
 
     dependencies = [
         ('orders', '0003_add_actual_shipment_dims_to_suborder'),
@@ -8,16 +16,7 @@ class Migration(migrations.Migration):
 
     operations = [
         migrations.SeparateDatabaseAndState(
-            database_operations=[
-                migrations.RunSQL(
-                    "UPDATE orders_order SET payment_status='pending' WHERE payment_status IS NULL;",
-                    reverse_sql="UPDATE orders_order SET payment_status=NULL WHERE payment_status='pending';",
-                ),
-                migrations.RunSQL(
-                    "ALTER TABLE orders_order ALTER COLUMN payment_status SET DEFAULT 'pending';",
-                    reverse_sql="ALTER TABLE orders_order ALTER COLUMN payment_status DROP DEFAULT;",
-                ),
-            ],
+            database_operations=[],
             state_operations=[
                 migrations.AddField(
                     model_name='order',

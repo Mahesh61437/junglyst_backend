@@ -47,6 +47,12 @@ class RegisterSerializer(serializers.ModelSerializer):
             first_name=validated_data.get('first_name', ''),
             last_name=validated_data.get('last_name', '')
         )
+        from sellers.models import AllowedSeller
+        email = (validated_data['email'] or '').strip()
+        if AllowedSeller.objects.filter(email__iexact=email, is_active=True).exists():
+            user.role = 'grower'
+            user.is_staff = True
+            user.save(update_fields=['role', 'is_staff'])
         return user
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
