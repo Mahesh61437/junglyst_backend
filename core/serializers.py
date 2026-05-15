@@ -3,8 +3,9 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from core.models import (
-    Category, SubCategory, Tag, Product, ProductVariant, ProductImage
+    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview
 )
+from cart.models import Cart, CartItem
 
 User = get_user_model()
 
@@ -14,8 +15,8 @@ class UserSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile')
-        read_only_fields = ('id', 'is_verified_seller')
+        fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile', 'is_staff', 'is_superuser')
+        read_only_fields = ('id', 'is_verified_seller', 'is_superuser')
 
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
@@ -29,10 +30,12 @@ class UserSerializer(serializers.ModelSerializer):
 
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)
+    first_name = serializers.CharField(required=False, allow_blank=True)
+    last_name = serializers.CharField(required=False, allow_blank=True)
     
     class Meta:
         model = User
-        fields = ('email', 'username', 'password', 'phone', 'role')
+        fields = ('email', 'username', 'password', 'phone', 'role', 'first_name', 'last_name')
 
     def create(self, validated_data):
         user = User.objects.create_user(
@@ -40,7 +43,9 @@ class RegisterSerializer(serializers.ModelSerializer):
             username=validated_data['username'],
             password=validated_data['password'],
             phone=validated_data.get('phone'),
-            role=validated_data.get('role', 'collector')
+            role=validated_data.get('role', 'collector'),
+            first_name=validated_data.get('first_name', ''),
+            last_name=validated_data.get('last_name', '')
         )
         return user
 
@@ -52,17 +57,34 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         data['user'] = UserSerializer(self.user).data
         return data
 
+class CategoryShippingRateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CategoryShippingRate
+        fields = ('id', 'category', 'sub_category', 'min_weight_grams', 'max_weight_grams',
+                  'rate', 'free_above_order_value')
+
+
 class SubCategorySerializer(serializers.ModelSerializer):
+    effective_gst = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    effective_commission = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+    shipping_rates = CategoryShippingRateSerializer(many=True, read_only=True)
+
     class Meta:
         model = SubCategory
-        fields = ('id', 'name', 'slug', 'description', 'image_url')
+        fields = ('id', 'name', 'slug', 'description', 'image_url',
+                  'gst_percentage', 'commission_rate',
+                  'effective_gst', 'effective_commission', 'shipping_rates')
+
 
 class CategorySerializer(serializers.ModelSerializer):
     subcategories = SubCategorySerializer(many=True, read_only=True)
-    
+    shipping_rates = CategoryShippingRateSerializer(many=True, read_only=True)
+
     class Meta:
         model = Category
-        fields = ('id', 'name', 'slug', 'description', 'image_url', 'gst_percentage', 'commission_rate', 'subcategories')
+        fields = ('id', 'name', 'slug', 'description', 'image_url',
+                  'gst_percentage', 'commission_rate', 'shipping_type',
+                  'subcategories', 'shipping_rates')
 
 class TagSerializer(serializers.ModelSerializer):
     class Meta:
@@ -71,11 +93,27 @@ class TagSerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)
-    
+    chargeable_weight = serializers.SerializerMethodField()
+
     class Meta:
         model = ProductVariant
         fields = '__all__'
-        read_only_fields = ['product'] # price is now allowed to be passed but we can handle it in model save if needed
+        read_only_fields = ['product']
+
+    def get_chargeable_weight(self, obj):
+        return obj.chargeable_weight
+
+    def validate_packed_weight_grams(self, value):
+        if value is not None and not (1 <= value <= 30000):
+            raise serializers.ValidationError("Packed weight must be between 1g and 30,000g.")
+        return value
+
+    def validate(self, attrs):
+        for dim_key in ('length', 'width', 'height'):
+            val = attrs.get(dim_key)
+            if val is not None and val <= 0:
+                raise serializers.ValidationError({dim_key: "Box dimensions must be positive."})
+        return attrs
 
 class ProductImageSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(required=False)
@@ -85,6 +123,37 @@ class ProductImageSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ['product']
 
+class ProductReviewSerializer(serializers.ModelSerializer):
+    product_id = serializers.UUIDField(write_only=True, required=True)
+    product = serializers.PrimaryKeyRelatedField(read_only=True)
+    date = serializers.SerializerMethodField()
+    image = serializers.ImageField(required=False, allow_null=True)
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductReview
+        fields = ('id', 'product', 'product_id', 'author', 'comment', 'plants', 'packaging', 'responsiveness', 'created_at', 'date', 'image', 'image_url')
+        read_only_fields = ('id', 'created_at', 'date', 'image_url')
+
+    def get_date(self, obj):
+        return obj.created_at.strftime('%Y-%m-%d') if obj.created_at else None
+
+    def get_image_url(self, obj):
+        if obj.image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.image.url)
+            return obj.image.url
+        return None
+
+    def create(self, validated_data):
+        product_id = validated_data.pop('product_id')
+        try:
+            product = Product.objects.get(id=product_id)
+        except Product.DoesNotExist:
+            raise serializers.ValidationError({'product_id': 'Product not found'})
+        return ProductReview.objects.create(product=product, **validated_data)
+
 class ProductSerializer(serializers.ModelSerializer):
     variants = ProductVariantSerializer(many=True, required=False)
     images = ProductImageSerializer(many=True, required=False)
@@ -93,6 +162,7 @@ class ProductSerializer(serializers.ModelSerializer):
     sub_category = SubCategorySerializer(read_only=True)
     category_id = serializers.IntegerField(write_only=True, required=False)
     sub_category_id = serializers.IntegerField(write_only=True, required=False)
+    seller_id = serializers.UUIDField(write_only=True, required=False)
     image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
     
@@ -112,11 +182,147 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ['slug']
 
+    def get_image(self, obj):
+        images = obj.images.all()
+        return images[0].image_url if images else None
+
+    def get_category(self, obj):
+        categories = obj.categories.all()
+        return categories[0].name if categories else None
+
+    def _first_variant(self, obj):
+        # Uses prefetch cache — avoids 9 separate DB hits per product
+        if not hasattr(obj, '_cached_first_variant'):
+            variants = obj.variants.all()
+            obj._cached_first_variant = variants[0] if variants else None
+        return obj._cached_first_variant
+
+    def get_variant(self, obj):
+        return self._first_variant(obj)
+
+    def get_price(self, obj):
+        v = self._first_variant(obj)
+        return v.price if v else 0
+
+    def get_base_price(self, obj):
+        v = self._first_variant(obj)
+        return v.base_price if v else 0
+
+    def get_gst_rate(self, obj):
+        v = self._first_variant(obj)
+        return v.gst_rate if v else 0
+
+    def get_commission_rate(self, obj):
+        v = self._first_variant(obj)
+        return v.commission_rate if v else 0
+
+    def get_stock(self, obj):
+        v = self._first_variant(obj)
+        return v.stock if v else 0
+
+    def get_weight(self, obj):
+        v = self._first_variant(obj)
+        return v.weight if v else 0
+
+    def get_length(self, obj):
+        v = self._first_variant(obj)
+        return v.length if v else 0
+
+    def get_width(self, obj):
+        v = self._first_variant(obj)
+        return v.width if v else 0
+
+    def get_height(self, obj):
+        v = self._first_variant(obj)
+        return v.height if v else 0
+
+class ProductListSerializer(serializers.ModelSerializer):
+    """
+    Optimized version of ProductSerializer for listing pages.
+    Provides necessary fields for ProductCard while minimizing database hits.
+    """
+    image = serializers.SerializerMethodField()
+    seller = serializers.SerializerMethodField()
+    category_name = serializers.SerializerMethodField()
+    price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    
+    # We include minimal variant info for cart compatibility
+    variants = serializers.SerializerMethodField()
+    base_price = serializers.SerializerMethodField()
+    stock = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = (
+            'id', 'name', 'slug', 'scientific_name', 'care_level', 
+            'growth_rate', 'origin', 'is_rare', 'is_active',
+            'price', 'image', 'seller', 'category_name', 'rating',
+            'variants', 'base_price', 'stock'
+        )
+
+    def get_image(self, obj):
+        images = obj.images.all()
+        return images[0].image_url if images else None
+
+    def _first_variant(self, obj):
+        if not hasattr(obj, '_cached_first_variant'):
+            variants = obj.variants.all()
+            obj._cached_first_variant = variants[0] if variants else None
+        return obj._cached_first_variant
+
+    def get_base_price(self, obj):
+        v = self._first_variant(obj)
+        return v.base_price if v else 0
+
+    def get_stock(self, obj):
+        v = self._first_variant(obj)
+        return v.stock if v else 0
+
+    def get_seller(self, obj):
+        # Return minimal seller info
+        try:
+            profile = obj.seller.seller_profile
+            return {
+                'id': str(obj.seller.id),
+                'full_name': obj.seller.get_full_name() or obj.seller.username,
+                'seller_profile': {
+                    'store_name': profile.store_name,
+                    'slug': profile.slug,
+                    'brand_color': profile.brand_color
+                }
+            }
+        except:
+            return {'id': str(obj.seller.id), 'full_name': obj.seller.username}
+
+    def get_category_name(self, obj):
+        return obj.sub_category.name if obj.sub_category else (obj.categories.all()[0].name if obj.categories.exists() else None)
+
+    def get_variants(self, obj):
+        # Return only what ProductCard needs: id, price, stock
+        return [
+            {'id': str(v.id), 'price': str(v.price), 'stock': v.stock}
+            for v in obj.variants.all()
+        ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Fallback price if DecimalField doesn't pick it up (though it should via @property or prefetched field)
+        if not data.get('price'):
+            v = instance.variants.all()
+            data['price'] = str(v[0].price) if v else "0"
+        return data
+
     def create(self, validated_data):
         variants_data = validated_data.pop('variants', [])
         images_data = validated_data.pop('images', [])
         category_id = validated_data.pop('category_id', None)
         sub_category_id = validated_data.pop('sub_category_id', None)
+        seller_id = validated_data.pop('seller_id', None)
+        if seller_id and 'seller' not in validated_data:
+            try:
+                validated_data['seller'] = User.objects.get(id=seller_id)
+            except User.DoesNotExist:
+                raise serializers.ValidationError({'seller_id': 'User not found'})
         
         # Auto-slugify
         name = validated_data.get('name')
@@ -177,12 +383,20 @@ class ProductSerializer(serializers.ModelSerializer):
         return product
 
     def update(self, instance, validated_data):
-        variants_data = validated_data.pop('variants', [])
-        images_data = validated_data.pop('images', [])
+        # Use sentinel to distinguish "not sent" (partial PATCH) from "sent as empty list"
+        _missing = object()
+        variants_data = validated_data.pop('variants', _missing)
+        images_data = validated_data.pop('images', _missing)
         category_id = validated_data.pop('category_id', None)
         sub_category_id = validated_data.pop('sub_category_id', None)
+        seller_id = validated_data.pop('seller_id', None)
+        if seller_id:
+            try:
+                instance.seller = User.objects.get(id=seller_id)
+            except User.DoesNotExist:
+                raise serializers.ValidationError({'seller_id': 'User not found'})
 
-        # Update core fields
+        # Update core fields (e.g. is_active from archive PATCH)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
@@ -206,42 +420,38 @@ class ProductSerializer(serializers.ModelSerializer):
             except SubCategory.DoesNotExist:
                 pass
 
-        # Handle variants
-        if variants_data is not None:
-            # Convert existing IDs to strings for comparison
+        # Handle variants — only modify when variants were explicitly sent in the request
+        if variants_data is not _missing:
             existing_variants = {str(v.id): v for v in instance.variants.all()}
             incoming_variant_ids = []
-            
+
             for v_data in variants_data:
-                # Sanitize v_data
                 v_id = str(v_data.pop('id')) if v_data.get('id') else None
-                v_data.pop('product', None) # Remove if exists
+                v_data.pop('product', None)
                 v_data.pop('is_deleted', None)
                 v_data.pop('deleted_at', None)
                 v_data.pop('created_at', None)
-                
+
                 if v_id and v_id in existing_variants:
-                    # Update existing - Use get + save to trigger model logic
                     v_obj = existing_variants[v_id]
                     for attr, value in v_data.items():
                         setattr(v_obj, attr, value)
                     v_obj.save()
                     incoming_variant_ids.append(v_id)
                 else:
-                    # Create new
                     new_v = ProductVariant.objects.create(product=instance, **v_data)
                     incoming_variant_ids.append(str(new_v.id))
-            
-            # Delete (soft-delete) variants that were not in the incoming data
+
+            # Only delete variants that were explicitly omitted from a full update
             for v_id, v_obj in existing_variants.items():
                 if v_id not in incoming_variant_ids:
-                    v_obj.delete() # Soft delete if model supports it
+                    v_obj.delete()
 
-        # Handle images
-        if images_data is not None:
+        # Handle images — only modify when images were explicitly sent in the request
+        if images_data is not _missing:
             existing_images = {img.id: img for img in instance.images.all()}
             incoming_image_ids = []
-            
+
             for img_data in images_data:
                 img_id = img_data.pop('id', None)
                 variant_id = img_data.pop('variant_id', None)
@@ -249,7 +459,7 @@ class ProductSerializer(serializers.ModelSerializer):
                 img_data.pop('is_deleted', None)
                 img_data.pop('deleted_at', None)
                 img_data.pop('created_at', None)
-                
+
                 target_variant = None
                 if variant_id:
                     try:
@@ -262,59 +472,41 @@ class ProductSerializer(serializers.ModelSerializer):
                     incoming_image_ids.append(img_id)
                 else:
                     ProductImage.objects.create(product=instance, variant=target_variant, **img_data)
-            
-            # Remove images not in request
+
+            # Only remove images that were explicitly omitted from a full update
             for img_id, img_obj in existing_images.items():
                 if img_id not in incoming_image_ids:
                     img_obj.delete()
 
         return instance
 
-    def get_variant(self, obj):
-        return obj.variants.first()
+class CartItemSerializer(serializers.ModelSerializer):
+    product = ProductSerializer(read_only=True)
+    variant = ProductVariantSerializer(read_only=True)
+    subtotal = serializers.SerializerMethodField()
 
-    def get_price(self, obj):
-        v = self.get_variant(obj)
-        return v.price if v else 0
+    class Meta:
+        model = CartItem
+        fields = ('id', 'product', 'variant', 'quantity', 'added_at', 'subtotal')
 
-    def get_base_price(self, obj):
-        v = self.get_variant(obj)
-        return v.base_price if v else 0
+    def get_subtotal(self, obj):
+        price = obj.variant.price if obj.variant else obj.product.price
+        return price * obj.quantity
 
-    def get_gst_rate(self, obj):
-        v = self.get_variant(obj)
-        return v.gst_rate if v else 0
+class CartSerializer(serializers.ModelSerializer):
+    items = CartItemSerializer(many=True, read_only=True)
+    total_items = serializers.SerializerMethodField()
+    subtotal = serializers.SerializerMethodField()
 
-    def get_commission_rate(self, obj):
-        v = self.get_variant(obj)
-        return v.commission_rate if v else 0
+    class Meta:
+        model = Cart
+        fields = ('id', 'items', 'total_items', 'subtotal', 'updated_at')
 
-    def get_stock(self, obj):
-        v = self.get_variant(obj)
-        return v.stock if v else 0
+    def get_total_items(self, obj):
+        return sum(item.quantity for item in obj.items.all())
 
-    def get_weight(self, obj):
-        v = self.get_variant(obj)
-        return v.weight if v else 0
-
-    def get_length(self, obj):
-        v = self.get_variant(obj)
-        return v.length if v else 0
-
-    def get_width(self, obj):
-        v = self.get_variant(obj)
-        return v.width if v else 0
-
-    def get_height(self, obj):
-        v = self.get_variant(obj)
-        return v.height if v else 0
-    def get_image(self, obj):
-        first_image = obj.images.first()
-        if first_image:
-            return first_image.image_url
-        return None
-    def get_category(self, obj):
-        first_cat = obj.categories.first()
-        if first_cat:
-            return first_cat.name
-        return None
+    def get_subtotal(self, obj):
+        return sum(
+            (item.variant.price if item.variant else item.product.price) * item.quantity 
+            for item in obj.items.all()
+        )

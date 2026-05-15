@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from datetime import timedelta
-from decouple import config
+from decouple import config, Csv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -52,6 +52,7 @@ if IS_PRODUCTION:
 
 # Application definition
 INSTALLED_APPS = [
+    'jazzmin',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -60,6 +61,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     
     # 3rd Party
+    'anymail',
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
@@ -77,6 +79,45 @@ INSTALLED_APPS = [
     'django_celery_results',
     'django_celery_beat',
 ]
+
+JAZZMIN_SETTINGS = {
+    "site_title": "Junglyst Admin",
+    "site_header": "Junglyst",
+    "site_brand": "Junglyst Curator",
+    "site_brand_link": "admin:index",
+    "site_logo": None,
+    "welcome_sign": "Welcome to the Junglyst Master Registry",
+    "copyright": "Junglyst Botanical Sanctuary",
+    "search_model": ["sellers.SellerProfile", "core.Product"],
+    "user_avatar": None,
+    "topmenu_links": [
+        {"name": "Home",  "url": "admin:index", "permissions": ["auth.view_user"]},
+        {"name": "View Site", "url": "http://localhost:5173", "new_window": True},
+        {"model": "sellers.SellerProfile"},
+    ],
+    "show_sidebar": True,
+    "navigation_expanded": True,
+    "icons": {
+        "auth": "fas fa-users-cog",
+        "auth.user": "fas fa-user",
+        "auth.Group": "fas fa-users",
+        "sellers.SellerProfile": "fas fa-store",
+        "sellers.AllowedSeller": "fas fa-user-check",
+        "core.Product": "fas fa-leaf",
+        "core.Category": "fas fa-list",
+        "orders.Order": "fas fa-shopping-cart",
+    },
+    "order_with_respect_to": ["sellers", "core", "orders", "auth"],
+    "use_google_fonts_cdn": True,
+    "show_ui_builder": True,
+}
+
+JAZZMIN_UI_CONFIG = {
+    "theme": "flatly",
+    "dark_mode_theme": None,
+    "navbar": "navbar-dark",
+    "sidebar": "sidebar-dark-primary",
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -108,6 +149,18 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'junglyst_backend.wsgi.application'
+
+# Email — Resend via django-anymail (HTTPS, no SMTP port issues on Railway)
+RESEND_API_KEY = config('RESEND_API_KEY', default='')
+EMAIL_BACKEND = (
+    'anymail.backends.resend.EmailBackend'
+    if RESEND_API_KEY
+    else 'django.core.mail.backends.console.EmailBackend'
+)
+ANYMAIL = {
+    'RESEND_API_KEY': RESEND_API_KEY,
+}
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='Junglyst <orders@junglyst.com>')
 
 # Database
 if config('DB_HOST', default=None):
@@ -183,7 +236,7 @@ REST_FRAMEWORK = {
         'rest_framework.filters.SearchFilter',
         'rest_framework.filters.OrderingFilter',
     ),
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'DEFAULT_PAGINATION_CLASS': 'core.pagination.StandardResultsSetPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
@@ -217,7 +270,8 @@ if IS_PRODUCTION:
         r"^https://.*\.up\.railway\.app$",
         r"^https://junglyst\.com$",
         r"^https://.*\.junglyst\.com$",
-        r"^http://localhost:3000$", # Keep local dev access if needed
+        r"^http://localhost:5173$", # React default
+        r"^http://localhost:3000$", # Alternative
     ]
 else:
     CORS_ALLOW_ALL_ORIGINS = True
@@ -241,12 +295,15 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
-# Sample Periodic Tasks
+# Periodic Tasks
 CELERY_BEAT_SCHEDULE = {
     'sync-shipment-statuses': {
         'task': 'shipping.tasks.sync_all_shipment_statuses',
         'schedule': 3600.0,  # every hour
     },
+    # Payment reconciliation is on-demand (not periodic).
+    # 4 delayed checks are scheduled per-payment at checkout time.
+    # See payments.tasks.schedule_payment_checks()
 }
 
 # Static & Media Files
@@ -297,11 +354,19 @@ os.makedirs(BASE_DIR / 'logs', exist_ok=True)
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Integration Credentials
-RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID', default='')
-RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET', default='')
+CASHFREE_APP_ID = config('CASHFREE_APP_ID', default='')
+CASHFREE_SECRET_KEY = config('CASHFREE_SECRET_KEY', default='')
+CASHFREE_ENVIRONMENT = config('CASHFREE_ENVIRONMENT', default='SANDBOX')
 ENABLE_PAYMENTS = config('ENABLE_PAYMENTS', default=False, cast=bool)
 
-NIMBUSPOST_TOKEN = config('NIMBUSPOST_TOKEN', default='')
+RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID', default='')
+RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET', default='')
+
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
+
+NIMBUSPOST_EMAIL = config('NIMBUSPOST_EMAIL', default='')
+NIMBUSPOST_PASSWORD = config('NIMBUSPOST_PASSWORD', default='')
+NIMBUSPOST_WAREHOUSE_NAME = config('NIMBUSPOST_WAREHOUSE_NAME', default='Junglyst')
 SHIPROCKET_EMAIL = config('SHIPROCKET_EMAIL', default='')
 SHIPROCKET_PASSWORD = config('SHIPROCKET_PASSWORD', default='')
 

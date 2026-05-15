@@ -1,9 +1,10 @@
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
-from django.db.models import Sum
+from django.db.models import Sum, Count, Q
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
-from .models import SellerProfile
+from .models import SellerProfile, AllowedSeller
+from .serializers import SellerProfileSerializer
 from django.utils.text import slugify
 
 class GrowerDashboardView(generics.GenericAPIView):
@@ -50,10 +51,15 @@ class GrowerDashboardView(generics.GenericAPIView):
             .annotate(total_qty=Sum('quantity'), total_rev=Sum('unit_price'))\
             .order_by('-total_qty')[:5]
 
-        # Inventory Distribution
-        out_of_stock = ProductVariant.objects.filter(product__seller=seller, stock=0).count()
-        low_stock = ProductVariant.objects.filter(product__seller=seller, stock__gt=0, stock__lt=5).count()
-        healthy_stock = ProductVariant.objects.filter(product__seller=seller, stock__gte=5).count()
+        # Inventory Distribution — single query with conditional aggregation
+        inv = ProductVariant.objects.filter(product__seller=seller).aggregate(
+            out_of_stock=Count('id', filter=Q(stock=0)),
+            low_stock=Count('id', filter=Q(stock__gt=0, stock__lt=5)),
+            healthy_stock=Count('id', filter=Q(stock__gte=5)),
+        )
+        out_of_stock = inv['out_of_stock']
+        low_stock = inv['low_stock']
+        healthy_stock = inv['healthy_stock']
 
         metrics = {
             "total_revenue": total_revenue,
@@ -94,7 +100,16 @@ class GrowerDashboardView(generics.GenericAPIView):
 
     def post(self, request):
         seller = request.user
-        # Allow collectors to upgrade during onboarding
+        
+        # Check if the user is allowed to become a seller
+        is_allowed = AllowedSeller.objects.filter(email=seller.email, is_active=True).exists() or \
+                     (hasattr(seller, 'mobile') and AllowedSeller.objects.filter(phone=seller.mobile, is_active=True).exists())
+        
+        if not is_allowed and seller.role != 'admin':
+            return Response({
+                "error": "Access denied. Your credentials are not in our master curator registry. Please contact admin for invitation."
+            }, status=403)
+
         if seller.role not in ['grower', 'admin', 'collector']:
             return Response({"error": "Access denied"}, status=403)
             
@@ -148,7 +163,128 @@ class SellerStoreView(generics.RetrieveAPIView):
                 "location_city": profile.location_city,
                 "rating": str(profile.rating),
                 "total_sales": str(profile.total_sales),
-                "created_at": profile.created_at
+                "created_at": profile.created_at,
+                "expertise_tags": profile.expertise_tags,
+                "infrastructure_details": profile.infrastructure_details,
+                "experience_years": profile.experience_years,
+                "identity_verified": profile.identity_verified,
+                "tagline": profile.tagline
             })
         except SellerProfile.DoesNotExist:
             return Response({"error": "Store not found"}, status=404)
+
+class SellerProfileListView(generics.ListAPIView):
+    serializer_class = SellerProfileSerializer
+    permission_classes = (permissions.AllowAny,)
+    pagination_class = None 
+
+    def get_queryset(self):
+        queryset = SellerProfile.objects.select_related('user').filter(is_active=True).order_by('sort_order', '-rating')
+        featured = self.request.query_params.get('featured')
+        if featured == 'true':
+            queryset = queryset.filter(is_featured=True)
+        return queryset
+
+class AllowedSellerListCreateView(generics.ListCreateAPIView):
+    permission_classes = (permissions.IsAdminUser,)
+    queryset = AllowedSeller.objects.all().order_by('-created_at')
+    
+    def get_serializer_class(self):
+        from rest_framework import serializers
+        class AllowedSellerSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = AllowedSeller
+                fields = '__all__'
+        return AllowedSellerSerializer
+
+class AllowedSellerDestroyView(generics.DestroyAPIView):
+    permission_classes = (permissions.IsAdminUser,)
+    queryset = AllowedSeller.objects.all()
+
+class CheckSellerApprovalView(generics.GenericAPIView):
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request):
+        seller = request.user
+        email = seller.email.strip() if seller.email else ""
+        is_allowed = AllowedSeller.objects.filter(email__iexact=email, is_active=True).exists() or \
+                     (hasattr(seller, 'mobile') and AllowedSeller.objects.filter(phone=seller.mobile, is_active=True).exists())
+        return Response({
+            "is_approved": is_allowed or seller.role == 'admin',
+            "email_checked": email
+        })
+
+class PlatformStatsView(generics.GenericAPIView):
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        # Single aggregation across all three counts
+        stats = {
+            'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
+            'total_products': Product.objects.filter(is_active=True).count(),
+            'total_users': User.objects.filter(is_active=True).count(),
+        }
+        return Response(stats)
+
+class VerifiedCuratorDirectoryView(generics.ListAPIView):
+    """
+    Dedicated endpoint for identity-verified curators.
+    """
+    serializer_class = SellerProfileSerializer
+    permission_classes = (permissions.AllowAny,)
+    pagination_class = None
+
+    def get_queryset(self):
+        # We can broaden this to all active curators or keep it strictly for identity_verified
+        return SellerProfile.objects.filter(is_active=True).order_by('-rating', '-created_at')
+class FeaturedCuratorView(generics.GenericAPIView):
+    permission_classes = (permissions.AllowAny,)
+    serializer_class = SellerProfileSerializer
+
+    def get(self, request):
+        featured = SellerProfile.objects.filter(is_active=True, is_featured=True).order_by('sort_order', '?').first()
+        if not featured:
+            return Response({"message": "No featured curators found"}, status=404)
+        return Response(SellerProfileSerializer(featured).data)
+
+
+class AdminSellerProfileEditView(generics.RetrieveUpdateAPIView):
+    """
+    Admin-only: view and edit any seller's profile fields.
+    GET/PATCH /api/sellers/profiles/<id>/admin-edit/
+    """
+    permission_classes = (permissions.IsAdminUser,)
+    serializer_class = SellerProfileSerializer
+    queryset = SellerProfile.objects.all()
+
+    def patch(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
+
+
+class SellerPromotionView(generics.GenericAPIView):
+    """
+    Admin-only endpoint to toggle is_featured and set sort_order for a seller profile.
+    PATCH /api/sellers/profiles/<id>/promote/
+    Body: { "is_featured": true/false, "sort_order": 0 }
+    """
+    permission_classes = (permissions.IsAdminUser,)
+
+    def patch(self, request, pk):
+        try:
+            profile = SellerProfile.objects.get(pk=pk)
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+
+        if 'is_featured' in request.data:
+            profile.is_featured = bool(request.data['is_featured'])
+        if 'sort_order' in request.data:
+            try:
+                profile.sort_order = int(request.data['sort_order'])
+            except (ValueError, TypeError):
+                return Response({"error": "sort_order must be an integer"}, status=400)
+
+        profile.save()
+        return Response(SellerProfileSerializer(profile).data)

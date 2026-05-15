@@ -1,9 +1,27 @@
 from rest_framework import viewsets, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from django.db.models import Prefetch
 from core.models import ProductVariant
 from .models import Cart, CartItem
 from .serializers import CartSerializer
+
+
+def _cart_with_prefetch(cart):
+    """Re-fetch cart with all related data in a fixed number of queries."""
+    return (
+        Cart.objects.prefetch_related(
+            Prefetch(
+                'items',
+                queryset=CartItem.objects.select_related(
+                    'variant',
+                    'product',
+                    'product__seller',
+                    'product__seller__seller_profile',
+                ).prefetch_related('product__images', 'variant__images'),
+            )
+        ).get(pk=cart.pk)
+    )
 
 class CartViewSet(viewsets.ModelViewSet):
     serializer_class = CartSerializer
@@ -25,7 +43,7 @@ class CartViewSet(viewsets.ModelViewSet):
 
     def list(self, request):
         cart = self.get_cart(request)
-        serializer = self.get_serializer(cart)
+        serializer = self.get_serializer(_cart_with_prefetch(cart))
         return Response(serializer.data)
 
     @action(detail=False, methods=['post'])
@@ -42,34 +60,54 @@ class CartViewSet(viewsets.ModelViewSet):
             return Response({"error": "Variant not found"}, status=404)
             
         cart = self.get_cart(request)
+
+        # Use all_objects to handle soft-deleted items (unique constraint includes deleted rows)
+        try:
+            item = CartItem.all_objects.get(cart=cart, variant=variant)
+            if item.is_deleted:
+                item.is_deleted = False
+                item.deleted_at = None
+                item.quantity = 0
+        except CartItem.DoesNotExist:
+            item = CartItem(cart=cart, variant=variant, product=variant.product, quantity=0)
         
-        item, created = CartItem.objects.get_or_create(
-            cart=cart, 
-            variant=variant,
-            defaults={'product': variant.product, 'quantity': quantity}
-        )
-        
-        if not created:
-            item.quantity += quantity
-            item.save()
+        # Check total quantity against stock
+        new_quantity = item.quantity + quantity
+        if new_quantity > variant.stock:
+            return Response({
+                "error": f"Insufficient stock. Only {variant.stock} units available.",
+                "available_stock": variant.stock
+            }, status=400)
             
-        serializer = self.get_serializer(cart)
+        item.quantity = new_quantity
+        item.save()
+
+        serializer = self.get_serializer(_cart_with_prefetch(cart))
         return Response(serializer.data)
 
     @action(detail=False, methods=['post'])
     def update_item(self, request):
         item_id = request.data.get('item_id')
-        quantity = request.data.get('quantity')
+        quantity = int(request.data.get('quantity'))
         
         try:
             item = CartItem.objects.get(id=item_id)
-            if int(quantity) <= 0:
-                item.delete()
+            if quantity <= 0:
+                # Hard delete to avoid unique constraint conflicts on re-add
+                from django.db.models import Model
+                Model.delete(item)
             else:
+                # Check against stock
+                if quantity > item.variant.stock:
+                    return Response({
+                        "error": f"Insufficient stock. Only {item.variant.stock} units available.",
+                        "available_stock": item.variant.stock
+                    }, status=400)
+                
                 item.quantity = quantity
                 item.save()
         except (CartItem.DoesNotExist, ValueError):
             return Response({"error": "Item not found"}, status=404)
             
         cart = self.get_cart(request)
-        return Response(self.get_serializer(cart).data)
+        return Response(self.get_serializer(_cart_with_prefetch(cart)).data)
