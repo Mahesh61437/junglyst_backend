@@ -3,7 +3,7 @@ from datetime import date
 from celery import shared_task
 from django.conf import settings
 from django.core.mail import send_mail
-from .services import NimbuspostService
+from .services import get_logistics_service
 from orders.models import Order, OrderItem, SubOrder
 from .models import Shipment
 
@@ -139,7 +139,7 @@ def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=Non
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
-def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: str = None, sub_order_id: str = None):
+def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = None, sub_order_id: str = None):
     """
     Create a NimbusPost shipment for a seller's sub-order.
     If courier_id is not supplied, the cheapest available courier is auto-selected.
@@ -185,7 +185,8 @@ def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: 
             for i in items if i.variant
         ) or 0.5
 
-        svc = NimbuspostService.check_serviceability(
+        svc_client = get_logistics_service()
+        svc = svc_client.check_serviceability(
             origin_pincode=origin_pincode,
             destination_pincode=dest_pincode,
             weight_kg=total_weight_kg,
@@ -207,7 +208,7 @@ def create_nimbuspost_shipment(self, order_id: str, seller_id: str, courier_id: 
                 return f"Failed after retries: {msg}"
 
     payload = _build_shipment_payload(order, seller, courier_id, sub_order)
-    result = NimbuspostService.create_shipment(payload)
+    result = get_logistics_service().create_shipment(payload)
 
     if not result or not result.get("status"):
         msg = (result or {}).get("message", "No response from NimbusPost")
@@ -306,7 +307,7 @@ def sync_all_shipment_statuses():
 
     updated = 0
     for shipment in active:
-        result = NimbuspostService.track_shipment(shipment.awb_number)
+        result = get_logistics_service().track_shipment(shipment.awb_number)
         if result and result.get("status"):
             raw = (result.get("data", {}).get("status") or "").lower().replace(" ", "_")
             new_status = NP_TO_SUBORDER.get(raw, raw)
@@ -323,7 +324,7 @@ def sync_all_shipment_statuses():
 @shared_task
 def generate_manifest_for_awbs(awb_numbers: list):
     """Generate a NimbusPost manifest PDF for the given AWBs and return the URL."""
-    result = NimbuspostService.generate_manifest(awb_numbers)
+    result = get_logistics_service().generate_manifest(awb_numbers)
     if result and result.get("status"):
         manifest_url = result.get("data")
         if manifest_url:

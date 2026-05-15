@@ -3,9 +3,9 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.exceptions import ValidationError
-from .models import ShippingAddress, Shipment
+from .models import ShippingAddress, Shipment, LogisticsProviderSettings, LogisticsProvider
 from .serializers import ShippingAddressSerializer, ShipmentSerializer
-from .services import NimbuspostService
+from .services import get_logistics_service
 from .pincode_zones import classify_pincode
 
 
@@ -45,7 +45,8 @@ class LogisticsViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        result = NimbuspostService.check_serviceability(
+        svc = get_logistics_service()
+        result = svc.check_serviceability(
             origin_pincode=origin,
             destination_pincode=destination,
             weight_kg=weight,
@@ -81,8 +82,8 @@ class LogisticsViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        from .tasks import create_nimbuspost_shipment
-        create_nimbuspost_shipment.delay(str(order_id), str(seller_id), courier_id)
+        from .tasks import create_shipment_task
+        create_shipment_task.delay(str(order_id), str(seller_id), courier_id)
         return Response({"message": "Shipment creation initiated"}, status=status.HTTP_202_ACCEPTED)
 
     # ── Generate / Fetch Label ────────────────────────────────────────────────
@@ -105,7 +106,7 @@ class LogisticsViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        result = NimbuspostService.generate_label(awb_numbers)
+        result = get_logistics_service().generate_label(awb_numbers)
         if result and result.get("status"):
             label_url = result.get("data")
             Shipment.objects.filter(awb_number__in=awb_numbers).update(label_url=label_url)
@@ -135,7 +136,7 @@ class LogisticsViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        result = NimbuspostService.generate_manifest(awb_numbers)
+        result = get_logistics_service().generate_manifest(awb_numbers)
         if result and result.get("status"):
             manifest_url = result.get("data")
             Shipment.objects.filter(awb_number__in=awb_numbers).update(manifest_url=manifest_url)
@@ -161,7 +162,7 @@ class LogisticsViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        result = NimbuspostService.cancel_shipment(awb_number)
+        result = get_logistics_service().cancel_shipment(awb_number)
         if result and result.get("status"):
             Shipment.objects.filter(awb_number=awb_number).update(status="cancelled")
             return Response({"message": result.get("message", "Shipment cancelled")})
@@ -180,7 +181,7 @@ class LogisticsViewSet(viewsets.ViewSet):
         GET /api/shipping/logistics/track/{awb_number}/
         Returns tracking history from NimbusPost.
         """
-        result = NimbuspostService.track_shipment(awb_number)
+        result = get_logistics_service().track_shipment(awb_number)
         if result and result.get("status"):
             return Response(result["data"])
         return Response(
@@ -216,13 +217,40 @@ class LogisticsViewSet(viewsets.ViewSet):
         if not (request.user.is_staff or request.user.role == "admin"):
             return Response({"error": "Admin access required"}, status=status.HTTP_403_FORBIDDEN)
 
-        result = NimbuspostService.get_wallet_balance()
+        result = get_logistics_service().get_wallet_balance()
         if result and result.get("status"):
             return Response(result["data"])
         return Response(
             {"error": "Could not fetch wallet balance"},
             status=status.HTTP_502_BAD_GATEWAY,
         )
+
+
+class LogisticsProviderSettingsView(APIView):
+    """
+    GET  /api/shipping/provider-settings/  — return active provider
+    PATCH /api/shipping/provider-settings/ — switch provider (super_admin only)
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        s = LogisticsProviderSettings.get_solo()
+        return Response({"active_provider": s.active_provider})
+
+    def patch(self, request):
+        if request.user.role not in ("admin", "super_admin") and not request.user.is_staff:
+            return Response({"error": "Admin access required"}, status=status.HTTP_403_FORBIDDEN)
+        provider = request.data.get("active_provider")
+        valid = {LogisticsProvider.NIMBUSPOST, LogisticsProvider.SHIPROCKET}
+        if provider not in valid:
+            return Response(
+                {"error": f"active_provider must be one of: {', '.join(valid)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        s = LogisticsProviderSettings.get_solo()
+        s.active_provider = provider
+        s.save(update_fields=["active_provider", "updated_at"])
+        return Response({"active_provider": s.active_provider})
 
 
 class PackageImageUploadView(APIView):

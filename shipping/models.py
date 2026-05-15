@@ -2,6 +2,33 @@ from django.db import models
 from core.models import User, SoftDeleteModel
 from orders.models import Order
 
+
+class LogisticsProvider(models.TextChoices):
+    NIMBUSPOST = 'nimbuspost', 'NimbusPost'
+    SHIPROCKET = 'shiprocket', 'Shiprocket'
+
+
+class LogisticsProviderSettings(models.Model):
+    """
+    Singleton settings row controlling which logistics provider is active.
+    Mirrors PaymentGatewaySettings pattern.
+    """
+    active_provider = models.CharField(
+        max_length=20,
+        choices=LogisticsProvider.choices,
+        default=LogisticsProvider.NIMBUSPOST,
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(id=1)
+        return obj
+
+    class Meta:
+        verbose_name = 'Logistics Provider Settings'
+        verbose_name_plural = 'Logistics Provider Settings'
+
 class ShippingAddress(SoftDeleteModel):
     user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True, related_name='addresses')
     full_name = models.CharField(max_length=255)
