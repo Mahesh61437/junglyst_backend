@@ -242,6 +242,144 @@ class ProductSerializer(serializers.ModelSerializer):
         v = self._first_variant(obj)
         return v.height if v else 0
 
+    def create(self, validated_data):
+        variants_data = validated_data.pop('variants', [])
+        images_data = validated_data.pop('images', [])
+        category_id = validated_data.pop('category_id', None)
+        sub_category_id = validated_data.pop('sub_category_id', None)
+        seller_id = validated_data.pop('seller_id', None)
+        if seller_id and 'seller' not in validated_data:
+            try:
+                validated_data['seller'] = User.objects.get(id=seller_id)
+            except User.DoesNotExist:
+                raise serializers.ValidationError({'seller_id': 'User not found'})
+
+        name = validated_data.get('name')
+        if name:
+            slug = slugify(name)
+            base_slug = slug
+            counter = 1
+            while Product.objects.filter(slug=slug).exists():
+                slug = f"{base_slug}-{counter}"
+                counter += 1
+            validated_data['slug'] = slug
+
+        product = Product.objects.create(**validated_data)
+
+        if category_id:
+            try:
+                product.categories.add(Category.objects.get(id=category_id))
+            except Category.DoesNotExist:
+                pass
+
+        if sub_category_id:
+            try:
+                sub_cat = SubCategory.objects.get(id=sub_category_id)
+                product.sub_category = sub_cat
+                product.categories.add(sub_cat.category)
+                product.save()
+            except SubCategory.DoesNotExist:
+                pass
+
+        created_variants = []
+        for variant_data in variants_data:
+            created_variants.append(ProductVariant.objects.create(product=product, **variant_data))
+
+        for image_data in images_data:
+            variant_id = image_data.pop('variant_id', None)
+            target_variant = None
+            if variant_id is not None and variant_id != "":
+                try:
+                    idx = int(variant_id)
+                    if 0 <= idx < len(created_variants):
+                        target_variant = created_variants[idx]
+                except (ValueError, TypeError):
+                    try:
+                        target_variant = ProductVariant.objects.get(id=variant_id, product=product)
+                    except (ProductVariant.DoesNotExist, ValueError):
+                        pass
+            ProductImage.objects.create(product=product, variant=target_variant, **image_data)
+
+        return product
+
+    def update(self, instance, validated_data):
+        _missing = object()
+        variants_data = validated_data.pop('variants', _missing)
+        images_data = validated_data.pop('images', _missing)
+        category_id = validated_data.pop('category_id', None)
+        sub_category_id = validated_data.pop('sub_category_id', None)
+        seller_id = validated_data.pop('seller_id', None)
+        if seller_id:
+            try:
+                instance.seller = User.objects.get(id=seller_id)
+            except User.DoesNotExist:
+                raise serializers.ValidationError({'seller_id': 'User not found'})
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if category_id:
+            instance.categories.clear()
+            try:
+                instance.categories.add(Category.objects.get(id=category_id))
+            except Category.DoesNotExist:
+                pass
+
+        if sub_category_id:
+            try:
+                sub_cat = SubCategory.objects.get(id=sub_category_id)
+                instance.sub_category = sub_cat
+                if sub_cat.category not in instance.categories.all():
+                    instance.categories.add(sub_cat.category)
+                instance.save()
+            except SubCategory.DoesNotExist:
+                pass
+
+        if variants_data is not _missing:
+            existing_variants = {str(v.id): v for v in instance.variants.all()}
+            incoming_variant_ids = []
+            for v_data in variants_data:
+                v_id = str(v_data.pop('id')) if v_data.get('id') else None
+                for key in ('product', 'is_deleted', 'deleted_at', 'created_at'):
+                    v_data.pop(key, None)
+                if v_id and v_id in existing_variants:
+                    v_obj = existing_variants[v_id]
+                    for attr, value in v_data.items():
+                        setattr(v_obj, attr, value)
+                    v_obj.save()
+                    incoming_variant_ids.append(v_id)
+                else:
+                    incoming_variant_ids.append(str(ProductVariant.objects.create(product=instance, **v_data).id))
+            for v_id, v_obj in existing_variants.items():
+                if v_id not in incoming_variant_ids:
+                    v_obj.delete()
+
+        if images_data is not _missing:
+            existing_images = {img.id: img for img in instance.images.all()}
+            incoming_image_ids = []
+            for img_data in images_data:
+                img_id = img_data.pop('id', None)
+                variant_id = img_data.pop('variant_id', None)
+                for key in ('product', 'is_deleted', 'deleted_at', 'created_at'):
+                    img_data.pop(key, None)
+                target_variant = None
+                if variant_id:
+                    try:
+                        target_variant = ProductVariant.objects.get(id=variant_id)
+                    except (ProductVariant.DoesNotExist, ValueError):
+                        pass
+                if img_id and img_id in existing_images:
+                    ProductImage.objects.filter(id=img_id).update(variant=target_variant, **img_data)
+                    incoming_image_ids.append(img_id)
+                else:
+                    ProductImage.objects.create(product=instance, variant=target_variant, **img_data)
+            for img_id, img_obj in existing_images.items():
+                if img_id not in incoming_image_ids:
+                    img_obj.delete()
+
+        return instance
+
 class ProductListSerializer(serializers.ModelSerializer):
     """
     Optimized version of ProductSerializer for listing pages.
@@ -312,179 +450,10 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        # Fallback price if DecimalField doesn't pick it up (though it should via @property or prefetched field)
         if not data.get('price'):
             v = instance.variants.all()
             data['price'] = str(v[0].price) if v else "0"
         return data
-
-    def create(self, validated_data):
-        variants_data = validated_data.pop('variants', [])
-        images_data = validated_data.pop('images', [])
-        category_id = validated_data.pop('category_id', None)
-        sub_category_id = validated_data.pop('sub_category_id', None)
-        seller_id = validated_data.pop('seller_id', None)
-        if seller_id and 'seller' not in validated_data:
-            try:
-                validated_data['seller'] = User.objects.get(id=seller_id)
-            except User.DoesNotExist:
-                raise serializers.ValidationError({'seller_id': 'User not found'})
-        
-        # Auto-slugify
-        name = validated_data.get('name')
-        if name:
-            slug = slugify(name)
-            base_slug = slug
-            counter = 1
-            while Product.objects.filter(slug=slug).exists():
-                slug = f"{base_slug}-{counter}"
-                counter += 1
-            validated_data['slug'] = slug
-
-        product = Product.objects.create(**validated_data)
-        
-        if category_id:
-            try:
-                category = Category.objects.get(id=category_id)
-                product.categories.add(category)
-            except Category.DoesNotExist:
-                pass
-        
-        if sub_category_id:
-            try:
-                sub_cat = SubCategory.objects.get(id=sub_category_id)
-                product.sub_category = sub_cat
-                # Automatically add the parent category as well
-                product.categories.add(sub_cat.category)
-                product.save()
-            except SubCategory.DoesNotExist:
-                pass
-
-        # Create variants and keep track of them for image mapping
-        created_variants = []
-        for variant_data in variants_data:
-            variant = ProductVariant.objects.create(product=product, **variant_data)
-            created_variants.append(variant)
-            
-        # Create images
-        for image_data in images_data:
-            variant_id = image_data.pop('variant_id', None)
-            # Try to handle mapping by index (if string/int) or ID (if UUID)
-            target_variant = None
-            if variant_id is not None and variant_id != "":
-                try:
-                    # If it's an index (from new product flow)
-                    idx = int(variant_id)
-                    if 0 <= idx < len(created_variants):
-                        target_variant = created_variants[idx]
-                except (ValueError, TypeError):
-                    # If it's a UUID (from edit flow)
-                    try:
-                        target_variant = ProductVariant.objects.get(id=variant_id, product=product)
-                    except (ProductVariant.DoesNotExist, ValueError):
-                        pass
-            
-            ProductImage.objects.create(product=product, variant=target_variant, **image_data)
-            
-        return product
-
-    def update(self, instance, validated_data):
-        # Use sentinel to distinguish "not sent" (partial PATCH) from "sent as empty list"
-        _missing = object()
-        variants_data = validated_data.pop('variants', _missing)
-        images_data = validated_data.pop('images', _missing)
-        category_id = validated_data.pop('category_id', None)
-        sub_category_id = validated_data.pop('sub_category_id', None)
-        seller_id = validated_data.pop('seller_id', None)
-        if seller_id:
-            try:
-                instance.seller = User.objects.get(id=seller_id)
-            except User.DoesNotExist:
-                raise serializers.ValidationError({'seller_id': 'User not found'})
-
-        # Update core fields (e.g. is_active from archive PATCH)
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save()
-
-        if category_id:
-            instance.categories.clear()
-            try:
-                category = Category.objects.get(id=category_id)
-                instance.categories.add(category)
-            except Category.DoesNotExist:
-                pass
-
-        if sub_category_id:
-            try:
-                sub_cat = SubCategory.objects.get(id=sub_category_id)
-                instance.sub_category = sub_cat
-                # Ensure parent category is in categories
-                if sub_cat.category not in instance.categories.all():
-                    instance.categories.add(sub_cat.category)
-                instance.save()
-            except SubCategory.DoesNotExist:
-                pass
-
-        # Handle variants — only modify when variants were explicitly sent in the request
-        if variants_data is not _missing:
-            existing_variants = {str(v.id): v for v in instance.variants.all()}
-            incoming_variant_ids = []
-
-            for v_data in variants_data:
-                v_id = str(v_data.pop('id')) if v_data.get('id') else None
-                v_data.pop('product', None)
-                v_data.pop('is_deleted', None)
-                v_data.pop('deleted_at', None)
-                v_data.pop('created_at', None)
-
-                if v_id and v_id in existing_variants:
-                    v_obj = existing_variants[v_id]
-                    for attr, value in v_data.items():
-                        setattr(v_obj, attr, value)
-                    v_obj.save()
-                    incoming_variant_ids.append(v_id)
-                else:
-                    new_v = ProductVariant.objects.create(product=instance, **v_data)
-                    incoming_variant_ids.append(str(new_v.id))
-
-            # Only delete variants that were explicitly omitted from a full update
-            for v_id, v_obj in existing_variants.items():
-                if v_id not in incoming_variant_ids:
-                    v_obj.delete()
-
-        # Handle images — only modify when images were explicitly sent in the request
-        if images_data is not _missing:
-            existing_images = {img.id: img for img in instance.images.all()}
-            incoming_image_ids = []
-
-            for img_data in images_data:
-                img_id = img_data.pop('id', None)
-                variant_id = img_data.pop('variant_id', None)
-                img_data.pop('product', None)
-                img_data.pop('is_deleted', None)
-                img_data.pop('deleted_at', None)
-                img_data.pop('created_at', None)
-
-                target_variant = None
-                if variant_id:
-                    try:
-                        target_variant = ProductVariant.objects.get(id=variant_id)
-                    except (ProductVariant.DoesNotExist, ValueError):
-                        pass
-
-                if img_id and img_id in existing_images:
-                    ProductImage.objects.filter(id=img_id).update(variant=target_variant, **img_data)
-                    incoming_image_ids.append(img_id)
-                else:
-                    ProductImage.objects.create(product=instance, variant=target_variant, **img_data)
-
-            # Only remove images that were explicitly omitted from a full update
-            for img_id, img_obj in existing_images.items():
-                if img_id not in incoming_image_ids:
-                    img_obj.delete()
-
-        return instance
 
 class CartItemSerializer(serializers.ModelSerializer):
     product = ProductSerializer(read_only=True)
