@@ -190,7 +190,7 @@ class SellerProfileListView(generics.ListAPIView):
 class AllowedSellerListCreateView(generics.ListCreateAPIView):
     permission_classes = (permissions.IsAdminUser,)
     queryset = AllowedSeller.objects.all().order_by('-created_at')
-    
+
     def get_serializer_class(self):
         from rest_framework import serializers
         class AllowedSellerSerializer(serializers.ModelSerializer):
@@ -198,6 +198,24 @@ class AllowedSellerListCreateView(generics.ListCreateAPIView):
                 model = AllowedSeller
                 fields = '__all__'
         return AllowedSellerSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        # If a user with this email already exists and is not yet a grower,
+        # upgrade them immediately so they don't have to re-login or re-apply.
+        email = instance.email
+        if email:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            try:
+                user = User.objects.get(email__iexact=email)
+                if user.role not in ['grower', 'admin']:
+                    user.role = 'grower'
+                    user.is_staff = True
+                    user.save(update_fields=['role', 'is_staff'])
+                    SellerProfile.objects.get_or_create(user=user)
+            except User.DoesNotExist:
+                pass
 
 class AllowedSellerDestroyView(generics.DestroyAPIView):
     permission_classes = (permissions.IsAdminUser,)

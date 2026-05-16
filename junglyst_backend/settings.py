@@ -243,9 +243,9 @@ REST_FRAMEWORK = {
         'rest_framework.throttling.UserRateThrottle'
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '100/day',
-        'user': '1000/day',
-        'auth': '10/minute',
+        'anon': '200/minute',   # stops scrapers/bots; casual browsing is ~5-15 req/page
+        'user': '600/minute',   # authenticated users won't hit this under normal use
+        'auth': '10/minute',    # keep tight for brute-force protection
     }
 }
 
