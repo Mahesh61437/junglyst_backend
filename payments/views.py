@@ -211,10 +211,34 @@ class PaymentGatewaySettingsView(APIView):
         return Response({"active_gateway": s.active_gateway})
 
     def patch(self, request):
+        from django.contrib.auth import get_user_model
         active = request.data.get("active_gateway")
         if active not in (PaymentGateway.CASHFREE, PaymentGateway.RAZORPAY):
             return Response({"error": "active_gateway must be 'cashfree' or 'razorpay'."}, status=400)
         s = PaymentGatewaySettings.get_solo()
+        previous = s.active_gateway
         s.active_gateway = active
         s.save(update_fields=["active_gateway", "updated_at"])
+
+        if previous != active:
+            User = get_user_model()
+            superadmins = User.objects.filter(is_staff=True, is_superuser=True, is_active=True)
+            label = {"cashfree": "Cashfree (UPI/QR)", "razorpay": "Razorpay"}.get(active, active)
+            prev_label = {"cashfree": "Cashfree (UPI/QR)", "razorpay": "Razorpay"}.get(previous, previous)
+            actor = request.user.get_full_name() or request.user.username or request.user.email
+            notifs = [
+                AppNotification(
+                    user=admin,
+                    title="Payment Gateway Switched",
+                    message=(
+                        f"{actor} switched the active payment gateway from "
+                        f"{prev_label} to {label}. "
+                        f"All new checkouts will now use {label}."
+                    ),
+                )
+                for admin in superadmins
+            ]
+            if notifs:
+                AppNotification.objects.bulk_create(notifs)
+
         return Response({"active_gateway": s.active_gateway})
