@@ -238,6 +238,8 @@ class LogisticsProviderSettingsView(APIView):
         return Response({"active_provider": s.active_provider})
 
     def patch(self, request):
+        from django.contrib.auth import get_user_model
+        from notifications.models import AppNotification
         if request.user.role not in ("admin", "super_admin") and not request.user.is_staff:
             return Response({"error": "Admin access required"}, status=status.HTTP_403_FORBIDDEN)
         provider = request.data.get("active_provider")
@@ -248,8 +250,31 @@ class LogisticsProviderSettingsView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         s = LogisticsProviderSettings.get_solo()
+        previous = s.active_provider
         s.active_provider = provider
         s.save(update_fields=["active_provider", "updated_at"])
+
+        if previous != provider:
+            User = get_user_model()
+            superadmins = User.objects.filter(is_staff=True, is_superuser=True, is_active=True)
+            label = {"nimbuspost": "NimbusPost", "shiprocket": "Shiprocket"}.get(provider, provider)
+            prev_label = {"nimbuspost": "NimbusPost", "shiprocket": "Shiprocket"}.get(previous, previous)
+            actor = request.user.get_full_name() or request.user.username or request.user.email
+            notifs = [
+                AppNotification(
+                    user=admin,
+                    title="Logistics Provider Switched",
+                    message=(
+                        f"{actor} switched the logistics provider from "
+                        f"{prev_label} to {label}. "
+                        f"All new shipments will now be booked via {label}."
+                    ),
+                )
+                for admin in superadmins
+            ]
+            if notifs:
+                AppNotification.objects.bulk_create(notifs)
+
         return Response({"active_provider": s.active_provider})
 
 
