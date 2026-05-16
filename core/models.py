@@ -165,9 +165,13 @@ class Product(SoftDeleteModel):
     tags = models.ManyToManyField(Tag, related_name='products', blank=True)
     
     scientific_name = models.CharField(max_length=255, blank=True, null=True)
-    care_level = models.CharField(max_length=50, choices=[('Easy', 'Easy'), ('Medium', 'Medium'), ('Advanced', 'Advanced')], default='Easy')
-    light_requirements = models.CharField(max_length=50, choices=[('Low', 'Low'), ('Medium', 'Medium'), ('High', 'High')], default='Medium')
-    growth_rate = models.CharField(max_length=50, choices=[('Slow', 'Slow'), ('Moderate', 'Moderate'), ('Fast', 'Fast')], default='Moderate')
+    # Range-aware fields: store single value "Easy" or range "Easy to Medium"
+    care_level = models.CharField(max_length=50, default='Easy',
+        help_text="Single value (Easy) or range (Easy to Advanced)")
+    light_requirements = models.CharField(max_length=50, default='Medium',
+        help_text="Single value (Low) or range (Low to High)")
+    growth_rate = models.CharField(max_length=50, default='Moderate',
+        help_text="Single value (Slow) or range (Slow to Fast)")
     
     is_rare = models.BooleanField(default=False, db_index=True)
     origin = models.CharField(max_length=100, blank=True, null=True)
@@ -177,6 +181,8 @@ class Product(SoftDeleteModel):
     ph_range = models.CharField(max_length=50, blank=True, null=True)
     
     is_active = models.BooleanField(default=True, db_index=True)
+    is_draft = models.BooleanField(default=False, db_index=True,
+        help_text="True = saved as draft (not visible to buyers). False = published or archived.")
     co2_requirement = models.CharField(max_length=50, choices=[('Low', 'Low'), ('Medium', 'Medium'), ('High', 'High')], default='Low')
     
     view_count = models.PositiveIntegerField(default=0)
@@ -191,10 +197,37 @@ class Product(SoftDeleteModel):
     def __str__(self):
         return self.name
 
+class VariantType(models.TextChoices):
+    PLANT      = 'Plant',          _('Plant')
+    RHIZOME    = 'Rhizome',        _('Rhizome')
+    POT        = 'Pot',            _('Pot')
+    CLUMP      = 'Clump',          _('Clump')
+    TISSUE_CULTURE = 'Tissue Culture', _('Tissue Culture')
+    CUTTING    = 'Cutting',        _('Cutting')
+    BUNCH      = 'Bunch',          _('Bunch')
+    MAT        = 'Mat',            _('Mat')
+    CUP        = 'Cup',            _('Cup')
+    EMERSED    = 'Emersed',        _('Emersed')
+    SUBMERGED  = 'Submerged',      _('Submerged')
+    SEEDLING   = 'Seedling',       _('Seedling')
+    BULB       = 'Bulb',           _('Bulb')
+    CORM       = 'Corm',           _('Corm')
+    DRY_START  = 'Dry Start',      _('Dry Start')
+    COLONY     = 'Colony',         _('Colony')
+    PAIR       = 'Pair',           _('Pair')
+    TRIO       = 'Trio',           _('Trio')
+    OTHER      = 'Other',          _('Other')
+
 class ProductVariant(SoftDeleteModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variants')
     name = models.CharField(max_length=100, default='Standard')
+    variant_type = models.CharField(
+        max_length=50,
+        choices=VariantType.choices,
+        default=VariantType.PLANT,
+        help_text="What form is this variant? e.g. Rhizome, Clump, Tissue Culture"
+    )
     
     sku = models.CharField(max_length=100, unique=True, null=True, blank=True)
     
