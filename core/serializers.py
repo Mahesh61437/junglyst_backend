@@ -126,8 +126,8 @@ class ProductImageSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = ProductImage
-        fields = '__all__'
-        read_only_fields = ['product']
+        fields = ('id', 'image_url', 'is_primary', 'order', 'variant')
+        read_only_fields = ('id',)
 
 class ProductReviewSerializer(serializers.ModelSerializer):
     product_id = serializers.UUIDField(write_only=True, required=True)
@@ -190,7 +190,10 @@ class ProductSerializer(serializers.ModelSerializer):
 
     def get_image(self, obj):
         images = obj.images.all()
-        return images[0].image_url if images else None
+        # Try to get primary image first, then fall back to first image
+        primary_img = next((img for img in images if img.is_primary), None)
+        target_img = primary_img or (images[0] if images else None)
+        return target_img.image_url if target_img and target_img.image_url else None
 
     def get_category(self, obj):
         categories = obj.categories.all()
@@ -406,7 +409,10 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     def get_image(self, obj):
         images = obj.images.all()
-        return images[0].image_url if images else None
+        # Try to get primary image first, then fall back to first image
+        primary_img = next((img for img in images if img.is_primary), None)
+        target_img = primary_img or (images[0] if images else None)
+        return target_img.image_url if target_img and target_img.image_url else None
 
     def _first_variant(self, obj):
         if not hasattr(obj, '_cached_first_variant'):

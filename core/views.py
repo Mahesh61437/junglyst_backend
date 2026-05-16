@@ -252,7 +252,7 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (permissions.IsAuthenticatedOrReadOnly,)
     lookup_field = 'id'
 
-    @method_decorator(cache_page(60 * 60)) # Cache for 1 hour
+    @method_decorator(cache_page(60 * 5)) # Cache for 5 minutes for debugging
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
 
@@ -635,7 +635,7 @@ class HomeDataView(generics.GenericAPIView):
             is_active=True, is_featured=True
         ).order_by('sort_order', '-rating')
 
-        products_qs = _product_queryset().filter(is_active=True).order_by('-created_at')[:8]
+        products_qs = _product_list_queryset().filter(is_active=True).order_by('-created_at')[:8]
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
@@ -645,6 +645,42 @@ class HomeDataView(generics.GenericAPIView):
 
         return Response({
             'featured_sellers': SellerProfileSerializer(featured_sellers, many=True).data,
-            'products': ProductSerializer(products_qs, many=True).data,
+            'products': ProductListSerializer(products_qs, many=True).data,
             'stats': stats,
         })
+
+from django.http import HttpResponse
+
+def robots_txt(request):
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+    lines = [
+        "User-agent: *",
+        "Disallow: /checkout/",
+        "Disallow: /cart/",
+        "Disallow: /account/",
+        "Disallow: /search?q=*",
+        "Disallow: /api/",
+        "",
+        f"Sitemap: {frontend_url}/sitemap.xml"
+    ]
+    return HttpResponse("\n".join(lines), content_type="text/plain")
+
+def sitemap_xml(request):
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+    
+    products = Product.objects.filter(is_active=True).order_by('-created_at')[:1000] # Limit to 1000 for simplicity
+    
+    xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+    
+    for product in products:
+        slug = product.slug or product.id
+        date = product.updated_at.strftime('%Y-%m-%d') if hasattr(product, 'updated_at') else (product.created_at.strftime('%Y-%m-%d') if hasattr(product, 'created_at') else '2023-10-25')
+        xml.append(f"""   <url>
+      <loc>{frontend_url}/product/{slug}</loc>
+      <lastmod>{date}</lastmod>
+      <changefreq>weekly</changefreq>
+      <priority>0.8</priority>
+   </url>""")
+        
+    xml.append('</urlset>')
+    return HttpResponse("\n".join(xml), content_type="application/xml")
