@@ -284,7 +284,6 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (permissions.IsAuthenticatedOrReadOnly,)
     lookup_field = 'id'
 
-    @method_decorator(cache_page(60 * 5)) # Cache for 5 minutes for debugging
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
 
@@ -700,18 +699,24 @@ class HomeDataView(generics.GenericAPIView):
     """
     permission_classes = (permissions.AllowAny,)
 
-    @method_decorator(cache_page(60 * 10)) # Cache for 10 minutes
+    _CACHE_KEY = 'home_data_v1'
+    _CACHE_TTL = 60 * 10  # 10 minutes
+
     def get(self, request):
         from sellers.models import SellerProfile
         from sellers.serializers import SellerProfileSerializer
         from django.contrib.auth import get_user_model
         User = get_user_model()
 
+        cached = cache.get(self._CACHE_KEY)
+        if cached is not None:
+            return Response(cached)
+
         featured_sellers = SellerProfile.objects.select_related('user').filter(
             is_active=True, is_featured=True
         ).order_by('sort_order', '-rating')
 
-        products_qs = _product_queryset().filter(is_active=True, is_draft=False).order_by('-created_at')[:8]
+        products_qs = _product_list_queryset().filter(is_active=True, is_draft=False).order_by('-created_at')[:8]
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
@@ -719,11 +724,13 @@ class HomeDataView(generics.GenericAPIView):
             'total_users': User.objects.filter(is_active=True).count(),
         }
 
-        return Response({
+        data = {
             'featured_sellers': SellerProfileSerializer(featured_sellers, many=True).data,
             'products': ProductListSerializer(products_qs, many=True).data,
             'stats': stats,
-        })
+        }
+        cache.set(self._CACHE_KEY, data, self._CACHE_TTL)
+        return Response(data)
 
 from django.http import HttpResponse
 
