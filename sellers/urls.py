@@ -3,7 +3,7 @@ from .views import (
     GrowerDashboardView, SellerStoreView, SellerProfileListView,
     CheckSellerApprovalView, CheckEmailAllowedView, AllowedSellerListCreateView, AllowedSellerDestroyView,
     PlatformStatsView, FeaturedCuratorView,
-    SellerPromotionView, AdminSellerProfileEditView,
+    SellerPromotionView, AdminSellerProfileEditView, BankDetailsView,
 )
 
 urlpatterns = [
@@ -14,6 +14,7 @@ urlpatterns = [
     path('', SellerProfileListView.as_view(), name='seller_list'),
     path('profiles/', SellerProfileListView.as_view(), name='seller_profiles_list'),
 
+    path('bank-details/', BankDetailsView.as_view(), name='bank_details'),
     path('check-approval/', CheckSellerApprovalView.as_view(), name='check_seller_approval'),
     path('check-email/', CheckEmailAllowedView.as_view(), name='check_email_allowed'),
     path('platform-stats/', PlatformStatsView.as_view(), name='platform_stats'),
