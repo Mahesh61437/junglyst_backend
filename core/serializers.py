@@ -1,4 +1,3 @@
-from django.utils.text import slugify
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
@@ -256,16 +255,6 @@ class ProductSerializer(serializers.ModelSerializer):
                 validated_data['seller'] = User.objects.get(id=seller_id)
             except User.DoesNotExist:
                 raise serializers.ValidationError({'seller_id': 'User not found'})
-
-        name = validated_data.get('name')
-        if name:
-            slug = slugify(name)
-            base_slug = slug
-            counter = 1
-            while Product.objects.filter(slug=slug).exists():
-                slug = f"{base_slug}-{counter}"
-                counter += 1
-            validated_data['slug'] = slug
 
         product = Product.objects.create(**validated_data)
 

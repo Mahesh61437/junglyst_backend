@@ -789,8 +789,8 @@ class OrderTrackView(APIView):
 
     def get(self, request):
         order_id = request.query_params.get('order_id')
-        order_number = request.query_params.get('order_number')
-        
+        order_number = (request.query_params.get('order_number') or '').strip().upper() or None
+
         if not order_id and not order_number:
             return Response({'error': 'order_id or order_number query parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -808,11 +808,10 @@ class OrderTrackView(APIView):
         ).prefetch_related(
             Prefetch('items', queryset=items_qs),
         )
-        qs = Order.objects.prefetch_related(
+        qs = Order.objects.select_related('payment').prefetch_related(
             Prefetch('items', queryset=items_qs),
             Prefetch('sub_orders', queryset=sub_orders_qs),
             'shipments',
-            'payments',
         )
 
         if order_uuid:

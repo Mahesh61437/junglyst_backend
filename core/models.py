@@ -2,6 +2,7 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
+from django.utils.text import slugify
 import uuid
 
 class UserRole(models.TextChoices):
@@ -155,10 +156,10 @@ class Tag(SoftDeleteModel):
 class Product(SoftDeleteModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
-    slug = models.SlugField(unique=True)
+    slug = models.SlugField(unique=True, max_length=120)
     tagline = models.CharField(max_length=500, blank=True, null=True)
     description = models.TextField()
-    
+
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='products')
     categories = models.ManyToManyField(Category, related_name='products', blank=True)
     sub_category = models.ForeignKey(SubCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
@@ -193,6 +194,39 @@ class Product(SoftDeleteModel):
 
     class Meta:
         ordering = ['-created_at']
+
+    _SLUG_MAX = 120
+
+    @staticmethod
+    def _truncate_slug(s: str, max_len: int) -> str:
+        """Trim to max_len at a word boundary (last '-' before limit)."""
+        if len(s) <= max_len:
+            return s
+        cut = s[:max_len]
+        boundary = cut.rfind('-')
+        return cut[:boundary] if boundary > 0 else cut
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base = self._truncate_slug(slugify(self.name), self._SLUG_MAX)
+            qs = Product.all_objects.exclude(pk=self.pk)
+
+            slug = base
+            if qs.filter(slug=slug).exists():
+                try:
+                    store_slug = self.seller.seller_profile.slug
+                    slug = self._truncate_slug(f"{base}-{store_slug}", self._SLUG_MAX)
+                except Exception:
+                    pass
+
+            counter = 1
+            candidate = slug
+            while qs.filter(slug=candidate).exists():
+                suffix = f"-{counter}"
+                candidate = self._truncate_slug(slug, self._SLUG_MAX - len(suffix)) + suffix
+                counter += 1
+            self.slug = candidate
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
