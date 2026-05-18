@@ -21,7 +21,7 @@ class SellerProfileAdmin(admin.ModelAdmin):
             'fields': ('user', 'store_name', 'slug', 'tagline', 'bio', 'is_active')
         }),
         ('Visual Identity', {
-            'fields': ('logo_url', 'banner_url', 'brand_color')
+            'fields': ('logo_url', 'icon_url', 'banner_url', 'brand_color')
         }),
         ('Promotion & Authenticity', {
             'fields': ('is_featured', 'sort_order', 'identity_verified', 'expertise_tags', 'experience_years')
