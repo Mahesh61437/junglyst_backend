@@ -370,11 +370,5 @@ NIMBUSPOST_WAREHOUSE_NAME = config('NIMBUSPOST_WAREHOUSE_NAME', default='Junglys
 SHIPROCKET_EMAIL = config('SHIPROCKET_EMAIL', default='')
 SHIPROCKET_PASSWORD = config('SHIPROCKET_PASSWORD', default='')
 
-FIREBASE_CONFIG = {
-    "apiKey": config('FIREBASE_API_KEY', default=''),
-    "authDomain": config('FIREBASE_AUTH_DOMAIN', default=''),
-    "projectId": config('FIREBASE_PROJECT_ID', default=''),
-    "storageBucket": config('FIREBASE_STORAGE_BUCKET', default=''),
-    "messagingSenderId": config('FIREBASE_MESSAGING_SENDER_ID', default=''),
-    "appId": config('FIREBASE_APP_ID', default='')
-}
+FIREBASE_STORAGE_BUCKET = config('FIREBASE_STORAGE_BUCKET', default='')
+FIREBASE_SERVICE_ACCOUNT_JSON = config('FIREBASE_SERVICE_ACCOUNT_JSON', default='')
