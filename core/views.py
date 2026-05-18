@@ -242,6 +242,18 @@ class ProductListView(generics.ListAPIView):
         if sub_cat_id:
             queryset = queryset.filter(sub_category_id=sub_cat_id)
 
+        # Category filter by name (comma-separated for multi-select)
+        category_name = params.get('category')
+        if category_name:
+            names = [n.strip() for n in category_name.split(',') if n.strip()]
+            queryset = queryset.filter(categories__name__in=names).distinct()
+
+        # Care level filter (comma-separated, e.g. "Easy,Medium")
+        care_level = params.get('care_level')
+        if care_level:
+            levels = [l.strip() for l in care_level.split(',') if l.strip()]
+            queryset = queryset.filter(care_level__in=levels)
+
         # Annotate with has_stock so filter_queryset can use it for ordering
         from django.db.models import Exists, OuterRef
         queryset = queryset.annotate(
