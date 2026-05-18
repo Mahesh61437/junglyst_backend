@@ -237,7 +237,7 @@ class NimbuspostService:
 
 SHIPROCKET_BASE = "https://apiv2.shiprocket.in/v1/external"
 SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket_token"
-SHIPROCKET_TOKEN_TTL = 3600 * 9  # 9 hours (Shiprocket tokens last ~10 h)
+SHIPROCKET_TOKEN_TTL = 3600 * 200  # 200 hours (tokens are valid for 240 h per docs)
 
 
 class ShiprocketService:

@@ -4,11 +4,12 @@ from django.utils.text import slugify
 
 class SellerProfileManager(models.Manager):
     def get_or_get_default(self, user):
+        display_name = user.get_full_name() or user.email.split('@')[0]
         profile, created = self.get_or_create(
             user=user,
             defaults={
-                'store_name': f"{user.username}'s Sanctuary",
-                'slug': slugify(user.username),
+                'store_name': f"{display_name}'s Sanctuary",
+                'slug': slugify(display_name),
                 'brand_color': '#0A3029'
             }
         )
@@ -27,6 +28,13 @@ class SellerProfile(models.Model):
     
     gst_number = models.CharField(max_length=15, blank=True, null=True)
     gst_document_url = models.URLField(max_length=1000, blank=True, null=True)
+
+    PAYOUT_TYPE_CHOICES = [('upi', 'UPI'), ('bank', 'Bank Account')]
+    payout_type = models.CharField(max_length=10, choices=PAYOUT_TYPE_CHOICES, default='upi', blank=True)
+    # Stored encrypted via sellers.encryption — never log or expose raw values
+    payout_account = models.CharField(max_length=500, blank=True, null=True)
+    ifsc_code = models.CharField(max_length=500, blank=True, null=True)
+    account_holder_name = models.CharField(max_length=255, blank=True, null=True)
     
     location_city = models.CharField(max_length=100, blank=True, null=True)
     location_state = models.CharField(max_length=100, blank=True, null=True)

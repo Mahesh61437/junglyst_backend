@@ -5,6 +5,7 @@ from core.models import ProductVariant, Product
 from orders.models import OrderItem
 from .models import SellerProfile, AllowedSeller
 from .serializers import SellerProfileSerializer
+from .encryption import encrypt_field, decrypt_field, mask_account
 from django.utils.text import slugify
 
 class GrowerDashboardView(generics.GenericAPIView):
@@ -126,12 +127,18 @@ class GrowerDashboardView(generics.GenericAPIView):
             profile.slug = slugify(store_name)
             
         profile.logo_url = data.get('logo_url', profile.logo_url)
+        profile.icon_url = data.get('icon_url', profile.icon_url)
         profile.banner_url = data.get('banner_url', profile.banner_url)
         profile.brand_color = data.get('brand_color', profile.brand_color)
         profile.bio = data.get('bio', profile.bio)
+        profile.tagline = data.get('expertise', profile.tagline)
         profile.location_city = data.get('location_city', profile.location_city)
         profile.location_pincode = data.get('location_pincode', profile.location_pincode)
-        
+        profile.gst_number = data.get('tax_id', profile.gst_number)
+        profile.payout_type = data.get('payout_type', profile.payout_type)
+        profile.payout_account = data.get('payout_account', profile.payout_account)
+        profile.ifsc_code = data.get('ifsc_code', profile.ifsc_code)
+
         profile.save()
 
         # Upgrade user role and staff status
@@ -190,7 +197,7 @@ class SellerProfileListView(generics.ListAPIView):
 class AllowedSellerListCreateView(generics.ListCreateAPIView):
     permission_classes = (permissions.IsAdminUser,)
     queryset = AllowedSeller.objects.all().order_by('-created_at')
-    
+
     def get_serializer_class(self):
         from rest_framework import serializers
         class AllowedSellerSerializer(serializers.ModelSerializer):
@@ -198,6 +205,24 @@ class AllowedSellerListCreateView(generics.ListCreateAPIView):
                 model = AllowedSeller
                 fields = '__all__'
         return AllowedSellerSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        # If a user with this email already exists and is not yet a grower,
+        # upgrade them immediately so they don't have to re-login or re-apply.
+        email = instance.email
+        if email:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            try:
+                user = User.objects.get(email__iexact=email)
+                if user.role not in ['grower', 'admin']:
+                    user.role = 'grower'
+                    user.is_staff = True
+                    user.save(update_fields=['role', 'is_staff'])
+                    SellerProfile.objects.get_or_create(user=user)
+            except User.DoesNotExist:
+                pass
 
 class AllowedSellerDestroyView(generics.DestroyAPIView):
     permission_classes = (permissions.IsAdminUser,)
@@ -300,3 +325,83 @@ class SellerPromotionView(generics.GenericAPIView):
 
         profile.save()
         return Response(SellerProfileSerializer(profile).data)
+
+
+class BankDetailsView(generics.GenericAPIView):
+    """
+    GET  /api/sellers/bank-details/  — returns masked payout info (no raw account numbers)
+    POST /api/sellers/bank-details/  — encrypts and saves payout details
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def _require_grower(self, user):
+        if user.role not in ('grower', 'admin'):
+            return Response({"error": "Access denied"}, status=403)
+        return None
+
+    def get(self, request):
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        try:
+            profile = request.user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+
+        payout_type = profile.payout_type or 'upi'
+        raw_account = decrypt_field(profile.payout_account or '')
+        raw_ifsc = decrypt_field(profile.ifsc_code or '')
+
+        return Response({
+            "payout_type": payout_type,
+            "account_holder_name": profile.account_holder_name or '',
+            "payout_account_masked": mask_account(raw_account) if raw_account else '',
+            "ifsc_code_masked": raw_ifsc[:4] + '****' if len(raw_ifsc) > 4 else ('****' if raw_ifsc else ''),
+            "has_bank_details": bool(raw_account),
+        })
+
+    def post(self, request):
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        try:
+            profile = request.user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+
+        data = request.data
+        payout_type = data.get('payout_type', profile.payout_type or 'upi')
+
+        if payout_type not in ('upi', 'bank'):
+            return Response({"error": "payout_type must be 'upi' or 'bank'"}, status=400)
+
+        payout_account = data.get('payout_account', '').strip()
+        ifsc_code = data.get('ifsc_code', '').strip()
+        account_holder_name = data.get('account_holder_name', '').strip()
+
+        if not payout_account:
+            return Response({"error": "payout_account is required"}, status=400)
+
+        if payout_type == 'bank':
+            if not ifsc_code:
+                return Response({"error": "ifsc_code is required for bank transfers"}, status=400)
+            if len(ifsc_code) != 11:
+                return Response({"error": "IFSC code must be exactly 11 characters"}, status=400)
+            if not account_holder_name:
+                return Response({"error": "account_holder_name is required for bank transfers"}, status=400)
+
+        profile.payout_type = payout_type
+        profile.payout_account = encrypt_field(payout_account)
+        profile.ifsc_code = encrypt_field(ifsc_code) if ifsc_code else ''
+        profile.account_holder_name = account_holder_name
+        profile.save(update_fields=['payout_type', 'payout_account', 'ifsc_code', 'account_holder_name'])
+
+        raw_account = payout_account
+        raw_ifsc = ifsc_code
+        return Response({
+            "message": "Payout details saved securely",
+            "payout_type": payout_type,
+            "account_holder_name": account_holder_name,
+            "payout_account_masked": mask_account(raw_account),
+            "ifsc_code_masked": raw_ifsc[:4] + '****' if len(raw_ifsc) > 4 else ('****' if raw_ifsc else ''),
+        }, status=status.HTTP_200_OK)

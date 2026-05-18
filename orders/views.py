@@ -413,10 +413,12 @@ class VerifyPaymentView(generics.GenericAPIView):
                 order.payment_gateway = PaymentGateway.RAZORPAY
                 order.save()
 
-                # Update sub-order statuses (sync — part of core order state)
+                # Update sub-order statuses + reset dispatch clock from payment time
+                placed_at = timezone.now()
                 for sub in order.sub_orders.all():
                     sub.status = 'placed'
-                    sub.save(update_fields=['status', 'updated_at'])
+                    sub.dispatch_deadline = placed_at + timedelta(hours=48)
+                    sub.save(update_fields=['status', 'dispatch_deadline', 'updated_at'])
 
                 # Deduct stock (sync — must be atomic)
                 for item in order.items.select_related('variant').all():
@@ -492,10 +494,12 @@ class VerifyPaymentView(generics.GenericAPIView):
                 order.payment_gateway = PaymentGateway.CASHFREE
                 order.save()
 
-                # Update sub-order statuses (sync — part of core order state)
+                # Update sub-order statuses + reset dispatch clock from payment time
+                placed_at = timezone.now()
                 for sub in order.sub_orders.all():
                     sub.status = 'placed'
-                    sub.save(update_fields=['status', 'updated_at'])
+                    sub.dispatch_deadline = placed_at + timedelta(hours=48)
+                    sub.save(update_fields=['status', 'dispatch_deadline', 'updated_at'])
 
                 # Deduct stock (sync — must be atomic)
                 for item in order.items.select_related('variant').all():

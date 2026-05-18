@@ -334,3 +334,59 @@ class RejectGrowerView(APIView):
             return Response({"message": "Grower request rejected. Role updated to collector."}, status=200)
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=404)
+
+class UserSearchView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    def get(self, request):
+        from django.db.models import Q
+        from sellers.models import AllowedSeller, SellerProfile
+        q = request.query_params.get('q', '').strip()
+        if len(q) < 2:
+            return Response([])
+        users = User.objects.filter(
+            Q(email__icontains=q) | Q(username__icontains=q) | Q(full_name__icontains=q)
+        ).prefetch_related('seller_profile')[:10]
+        result = []
+        for u in users:
+            is_allowed = AllowedSeller.objects.filter(email__iexact=u.email, is_active=True).exists()
+            profile = getattr(u, 'seller_profile', None)
+            result.append({
+                'id': str(u.id),
+                'email': u.email,
+                'username': u.username,
+                'full_name': getattr(u, 'full_name', ''),
+                'role': u.role,
+                'is_allowed': is_allowed,
+                'store_name': profile.store_name if profile else None,
+            })
+        return Response(result)
+
+class SetGrowerView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    def post(self, request, pk):
+        from sellers.models import AllowedSeller, SellerProfile
+        try:
+            user = User.objects.get(id=pk)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+
+        action = request.data.get('action', 'grant')
+
+        if action == 'grant':
+            AllowedSeller.objects.get_or_create(email=user.email, defaults={'is_active': True})
+            user.role = 'grower'
+            user.is_staff = True
+            user.save(update_fields=['role', 'is_staff'])
+            SellerProfile.objects.get_or_create(user=user)
+            return Response({'message': f'{user.email} is now a grower', 'role': user.role})
+
+        elif action == 'revoke':
+            AllowedSeller.objects.filter(email__iexact=user.email).delete()
+            user.role = 'collector'
+            user.is_staff = False
+            user.save(update_fields=['role', 'is_staff'])
+            return Response({'message': f'{user.email} grower access revoked', 'role': user.role})
+
+        return Response({'error': 'Invalid action'}, status=400)

@@ -197,20 +197,67 @@ class ProductListView(generics.ListAPIView):
 
     def get_queryset(self):
         queryset = _product_list_queryset()
+        params = self.request.query_params
 
-        seller_slug = self.request.query_params.get('seller_slug')
+        seller_slug = params.get('seller_slug')
         if seller_slug:
             queryset = queryset.filter(seller__seller_profile__slug=seller_slug)
 
-        seller_id = self.request.query_params.get('seller')
-        is_active_param = self.request.query_params.get('is_active')
-        if seller_id and is_active_param is None:
-            pass
+        seller_id = params.get('seller')
+        is_active_param = params.get('is_active')
+        is_draft_param = params.get('is_draft')
+
+        if seller_id:
+            # Seller-scoped: respect explicit filters
+            if is_active_param is not None and is_active_param != 'all':
+                queryset = queryset.filter(is_active=is_active_param in ('true', '1', 'True'))
+            if is_draft_param is not None:
+                queryset = queryset.filter(is_draft=is_draft_param in ('true', '1', 'True'))
+            # If is_active='all' is passed, show everything (drafts + published + archived)
         else:
+            # Public shop: only published, non-draft products
             if is_active_param is None:
-                queryset = queryset.filter(is_active=True)
+                queryset = queryset.filter(is_active=True, is_draft=False)
+
+        # In-stock filter
+        if params.get('in_stock') in ('true', '1', 'True'):
+            queryset = queryset.filter(variants__stock__gt=0).distinct()
+
+        # Price range filter (based on first variant price)
+        min_price = params.get('min_price')
+        max_price = params.get('max_price')
+        if min_price:
+            try:
+                queryset = queryset.filter(variants__price__gte=float(min_price)).distinct()
+            except ValueError:
+                pass
+        if max_price:
+            try:
+                queryset = queryset.filter(variants__price__lte=float(max_price)).distinct()
+            except ValueError:
+                pass
+
+        # Subcategory filter
+        sub_cat_id = params.get('sub_category_id')
+        if sub_cat_id:
+            queryset = queryset.filter(sub_category_id=sub_cat_id)
+
+        # Annotate with has_stock so filter_queryset can use it for ordering
+        from django.db.models import Exists, OuterRef
+        queryset = queryset.annotate(
+            has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
+        )
 
         return queryset
+
+    def filter_queryset(self, queryset):
+        """Always put in-stock products first; user's chosen sort is the secondary key."""
+        qs = super().filter_queryset(queryset)
+        ordering_param = self.request.query_params.get('ordering')
+        if ordering_param:
+            secondary = [f.strip() for f in ordering_param.split(',')]
+            return qs.order_by('-has_stock', *secondary)
+        return qs.order_by('-has_stock', '-created_at')
 
     def paginate_queryset(self, queryset):
         if self.request.query_params.get('no_pagination'):
@@ -252,7 +299,6 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (permissions.IsAuthenticatedOrReadOnly,)
     lookup_field = 'id'
 
-    @method_decorator(cache_page(60 * 60)) # Cache for 1 hour
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
 
@@ -394,8 +440,9 @@ class CategoryListView(generics.ListAPIView):
     queryset = Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
     serializer_class = CategorySerializer
     permission_classes = (permissions.AllowAny,)
+    pagination_class = None  # always return all categories in one response
 
-    _CACHE_KEY = 'categories_list_v1'
+    _CACHE_KEY = 'categories_list_v2'
     _CACHE_TTL = 60 * 60 * 24  # 24 hours
 
     def get(self, request, *args, **kwargs):
@@ -617,6 +664,49 @@ class WishlistView(generics.GenericAPIView):
         return Response({'status': 'removed'})
 
 
+class ProductBulkActionView(generics.GenericAPIView):
+    """
+    POST /core/products/bulk-action/
+    Body: { "action": "publish"|"archive"|"unarchive"|"delete", "ids": ["uuid1", ...] }
+    Sellers can only act on their own products. Admins can act on any.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    VALID_ACTIONS = {'publish', 'archive', 'unarchive', 'delete'}
+
+    def post(self, request):
+        action = request.data.get('action')
+        ids = request.data.get('ids', [])
+
+        if not action or action not in self.VALID_ACTIONS:
+            return Response({'error': f'action must be one of: {", ".join(self.VALID_ACTIONS)}'}, status=400)
+        if not ids:
+            return Response({'error': 'ids list is required'}, status=400)
+
+        user = request.user
+        is_admin = user.is_staff or user.is_superuser or user.role == 'admin'
+
+        qs = Product.objects.filter(id__in=ids)
+        if not is_admin:
+            qs = qs.filter(seller=user)
+
+        count = qs.count()
+        if count == 0:
+            return Response({'error': 'No matching products found'}, status=404)
+
+        if action == 'publish':
+            qs.update(is_active=True, is_draft=False)
+        elif action == 'archive':
+            ProductVariant.objects.filter(product_id__in=ids).update(stock=0)
+            qs.update(is_active=False, is_draft=False)
+        elif action == 'unarchive':
+            qs.update(is_active=True, is_draft=False)
+        elif action == 'delete':
+            qs.update(is_deleted=True)
+
+        return Response({'success': True, 'affected': count, 'action': action})
+
+
 class HomeDataView(generics.GenericAPIView):
     """
     Single aggregate endpoint for the home page.
@@ -624,27 +714,74 @@ class HomeDataView(generics.GenericAPIView):
     """
     permission_classes = (permissions.AllowAny,)
 
-    @method_decorator(cache_page(60 * 10)) # Cache for 10 minutes
+    _CACHE_KEY = 'home_data_v2'
+    _CACHE_TTL = 60 * 10  # 10 minutes
+
     def get(self, request):
         from sellers.models import SellerProfile
         from sellers.serializers import SellerProfileSerializer
         from django.contrib.auth import get_user_model
         User = get_user_model()
 
+        cached = cache.get(self._CACHE_KEY)
+        if cached is not None:
+            return Response(cached)
+
         featured_sellers = SellerProfile.objects.select_related('user').filter(
             is_active=True, is_featured=True
         ).order_by('sort_order', '-rating')
 
-        products_qs = _product_queryset().filter(is_active=True).order_by('-created_at')[:8]
+        from django.db.models import Exists, OuterRef
+        products_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
+            has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
+        ).order_by('-has_stock', '-created_at')[:8]
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
-            'total_products': Product.objects.filter(is_active=True).count(),
+            'total_products': Product.objects.filter(is_active=True, is_draft=False).count(),
             'total_users': User.objects.filter(is_active=True).count(),
         }
 
-        return Response({
+        data = {
             'featured_sellers': SellerProfileSerializer(featured_sellers, many=True).data,
-            'products': ProductSerializer(products_qs, many=True).data,
+            'products': ProductListSerializer(products_qs, many=True).data,
             'stats': stats,
-        })
+        }
+        cache.set(self._CACHE_KEY, data, self._CACHE_TTL)
+        return Response(data)
+
+from django.http import HttpResponse
+
+def robots_txt(request):
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+    lines = [
+        "User-agent: *",
+        "Disallow: /checkout/",
+        "Disallow: /cart/",
+        "Disallow: /account/",
+        "Disallow: /search?q=*",
+        "Disallow: /api/",
+        "",
+        f"Sitemap: {frontend_url}/sitemap.xml"
+    ]
+    return HttpResponse("\n".join(lines), content_type="text/plain")
+
+def sitemap_xml(request):
+    frontend_url = getattr(settings, 'FRONTEND_URL', 'http://localhost:5173').rstrip('/')
+    
+    products = Product.objects.filter(is_active=True).order_by('-created_at')[:1000] # Limit to 1000 for simplicity
+    
+    xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+    
+    for product in products:
+        slug = product.slug or product.id
+        date = product.updated_at.strftime('%Y-%m-%d') if hasattr(product, 'updated_at') else (product.created_at.strftime('%Y-%m-%d') if hasattr(product, 'created_at') else '2023-10-25')
+        xml.append(f"""   <url>
+      <loc>{frontend_url}/product/{slug}</loc>
+      <lastmod>{date}</lastmod>
+      <changefreq>weekly</changefreq>
+      <priority>0.8</priority>
+   </url>""")
+        
+    xml.append('</urlset>')
+    return HttpResponse("\n".join(xml), content_type="application/xml")
