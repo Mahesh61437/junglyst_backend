@@ -293,6 +293,7 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
                     'variant_name': item.variant_name or (item.variant.name if item.variant else 'Default'),
                     'quantity': item.quantity,
                     'unit_price': float(item.unit_price),
+                    'product_image': self._get_product_image_cached(item),
                 }
                 for item in so.items.all()
             ]

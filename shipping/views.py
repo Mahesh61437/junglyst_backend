@@ -384,6 +384,91 @@ class NimbusPostWebhookView(APIView):
         return Response({"message": f"Webhook processed: {awb} → {mapped}"})
 
 
+class ShiprocketWebhookView(APIView):
+    """
+    POST /api/shipping/webhook/shiprocket/
+    Receives real-time tracking updates from Shiprocket.
+    Maps courier status → SubOrder status and notifies buyer.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    # Shiprocket current_status → SubOrder status mapping
+    # Shiprocket sends current_status in UPPERCASE; we .lower().strip() before lookup.
+    STATUS_MAP = {
+        # Pickup phase
+        "pickup scheduled":              "shipped",
+        "out for pickup":               "shipped",
+        "picked up":                    "shipped",
+        "shipped":                      "shipped",
+        # In-transit phase
+        "in transit":                   "in_transit",
+        "reached at destination hub":   "in_transit",
+        "delayed":                      "in_transit",
+        "misrouted":                    "in_transit",
+        # Delivery phase
+        "out for delivery":             "out_for_delivery",
+        "delivered":                    "delivered",
+        "undelivered":                  "delivery_failed",
+        "delivery failed":              "delivery_failed",
+        # RTO phase
+        "rto initiated":                "delivery_failed",
+        "rto delivered":                "cancelled",
+        "rto acknowledged":             "cancelled",
+        # Cancellation
+        "cancelled":                    "cancelled",
+        "shipment cancelled":           "cancelled",
+        # Loss / damage
+        "lost":                         "delivery_failed",
+        "damaged":                      "delivery_failed",
+    }
+
+    BUYER_MESSAGES = {
+        "in_transit":       ("Order In Transit", "Your order {ref} is in transit and on its way to you."),
+        "out_for_delivery": ("Out for Delivery!", "Great news! Order {ref} is out for delivery today."),
+        "delivered":        ("Order Delivered!", "Your order {ref} has been delivered. Enjoy your new botanical!"),
+        "delivery_failed":  ("Delivery Attempt Failed", "Delivery for order {ref} was unsuccessful. The courier will retry or contact you."),
+    }
+
+    def post(self, request):
+        awb = (
+            request.data.get("awb")
+            or request.data.get("awb_number")
+            or request.data.get("awb_code")
+        )
+        raw_status = (
+            request.data.get("current_status")
+            or request.data.get("status")
+            or ""
+        ).lower().strip()
+
+        if not awb:
+            return Response({"error": "awb required"}, status=400)
+
+        mapped = self.STATUS_MAP.get(raw_status)
+        if not mapped:
+            return Response({"message": f"Status '{raw_status}' not mapped, ignored"})
+
+        Shipment.objects.filter(awb_number=awb).update(status=mapped)
+
+        from orders.models import SubOrder
+        sub_orders = SubOrder.objects.filter(awb_number=awb).select_related("order__user")
+        for so in sub_orders:
+            so.status = mapped
+            so.save(update_fields=["status", "updated_at"])
+
+            buyer = so.order.user
+            if buyer and mapped in self.BUYER_MESSAGES:
+                title, msg_tpl = self.BUYER_MESSAGES[mapped]
+                from notifications.models import AppNotification
+                AppNotification.objects.create(
+                    user=buyer,
+                    title=title,
+                    message=msg_tpl.format(ref=so.sub_order_number),
+                )
+
+        return Response({"message": f"Webhook processed: {awb} → {mapped}"})
+
+
 class PincodeCheckView(APIView):
     """
     GET /api/shipping/pincode-check/?pincode=XXXXXX

@@ -242,7 +242,22 @@ class ProductListView(generics.ListAPIView):
         if sub_cat_id:
             queryset = queryset.filter(sub_category_id=sub_cat_id)
 
+        # Annotate with has_stock so filter_queryset can use it for ordering
+        from django.db.models import Exists, OuterRef
+        queryset = queryset.annotate(
+            has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
+        )
+
         return queryset
+
+    def filter_queryset(self, queryset):
+        """Always put in-stock products first; user's chosen sort is the secondary key."""
+        qs = super().filter_queryset(queryset)
+        ordering_param = self.request.query_params.get('ordering')
+        if ordering_param:
+            secondary = [f.strip() for f in ordering_param.split(',')]
+            return qs.order_by('-has_stock', *secondary)
+        return qs.order_by('-has_stock', '-created_at')
 
     def paginate_queryset(self, queryset):
         if self.request.query_params.get('no_pagination'):
@@ -699,7 +714,7 @@ class HomeDataView(generics.GenericAPIView):
     """
     permission_classes = (permissions.AllowAny,)
 
-    _CACHE_KEY = 'home_data_v1'
+    _CACHE_KEY = 'home_data_v2'
     _CACHE_TTL = 60 * 10  # 10 minutes
 
     def get(self, request):
@@ -716,7 +731,10 @@ class HomeDataView(generics.GenericAPIView):
             is_active=True, is_featured=True
         ).order_by('sort_order', '-rating')
 
-        products_qs = _product_list_queryset().filter(is_active=True, is_draft=False).order_by('-created_at')[:8]
+        from django.db.models import Exists, OuterRef
+        products_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
+            has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
+        ).order_by('-has_stock', '-created_at')[:8]
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),

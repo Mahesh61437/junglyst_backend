@@ -8,11 +8,18 @@ class ShippingAddressSerializer(serializers.ModelSerializer):
         read_only_fields = ('user',)
 
 class ShipmentSerializer(serializers.ModelSerializer):
+    tracking_url = serializers.SerializerMethodField()
+
     class Meta:
         model = Shipment
         fields = (
             'id', 'seller', 'order', 'nimbuspost_id', 'nimbuspost_order_id',
             'awb_number', 'courier_name', 'status',
             'label_url', 'manifest_url', 'package_image_url', 'pickup_scheduled_at',
-            'created_at', 'updated_at',
+            'tracking_url', 'created_at', 'updated_at',
         )
+
+    def get_tracking_url(self, obj):
+        if obj.awb_number:
+            return f"https://shiprocket.co/tracking/{obj.awb_number}"
+        return None
