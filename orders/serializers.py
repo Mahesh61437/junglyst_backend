@@ -256,13 +256,11 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
 
     def get_payment_status(self, obj):
         """Return payment status."""
-        # Try to get cached payment if available, otherwise query
         try:
-            payment = obj.payments.first()  # Related name from Payment model
-        except:
-            from payments.models import Payment
-            payment = Payment.objects.filter(order=obj).first()
-        
+            payment = obj.payment  # OneToOneField reverse accessor
+        except Exception:
+            payment = None
+
         return {
             'is_paid': obj.is_paid,
             'payment_method': payment.method if payment else None,
