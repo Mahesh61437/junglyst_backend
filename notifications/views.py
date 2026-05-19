@@ -1,3 +1,4 @@
+import logging
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -8,6 +9,30 @@ from django.core.validators import validate_email
 from django.core.exceptions import ValidationError
 from .models import AppNotification, NewsletterSubscriber, ContactSubmission
 from .serializers import AppNotificationSerializer
+
+logger = logging.getLogger(__name__)
+
+def _admin_email():
+    """Return the admin inbox — never returns a display-name formatted address."""
+    raw = getattr(settings, 'ADMIN_EMAIL', None) or 'admin@junglyst.com'
+    # Strip display name like "Junglyst <admin@junglyst.com>" → "admin@junglyst.com"
+    if '<' in raw and '>' in raw:
+        raw = raw.split('<')[1].rstrip('>')
+    return raw.strip()
+
+
+def _send(subject, body, to):
+    """Send one email and log any error — raises nothing."""
+    try:
+        send_mail(
+            subject=subject,
+            message=body,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[to],
+            fail_silently=False,
+        )
+    except Exception as exc:
+        logger.error("Email send failed | to=%s subject=%r error=%s", to, subject, exc)
 
 # Cache TTL for unread counts — short enough to feel real-time, long enough to matter
 _UNREAD_CACHE_TTL = 30  # seconds
@@ -92,21 +117,15 @@ class NewsletterSubscribeView(APIView):
             subscriber.is_active = True
             subscriber.save(update_fields=['is_active'])
 
-        # Send welcome email
-        try:
-            send_mail(
-                subject='Welcome to the Junglyst Registry',
-                message=(
-                    f'Hi,\n\nThank you for joining the Junglyst Registry!\n\n'
-                    f'You will be the first to know about new arrivals, rare specimens, and care guides.\n\n'
-                    f'Happy growing,\nThe Junglyst Team\nadmin@junglyst.com'
-                ),
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[email],
-                fail_silently=True,
-            )
-        except Exception:
-            pass
+        _send(
+            subject='Welcome to the Junglyst Registry',
+            body=(
+                'Hi,\n\nThank you for joining the Junglyst Registry!\n\n'
+                'You will be the first to know about new arrivals, rare specimens, and expert care guides.\n\n'
+                'Happy growing,\nThe Junglyst Team\nadmin@junglyst.com'
+            ),
+            to=email,
+        )
 
         return Response({'message': 'Successfully subscribed! Check your email for a welcome note.'}, status=status.HTTP_201_CREATED)
 
@@ -133,38 +152,25 @@ class ContactFormView(APIView):
             name=name, email=email, phone=phone, topic=topic, message=message
         )
 
-        admin_email = getattr(settings, 'ADMIN_EMAIL', None) or getattr(settings, 'DEFAULT_FROM_EMAIL', None)
-        if admin_email:
-            try:
-                send_mail(
-                    subject=f'[Junglyst Contact] {topic or "General"} — {name}',
-                    message=(
-                        f'New contact form submission:\n\n'
-                        f'Name: {name}\nEmail: {email}\nPhone: {phone or "—"}\n'
-                        f'Topic: {topic or "—"}\n\nMessage:\n{message}'
-                    ),
-                    from_email=settings.DEFAULT_FROM_EMAIL,
-                    recipient_list=[admin_email],
-                    fail_silently=True,
-                )
-            except Exception:
-                pass
+        _send(
+            subject=f'[Junglyst Contact] {topic or "General"} — {name}',
+            body=(
+                f'New contact form submission:\n\n'
+                f'Name: {name}\nEmail: {email}\nPhone: {phone or "—"}\n'
+                f'Topic: {topic or "—"}\n\nMessage:\n{message}'
+            ),
+            to=_admin_email(),
+        )
 
-        # Confirmation to sender
-        try:
-            send_mail(
-                subject='We received your message — Junglyst',
-                message=(
-                    f'Hi {name},\n\nThank you for reaching out to us.\n\n'
-                    f'We have received your message and will respond within 1 business day.\n\n'
-                    f'Your message:\n"{message}"\n\n'
-                    f'The Junglyst Team\nadmin@junglyst.com'
-                ),
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[email],
-                fail_silently=True,
-            )
-        except Exception:
-            pass
+        _send(
+            subject='We received your message — Junglyst',
+            body=(
+                f'Hi {name},\n\nThank you for reaching out to us.\n\n'
+                f'We have received your message and will respond within 1 business day.\n\n'
+                f'Your message:\n"{message}"\n\n'
+                f'The Junglyst Team\nadmin@junglyst.com'
+            ),
+            to=email,
+        )
 
         return Response({'message': 'Message sent! We will get back to you within 1 business day.'}, status=status.HTTP_201_CREATED)
