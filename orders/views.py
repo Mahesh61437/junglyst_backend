@@ -147,12 +147,6 @@ class CheckoutView(generics.GenericAPIView):
         else:
             return Response({"error": "cart_id or items is required"}, status=400)
 
-        # Hard pincode zone check (SHIP-002)
-        if pincode:
-            zone_info = classify_pincode(str(pincode))
-            if not zone_info['deliverable']:
-                return Response({"error": "Sorry, we don't deliver to your pincode yet."}, status=400)
-
         # Address
         if request.user.is_authenticated and address_id:
             # Saved address flow
@@ -177,6 +171,13 @@ class CheckoutView(generics.GenericAPIView):
             shipping_address = guest_info.get('address')
             email = guest_info.get('email') or (request.user.email if request.user.is_authenticated else None)
             phone = guest_info.get('phone') or (request.user.phone if request.user.is_authenticated else None)
+
+        # Hard pincode zone check (SHIP-002) — always use the resolved address pincode
+        effective_pincode = str(pincode or (shipping_address or {}).get('pincode', '') or '')
+        if effective_pincode:
+            zone_info = classify_pincode(effective_pincode)
+            if not zone_info['deliverable']:
+                return Response({"error": "Sorry, we don't deliver to your pincode yet."}, status=400)
 
         # Stock check + group items by seller
 
@@ -988,22 +989,24 @@ class SubOrderShipView(APIView):
         manual_courier = request.data.get('courier_name')
 
         if manual_awb:
+            # Manual AWB entry — seller is confirming shipment with their own courier
             sub_order.awb_number = manual_awb
             sub_order.courier_name = manual_courier or 'Manual'
-            sub_order.status = 'shipped'
+            sub_order.status = 'packing'
             sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'updated_at'])
         else:
-            sub_order.status = 'shipped'
+            # Create NimbusPost order — pickup will be scheduled for the next day
+            sub_order.status = 'packing'
             sub_order.save(update_fields=['status', 'updated_at'])
-            from shipping.tasks import create_nimbuspost_shipment
-            create_nimbuspost_shipment.delay(str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id))
+            from shipping.tasks import create_shipment_task
+            create_shipment_task.delay(str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id))
 
         buyer = sub_order.order.user
         if buyer:
             AppNotification.objects.create(
                 user=buyer,
-                title='Your order is on its way!',
-                message=f'Order {sub_order.sub_order_number} has been shipped. AWB: {sub_order.awb_number or "pending"}.',
+                title='Your order is being packed!',
+                message=f'Order {sub_order.sub_order_number} is being prepared for dispatch. Tracking details will be shared once shipped.',
             )
 
         return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
@@ -1046,8 +1049,8 @@ class ShipNowView(APIView):
             )
 
         # Trigger async NimbusPost shipment creation
-        from shipping.tasks import create_nimbuspost_shipment
-        create_nimbuspost_shipment.delay(str(order_id), str(request.user.id), courier_id)
+        from shipping.tasks import create_shipment_task
+        create_shipment_task.delay(str(order_id), str(request.user.id), courier_id)
 
         return Response(
             {'message': 'Shipment initiated', 'order_id': str(order_id)},

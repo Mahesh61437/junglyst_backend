@@ -119,7 +119,7 @@ def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=Non
         "no_of_invoices": "1",
         "no_of_boxes": 1,
         "courier_id": str(courier_id),
-        "request_auto_pickup": "Yes",
+        "request_auto_pickup": "No",
         "invoice": [{
             "invoice_number": ref_number,
             "invoice_date": date.today().strftime("%d-%m-%Y"),
@@ -241,17 +241,16 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
         },
     )
 
-    # Write AWB back to SubOrder
+    # Write AWB back to SubOrder — status stays 'packing'; 'shipped' comes from webhook
     if sub_order and awb:
         SubOrder.objects.filter(id=sub_order.id).update(
             awb_number=awb,
             courier_name=courier,
-            status="shipped",
         )
 
-    # Write AWB to master Order (first sub-order wins)
+    # Write AWB to master Order (first sub-order wins) — don't promote status here
     if awb and not order.awb_number:
-        Order.objects.filter(id=order_id).update(awb_number=awb, courier_name=courier, status="shipped")
+        Order.objects.filter(id=order_id).update(awb_number=awb, courier_name=courier)
 
     # Notify buyer
     buyer = order.user

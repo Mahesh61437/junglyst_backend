@@ -2,7 +2,11 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.core.cache import cache
-from .models import AppNotification
+from django.conf import settings
+from django.core.mail import send_mail
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
+from .models import AppNotification, NewsletterSubscriber, ContactSubmission
 from .serializers import AppNotificationSerializer
 
 # Cache TTL for unread counts — short enough to feel real-time, long enough to matter
@@ -63,3 +67,104 @@ class UnreadCountView(APIView):
             ).count()
             cache.set(key, count, _UNREAD_CACHE_TTL)
         return Response({'count': count})
+
+
+class NewsletterSubscribeView(APIView):
+    """POST /api/notifications/newsletter/subscribe/ — public endpoint."""
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        email = (request.data.get('email') or '').strip().lower()
+        if not email:
+            return Response({'error': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            validate_email(email)
+        except ValidationError:
+            return Response({'error': 'Please enter a valid email address.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        subscriber, created = NewsletterSubscriber.objects.get_or_create(
+            email=email,
+            defaults={'is_active': True},
+        )
+        if not created and subscriber.is_active:
+            return Response({'message': 'You are already subscribed!'})
+        if not created:
+            subscriber.is_active = True
+            subscriber.save(update_fields=['is_active'])
+
+        # Send welcome email
+        try:
+            send_mail(
+                subject='Welcome to the Junglyst Registry',
+                message=(
+                    f'Hi,\n\nThank you for joining the Junglyst Registry!\n\n'
+                    f'You will be the first to know about new arrivals, rare specimens, and care guides.\n\n'
+                    f'Happy growing,\nThe Junglyst Team\nadmin@junglyst.com'
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=True,
+            )
+        except Exception:
+            pass
+
+        return Response({'message': 'Successfully subscribed! Check your email for a welcome note.'}, status=status.HTTP_201_CREATED)
+
+
+class ContactFormView(APIView):
+    """POST /api/notifications/contact/ — public endpoint."""
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request):
+        name = (request.data.get('name') or '').strip()
+        email = (request.data.get('email') or '').strip()
+        phone = (request.data.get('phone') or '').strip()
+        topic = (request.data.get('topic') or '').strip()
+        message = (request.data.get('message') or '').strip()
+
+        if not name or not email or not message:
+            return Response({'error': 'Name, email, and message are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            validate_email(email)
+        except ValidationError:
+            return Response({'error': 'Please enter a valid email address.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        ContactSubmission.objects.create(
+            name=name, email=email, phone=phone, topic=topic, message=message
+        )
+
+        admin_email = getattr(settings, 'ADMIN_EMAIL', None) or getattr(settings, 'DEFAULT_FROM_EMAIL', None)
+        if admin_email:
+            try:
+                send_mail(
+                    subject=f'[Junglyst Contact] {topic or "General"} — {name}',
+                    message=(
+                        f'New contact form submission:\n\n'
+                        f'Name: {name}\nEmail: {email}\nPhone: {phone or "—"}\n'
+                        f'Topic: {topic or "—"}\n\nMessage:\n{message}'
+                    ),
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[admin_email],
+                    fail_silently=True,
+                )
+            except Exception:
+                pass
+
+        # Confirmation to sender
+        try:
+            send_mail(
+                subject='We received your message — Junglyst',
+                message=(
+                    f'Hi {name},\n\nThank you for reaching out to us.\n\n'
+                    f'We have received your message and will respond within 1 business day.\n\n'
+                    f'Your message:\n"{message}"\n\n'
+                    f'The Junglyst Team\nadmin@junglyst.com'
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=True,
+            )
+        except Exception:
+            pass
+
+        return Response({'message': 'Message sent! We will get back to you within 1 business day.'}, status=status.HTTP_201_CREATED)
