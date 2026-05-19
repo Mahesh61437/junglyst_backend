@@ -4,11 +4,12 @@ from django.utils.translation import gettext_lazy as _
 import uuid
 
 class OrderStatus(models.TextChoices):
-    PENDING = 'pending', _('Pending')
-    PLACED = 'placed', _('Placed')
-    PROCESSING = 'processing', _('Processing')
-    SHIPPED = 'shipped', _('Shipped')
-    DELIVERED = 'delivered', _('Delivered')
+    PENDING = 'pending', _('Pending')           # order created, awaiting payment
+    CONFIRMED = 'confirmed', _('Confirmed')     # payment successful
+    FAILED = 'failed', _('Failed')             # payment failed
+    PROCESSING = 'processing', _('Processing') # seller(s) actively processing
+    SHIPPED = 'shipped', _('Shipped')          # at least one sub-order shipped
+    DELIVERED = 'delivered', _('Delivered')    # all sub-orders delivered
     CANCELLED = 'cancelled', _('Cancelled')
     RETURNED = 'returned', _('Returned')
 

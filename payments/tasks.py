@@ -254,7 +254,7 @@ def _capture_payment(payment, gateway_payment_id=None, gateway_data=None):
     # Reset order — may have been prematurely marked 'failed'
     order.is_paid = True
     order.payment_status = 'completed'
-    order.status = 'placed'
+    order.status = 'confirmed'
     order.save()
 
     # Deduct stock atomically
@@ -355,7 +355,7 @@ def check_payment_status(self, payment_id, label=''):
             payment.gateway_response = gw_data
             payment.save()
             order = payment.order
-            if order.status not in ('placed', 'shipped', 'delivered'):
+            if order.status not in ('confirmed', 'processing', 'shipped', 'delivered'):
                 order.status = 'failed'
                 order.payment_status = 'failed'
                 order.save(update_fields=['status', 'payment_status', 'updated_at'])
@@ -374,7 +374,7 @@ def check_payment_status(self, payment_id, label=''):
             payment.error_message = 'Hard-expired after 24 hours — no gateway response.'
             payment.save(update_fields=['status', 'error_message'])
             order = payment.order
-            if order.status not in ('placed', 'shipped', 'delivered'):
+            if order.status not in ('confirmed', 'processing', 'shipped', 'delivered'):
                 order.status = 'failed'
                 order.payment_status = 'failed'
                 order.save(update_fields=['status', 'payment_status', 'updated_at'])

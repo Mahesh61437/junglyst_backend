@@ -1,6 +1,9 @@
+from datetime import date, timedelta
 from django.db import models
 from core.models import User
 from django.utils.text import slugify
+
+WEEKDAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
 class SellerProfileManager(models.Manager):
     def get_or_get_default(self, user):
@@ -54,10 +57,29 @@ class SellerProfile(models.Model):
     total_sales = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     rating = models.DecimalField(max_digits=3, decimal_places=1, default=5.0)
     
+    # Shipping schedule: list of weekday ints (0=Monday … 6=Sunday)
+    shipping_days = models.JSONField(
+        default=list, blank=True,
+        help_text='Weekdays the seller ships: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun',
+    )
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SellerProfileManager()
+
+    def get_next_shipping_date(self):
+        """Return the nearest upcoming date (today included) when this seller ships."""
+        days = sorted(set(d for d in (self.shipping_days or []) if isinstance(d, int) and 0 <= d <= 6))
+        if not days:
+            return None
+        today = date.today()
+        current_weekday = today.weekday()  # 0=Monday
+        for day in days:
+            if day >= current_weekday:
+                return today + timedelta(days=day - current_weekday)
+        # Wrap to next week
+        return today + timedelta(days=7 - current_weekday + days[0])
 
     def __str__(self):
         return self.store_name

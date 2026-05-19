@@ -11,6 +11,7 @@ class SellerUserSerializer(serializers.ModelSerializer):
 class SellerProfileSerializer(serializers.ModelSerializer):
     user_email = serializers.EmailField(source='user.email', read_only=True)
     user_name = serializers.SerializerMethodField()
+    next_shipping_date = serializers.SerializerMethodField()
 
     class Meta:
         model = SellerProfile
@@ -19,3 +20,7 @@ class SellerProfileSerializer(serializers.ModelSerializer):
 
     def get_user_name(self, obj):
         return obj.user.get_full_name() or obj.user.username
+
+    def get_next_shipping_date(self, obj):
+        d = obj.get_next_shipping_date()
+        return d.isoformat() if d else None

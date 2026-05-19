@@ -437,9 +437,14 @@ class ProductListSerializer(serializers.ModelSerializer):
         return obj.sub_category.name if obj.sub_category else (obj.categories.all()[0].name if obj.categories.exists() else None)
 
     def get_variants(self, obj):
-        # Return only what ProductCard needs: id, price, stock
+        # Return only what ProductCard needs: id, price, stock, compare_at_price
         return [
-            {'id': str(v.id), 'price': str(v.price), 'stock': v.stock}
+            {
+                'id': str(v.id),
+                'price': str(v.price),
+                'stock': v.stock,
+                'compare_at_price': str(v.compare_at_price) if v.compare_at_price else None,
+            }
             for v in obj.variants.all()
         ]
 

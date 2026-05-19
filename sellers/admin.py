@@ -26,6 +26,10 @@ class SellerProfileAdmin(admin.ModelAdmin):
         ('Promotion & Authenticity', {
             'fields': ('is_featured', 'sort_order', 'identity_verified', 'expertise_tags', 'experience_years')
         }),
+        ('Shipping Schedule', {
+            'fields': ('shipping_days',),
+            'description': 'Select weekdays this seller ships. 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun. Example: [0, 2, 4] for Mon/Wed/Fri.',
+        }),
         ('Operations', {
             'fields': ('location_city', 'location_pincode', 'gst_number', 'gst_document_url')
         }),

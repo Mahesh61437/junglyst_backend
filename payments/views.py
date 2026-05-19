@@ -109,7 +109,7 @@ class CashfreeWebhookView(APIView):
 
                 order.is_paid = True
                 order.payment_status = 'completed'
-                order.status = 'placed'  # reset even if previously 'failed'
+                order.status = 'confirmed'  # reset even if previously 'failed'
                 order.save()
 
                 if order.user:
@@ -170,7 +170,7 @@ class CashfreeWebhookView(APIView):
             if payment.status == 'captured':
                 return
             order = payment.order
-            if order.status in ('placed', 'shipped', 'in_transit', 'out_for_delivery', 'delivered'):
+            if order.status in ('confirmed', 'processing', 'shipped', 'in_transit', 'out_for_delivery', 'delivered'):
                 return
             payment.status = 'failed'
             payment.gateway_status = 'FAILED'

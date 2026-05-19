@@ -66,7 +66,7 @@ def _finalize_order(order, payment=None, payment_data=None):
         payment.save()
 
     order.is_paid = True
-    order.status = 'placed'
+    order.status = 'confirmed'
     order.payment_status = 'captured'
     order.save()
 
@@ -410,7 +410,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 
                 order.is_paid = True
                 order.payment_status = 'completed'
-                order.status = 'placed'
+                order.status = 'confirmed'
                 order.payment_gateway = PaymentGateway.RAZORPAY
                 order.save()
 
@@ -491,7 +491,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 
                 order.is_paid = True
                 order.payment_status = 'completed'
-                order.status = 'placed'
+                order.status = 'confirmed'
                 order.payment_gateway = PaymentGateway.CASHFREE
                 order.save()
 
