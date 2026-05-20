@@ -7,12 +7,19 @@ from .models import Cart, CartItem
 class CartSellerSerializer(serializers.Serializer):
     id = serializers.UUIDField()
     store_name = serializers.SerializerMethodField()
+    shipping_days = serializers.SerializerMethodField()
 
     def get_store_name(self, obj):
         try:
             return obj.seller_profile.store_name
         except Exception:
             return ''
+
+    def get_shipping_days(self, obj):
+        try:
+            return obj.seller_profile.shipping_days or []
+        except Exception:
+            return []
 
 
 class CartImageSerializer(serializers.Serializer):

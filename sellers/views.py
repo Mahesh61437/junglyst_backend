@@ -94,7 +94,8 @@ class GrowerDashboardView(generics.GenericAPIView):
                 "location_city": profile.location_city,
                 "location_pincode": profile.location_pincode,
                 "rating": str(profile.rating),
-                "total_sales": str(profile.total_sales)
+                "total_sales": str(profile.total_sales),
+                "shipping_days": profile.shipping_days or []
             }
         }
         
@@ -139,6 +140,10 @@ class GrowerDashboardView(generics.GenericAPIView):
         profile.payout_type = data.get('payout_type', profile.payout_type)
         profile.payout_account = data.get('payout_account', profile.payout_account)
         profile.ifsc_code = data.get('ifsc_code', profile.ifsc_code)
+        if 'shipping_days' in data:
+            days = data.get('shipping_days')
+            if isinstance(days, list):
+                profile.shipping_days = [int(d) for d in days if isinstance(d, (int, float)) and 0 <= int(d) <= 6]
 
         profile.save()
 
