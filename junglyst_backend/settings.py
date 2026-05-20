@@ -76,6 +76,7 @@ INSTALLED_APPS = [
     'notifications',
     'sellers',
     'analytics',
+    'competition',
     'django_celery_results',
     'django_celery_beat',
 ]

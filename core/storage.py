@@ -57,6 +57,8 @@ def _build_path(user_id: str, type_prefix: str) -> str:
         return f"{env}/sellers/{user_id}/profile/{clean}/{clean}_{ts}_{uid}"
     elif clean == 'product':
         return f"{env}/sellers/{user_id}/products/{ts}_{uid}"
+    elif clean == 'competition':
+        return f"{env}/competition/{user_id}/{ts}_{uid}"
     else:
         return f"{env}/assets/{clean}/{ts}_{uid}"
 
