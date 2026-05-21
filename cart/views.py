@@ -111,3 +111,79 @@ class CartViewSet(viewsets.ModelViewSet):
             
         cart = self.get_cart(request)
         return Response(self.get_serializer(_cart_with_prefetch(cart)).data)
+
+    @action(detail=False, methods=['get'])
+    def shipping_configs(self, request):
+        """Return per-seller shipping tier configs for the given seller IDs.
+
+        Query param: seller_ids=UUID1,UUID2,...
+        Response: { "seller_id": { "light": {...}, "heavy": {...} }, ... }
+        """
+        from sellers.models import SellerShippingConfig
+        raw = request.query_params.get('seller_ids', '')
+        seller_ids = [s.strip() for s in raw.split(',') if s.strip()]
+        if not seller_ids:
+            return Response({})
+
+        configs = SellerShippingConfig.objects.filter(seller_id__in=seller_ids)
+        result = {}
+        for cfg in configs:
+            sid = str(cfg.seller_id)
+            result.setdefault(sid, {})[cfg.item_category] = {
+                'tier1_max': float(cfg.tier1_max),
+                'tier1_fee': float(cfg.tier1_fee),
+                'tier2_max': float(cfg.tier2_max),
+                'tier2_fee': float(cfg.tier2_fee),
+                'show_nudge_products': cfg.show_nudge_products,
+            }
+        return Response(result)
+
+    @action(detail=False, methods=['get'])
+    def nudge_products(self, request):
+        """Return a handful of products from a seller to help the buyer reach
+        the next shipping tier.
+
+        Query param: seller_id=UUID
+        Excludes products already in the current cart.
+        """
+        from core.models import Product
+        seller_id = request.query_params.get('seller_id')
+        if not seller_id:
+            return Response({'error': 'seller_id required'}, status=400)
+
+        cart = self.get_cart(request)
+        in_cart_product_ids = set(
+            str(item.product_id) for item in cart.items.select_related('product').all()
+        )
+
+        products = (
+            Product.objects
+            .filter(seller_id=seller_id, is_active=True)
+            .exclude(id__in=in_cart_product_ids)
+            .prefetch_related('variants', 'images')
+        )
+
+        result = []
+        for p in products:
+            variant = (
+                p.variants.filter(is_active=True, stock__gt=0)
+                .order_by('price')
+                .first()
+            )
+            if not variant:
+                continue
+            img = p.images.first()
+            result.append({
+                'id': str(p.id),
+                'name': p.name,
+                'slug': p.slug,
+                'price': float(variant.price),
+                'variant_id': str(variant.id),
+                'item_category': variant.item_category,
+                'image_url': img.image_url if img else None,
+                'stock': variant.stock,
+            })
+            if len(result) >= 6:
+                break
+
+        return Response(result)
