@@ -423,6 +423,7 @@ class ShiprocketWebhookView(APIView):
     }
 
     BUYER_MESSAGES = {
+        "shipped":          ("Order Picked Up!", "Your order {ref} has been picked up by the courier and is on its way."),
         "in_transit":       ("Order In Transit", "Your order {ref} is in transit and on its way to you."),
         "out_for_delivery": ("Out for Delivery!", "Great news! Order {ref} is out for delivery today."),
         "delivered":        ("Order Delivered!", "Your order {ref} has been delivered. Enjoy your new botanical!"),
@@ -430,10 +431,11 @@ class ShiprocketWebhookView(APIView):
     }
 
     def post(self, request):
+        # Shiprocket sends AWB primarily as awb_code; fall back to awb / awb_number
         awb = (
-            request.data.get("awb")
+            request.data.get("awb_code")
+            or request.data.get("awb")
             or request.data.get("awb_number")
-            or request.data.get("awb_code")
         )
         raw_status = (
             request.data.get("current_status")

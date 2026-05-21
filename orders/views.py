@@ -877,6 +877,18 @@ class SellerSubOrderListView(generics.ListAPIView):
         return super().paginate_queryset(queryset)
 
 
+class SellerSubOrderDetailView(APIView):
+    """GET /orders/seller/sub-orders/<pk>/ — fetch a single sub-order for the seller."""
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, pk):
+        try:
+            sub_order = SubOrder.objects.get(id=pk, seller=request.user)
+        except SubOrder.DoesNotExist:
+            return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
+
+
 class ConfirmSubOrderView(APIView):
     """Seller confirms a sub-order → status 'confirmed', starts 48h dispatch clock."""
     permission_classes = (permissions.IsAuthenticated,)
@@ -1013,11 +1025,19 @@ class SubOrderShipView(APIView):
             sub_order.status = 'packing'
             sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'updated_at'])
         else:
-            # Create NimbusPost order — pickup will be scheduled for the next day
             sub_order.status = 'packing'
             sub_order.save(update_fields=['status', 'updated_at'])
             from shipping.tasks import create_shipment_task
-            create_shipment_task.delay(str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id))
+            try:
+                create_shipment_task.delay(
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                )
+            except Exception as broker_err:
+                # Celery broker unavailable — run synchronously so the shipment still gets booked
+                logger.warning("Celery broker unavailable (%s); running create_shipment_task synchronously", broker_err)
+                create_shipment_task(
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                )
 
         buyer = sub_order.order.user
         if buyer:

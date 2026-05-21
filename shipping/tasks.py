@@ -227,7 +227,7 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
     manifest = data.get("manifest", "")
     courier = data.get("courier_name", "")
 
-    Shipment.objects.update_or_create(
+    shipment_obj, _ = Shipment.objects.update_or_create(
         order=order,
         seller=seller,
         defaults={
@@ -240,6 +240,21 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
             "manifest_url": manifest or None,
         },
     )
+
+    # Shiprocket occasionally needs a moment after AWB assignment before the label is ready.
+    # Now that the DB record exists (generate_label does a DB lookup by awb_number),
+    # try fetching the label if it wasn't returned inline.
+    if awb and not label:
+        try:
+            label_result = get_logistics_service().generate_label([awb])
+            label = (label_result or {}).get("data") or ""
+            if label:
+                Shipment.objects.filter(pk=shipment_obj.pk).update(label_url=label)
+                logger.info("Fallback label fetch succeeded for AWB %s", awb)
+            else:
+                logger.warning("Label not yet ready for AWB %s — seller can download once Shiprocket processes it", awb)
+        except Exception as exc:
+            logger.warning("Fallback label fetch raised: %s", exc)
 
     # Write AWB back to SubOrder — status stays 'packing'; 'shipped' comes from webhook
     if sub_order and awb:
