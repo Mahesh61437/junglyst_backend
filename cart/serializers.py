@@ -8,6 +8,13 @@ class CartSellerSerializer(serializers.Serializer):
     id = serializers.UUIDField()
     store_name = serializers.SerializerMethodField()
     shipping_days = serializers.SerializerMethodField()
+    slug = serializers.SerializerMethodField()
+
+    def get_slug(self, obj):
+        try:
+            return obj.seller_profile.slug
+        except Exception:
+            return ''
 
     def get_store_name(self, obj):
         try:

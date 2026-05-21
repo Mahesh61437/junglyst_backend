@@ -445,7 +445,8 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    clear_buyer_cart_task.delay(str(order.user_id))
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -526,7 +527,8 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    clear_buyer_cart_task.delay(str(order.user_id))
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -753,17 +755,22 @@ class OrderListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'grower':
-            qs = Order.objects.filter(items__seller=user).distinct()
-        elif user.is_staff or user.role == 'admin':
+        if user.is_staff or user.role == 'admin':
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
 
         # Single query for items + their product images — eliminates all N+1
         items_qs = OrderItem.objects.select_related('product').prefetch_related('product__images')
+        sub_orders_qs = SubOrder.objects.select_related(
+            'seller', 'seller__seller_profile'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+        )
         return qs.prefetch_related(
             Prefetch('items', queryset=items_qs),
+            Prefetch('sub_orders', queryset=sub_orders_qs),
+            Prefetch('shipments', to_attr='shipments_prefetched'),
         ).order_by('-created_at')
 
 
@@ -773,9 +780,7 @@ class OrderDetailView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'grower':
-            qs = Order.objects.filter(items__seller=user).distinct()
-        elif user.is_staff or user.role == 'admin':
+        if user.is_staff or user.role == 'admin':
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
