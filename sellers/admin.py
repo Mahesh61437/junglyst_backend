@@ -2,14 +2,6 @@ from django.contrib import admin
 from .models import SellerProfile, AllowedSeller, SellerShippingConfig
 
 
-class SellerShippingConfigInline(admin.TabularInline):
-    model = SellerShippingConfig
-    extra = 0
-    fields = ('item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee', 'show_nudge_products')
-    verbose_name = 'Shipping Tier'
-    verbose_name_plural = 'Shipping Tiers (light & heavy)'
-
-
 @admin.register(AllowedSeller)
 class AllowedSellerAdmin(admin.ModelAdmin):
     list_display = ('email', 'phone', 'is_active', 'created_at')
@@ -33,7 +25,6 @@ class SellerProfileAdmin(admin.ModelAdmin):
     prepopulated_fields = {'slug': ('store_name',)}
     list_editable = ('is_featured', 'identity_verified', 'is_active')
     ordering = ('sort_order', '-created_at')
-    inlines = [SellerShippingConfigInline]
 
     fieldsets = (
         ('Basic Information', {

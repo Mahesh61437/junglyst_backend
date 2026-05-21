@@ -26,6 +26,7 @@ def _cart_with_prefetch(cart):
 class CartViewSet(viewsets.ModelViewSet):
     serializer_class = CartSerializer
     permission_classes = (permissions.AllowAny,)
+    queryset = Cart.objects.none()   # satisfies ModelViewSet; all actions use get_cart()
 
     def get_cart(self, request):
         if request.user.is_authenticated:
@@ -112,7 +113,7 @@ class CartViewSet(viewsets.ModelViewSet):
         cart = self.get_cart(request)
         return Response(self.get_serializer(_cart_with_prefetch(cart)).data)
 
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], url_path='shipping-configs')
     def shipping_configs(self, request):
         """Return per-seller shipping tier configs for the given seller IDs.
 
@@ -138,7 +139,7 @@ class CartViewSet(viewsets.ModelViewSet):
             }
         return Response(result)
 
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], url_path='nudge-products')
     def nudge_products(self, request):
         """Return a handful of products from a seller to help the buyer reach
         the next shipping tier.
