@@ -285,10 +285,18 @@ class ShiprocketService:
     def ensure_seller_pickup_location(cls, seller, profile) -> str:
         """
         Returns the Shiprocket pickup_location name for this seller.
-        - Cached in SellerProfile.shiprocket_pickup_location → return immediately.
-        - Not cached → register via Shiprocket API → cache → return.
-        - Name already exists in Shiprocket → fetch list, find match → cache → return.
-        - Any failure → falls back to SHIPROCKET_PICKUP_LOCATION setting.
+
+        Only locations with status=1 (verified/active) are used — Shiprocket rejects
+        status=2 (pending phone verification) locations at order creation time.
+
+        Flow:
+          1. Return cached value if present (was verified at cache time).
+          2. Scan existing account locations for an active (status=1) match by name.
+          3. Register the seller's address via addpickup.
+          4. After registration, re-fetch and confirm status=1 before caching.
+             If still status=2 (pending OTP), do NOT cache — fall back to any
+             other active location so this shipment can proceed.
+          5. Ultimate fallback: SHIPROCKET_PICKUP_LOCATION setting.
         """
         import re
         from django.conf import settings as _s
@@ -303,16 +311,29 @@ class ShiprocketService:
             logger.error("Shiprocket auth failed — cannot register pickup for seller %s", seller.id)
             return fallback
 
-        # Build a clean location name (Shiprocket only allows alphanumeric + spaces)
+        # Build a clean location name (Shiprocket only allows alphanumeric + spaces, max 50)
         raw = profile.store_name or seller.get_full_name() or seller.username or 'Seller'
         location_name = re.sub(r'[^A-Za-z0-9 ]', '', raw).strip()[:50] or f"Seller{str(seller.id)[:8]}"
 
-        phone = (
-            getattr(profile, 'phone', None) or
-            getattr(seller, 'phone', None) or
-            '9999999999'
-        )
-        phone_clean = str(phone).replace('+91', '').replace(' ', '').strip()[-10:]
+        # ── Step 1: check whether an active matching location already exists ──
+        pre_check = cls._fetch_active_pickup(profile, location_name, token, None)
+        if pre_check:
+            logger.info("Shiprocket: reusing existing active pickup '%s' for seller %s", pre_check, seller.id)
+            return pre_check
+
+        # ── Step 2: register the seller's address ──
+        # Phone is mandatory for Shiprocket pickup registration (OTP verification).
+        # Use seller.phone (User model) — no fake fallback; missing phone = skip registration.
+        phone = getattr(seller, 'phone', None) or getattr(profile, 'phone', None)
+        if not phone:
+            logger.warning(
+                "Shiprocket: seller %s has no phone number — cannot register pickup location. "
+                "Seller must add a phone number in the Pickup Address settings.",
+                seller.id,
+            )
+            return cls._fetch_active_pickup(profile, None, token, fallback) or fallback
+
+        phone_clean = str(phone).replace('+91', '').replace(' ', '').replace('-', '').strip()[-10:]
 
         resp = requests.post(
             f"{SHIPROCKET_BASE}/settings/company/addpickup",
@@ -335,16 +356,32 @@ class ShiprocketService:
         if resp.status_code in (200, 201):
             body = resp.json()
             registered = (body.get('data') or {}).get('pickup_location') or location_name
-            cls._cache_pickup_location(profile, registered)
-            logger.info("Registered Shiprocket pickup '%s' for seller %s", registered, seller.id)
-            return registered
+            logger.info("Shiprocket: addpickup accepted '%s' for seller %s — verifying status", registered, seller.id)
 
-        # Already exists (422) or other issue — fetch list and match
+            # ── Step 3: confirm the newly registered location is active (status=1) ──
+            # Shiprocket requires phone/OTP verification before a location becomes usable.
+            # If status=2 (pending), do NOT cache it — fall through to any active location.
+            active = cls._fetch_active_pickup(profile, registered, token, None)
+            if active:
+                logger.info("Shiprocket: pickup '%s' is active and ready for seller %s", active, seller.id)
+                return active
+
+            # Registered but still pending verification — warn and use any active location
+            logger.warning(
+                "Shiprocket: pickup '%s' registered for seller %s but status≠1 (pending verification). "
+                "Seller must verify the phone number in Shiprocket dashboard. "
+                "Using first available active location for this shipment.",
+                registered, seller.id,
+            )
+            # Don't cache — retry registration/verification check on next shipment
+            return cls._fetch_active_pickup(profile, None, token, fallback) or fallback
+
+        # addpickup failed (422 = already exists, or other) — scan for active match
         logger.info(
-            "addpickup returned %s for seller %s — scanning existing locations",
+            "addpickup returned %s for seller %s — scanning existing active locations",
             resp.status_code, seller.id,
         )
-        return cls._fetch_existing_pickup(profile, location_name, token, fallback)
+        return cls._fetch_active_pickup(profile, location_name, token, fallback) or fallback
 
     @classmethod
     def _cache_pickup_location(cls, profile, name: str):
@@ -355,8 +392,17 @@ class ShiprocketService:
             logger.warning("Could not cache shiprocket_pickup_location: %s", exc)
 
     @classmethod
-    def _fetch_existing_pickup(cls, profile, desired_name: str, token: str, fallback: str) -> str:
-        """Fetch all registered Shiprocket pickup locations and return the best match."""
+    def _fetch_active_pickup(cls, profile, desired_name, token: str, fallback) -> str:
+        """
+        Fetch all Shiprocket pickup locations and return the best *active* (status=1) one.
+
+        Priority:
+          1. Exact name match with status=1  → cache and return.
+          2. Any location with status=1       → cache and return (no exact match found).
+          3. None active                      → return fallback without caching.
+
+        Pass desired_name=None to skip the exact-match step (i.e. just get any active).
+        """
         try:
             resp = requests.get(
                 f"{SHIPROCKET_BASE}/settings/company/pickup",
@@ -365,24 +411,36 @@ class ShiprocketService:
             )
             if resp.status_code == 200:
                 locations = resp.json().get('data', {}).get('shipping_address', [])
-                # Exact name match first
-                for loc in locations:
-                    if loc.get('pickup_location', '').lower() == desired_name.lower():
-                        name = loc['pickup_location']
+                # Only consider verified/active locations
+                active = [loc for loc in locations if loc.get('status') == 1]
+
+                if desired_name:
+                    for loc in active:
+                        if loc.get('pickup_location', '').lower() == desired_name.lower():
+                            name = loc['pickup_location']
+                            if profile is not None:
+                                cls._cache_pickup_location(profile, name)
+                            return name
+
+                if active:
+                    name = active[0].get('pickup_location', fallback)
+                    if profile is not None:
                         cls._cache_pickup_location(profile, name)
-                        return name
-                # Fall back to first location in account
-                if locations:
-                    name = locations[0].get('pickup_location', fallback)
-                    cls._cache_pickup_location(profile, name)
                     logger.warning(
-                        "No exact pickup match for '%s' — using first available '%s'",
+                        "Shiprocket: no exact active pickup match for '%s' — using first active '%s'",
                         desired_name, name,
                     )
                     return name
+
+                logger.error("Shiprocket: no active (status=1) pickup locations found in account")
         except Exception as exc:
             logger.error("Could not fetch Shiprocket pickup list: %s", exc)
         return fallback
+
+    # Keep old name as alias so any external callers don't break
+    @classmethod
+    def _fetch_existing_pickup(cls, profile, desired_name: str, token: str, fallback: str) -> str:
+        return cls._fetch_active_pickup(profile, desired_name, token, fallback)
 
     # ── Rate & Serviceability ─────────────────────────────────────────────────
 

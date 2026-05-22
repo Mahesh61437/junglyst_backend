@@ -352,8 +352,9 @@ class SellerPickupAddressView(generics.GenericAPIView):
             return Response({"error": "Access denied"}, status=403)
         return None
 
-    def _serialize(self, profile):
+    def _serialize(self, profile, user=None):
         return {
+            "phone": (user.phone if user else "") or "",
             "pickup_address": profile.pickup_address or "",
             "location_city": profile.location_city or "",
             "location_state": profile.location_state or "",
@@ -369,7 +370,7 @@ class SellerPickupAddressView(generics.GenericAPIView):
             profile = request.user.seller_profile
         except SellerProfile.DoesNotExist:
             return Response({"error": "Seller profile not found"}, status=404)
-        return Response(self._serialize(profile))
+        return Response(self._serialize(profile, request.user))
 
     def patch(self, request):
         denied = self._require_grower(request.user)
@@ -381,9 +382,46 @@ class SellerPickupAddressView(generics.GenericAPIView):
             return Response({"error": "Seller profile not found"}, status=404)
 
         data = request.data
-        update_fields = []
-        address_changed = False
 
+        # ── Validate required fields ──────────────────────────────────────────
+        if not data.get('reset_shiprocket_location'):
+            required = {
+                'phone': 'Phone number',
+                'pickup_address': 'Street address',
+                'location_city': 'City',
+                'location_state': 'State',
+                'location_pincode': 'Pincode',
+            }
+            errors = {k: f"{label} is required." for k, label in required.items() if not (data.get(k) or "").strip()}
+            if errors:
+                return Response({"errors": errors}, status=400)
+
+            pincode = data['location_pincode'].strip()
+            if not pincode.isdigit() or len(pincode) != 6:
+                return Response({"errors": {"location_pincode": "Pincode must be exactly 6 digits."}}, status=400)
+
+            phone = data['phone'].strip().replace('+91', '').replace(' ', '').replace('-', '')
+            if not phone.isdigit() or len(phone) != 10:
+                return Response({"errors": {"phone": "Enter a valid 10-digit Indian mobile number."}}, status=400)
+
+        profile_update_fields = []
+        reset_cache = False
+
+        # ── Phone → saved on User model ───────────────────────────────────────
+        if 'phone' in data and not data.get('reset_shiprocket_location'):
+            new_phone = data['phone'].strip().replace('+91', '').replace(' ', '').replace('-', '')
+            current_phone = (request.user.phone or '').replace('+91', '').replace(' ', '').replace('-', '')
+            if current_phone != new_phone:
+                # Ensure uniqueness (another user might have this phone)
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
+                if User.objects.filter(phone=new_phone).exclude(pk=request.user.pk).exists():
+                    return Response({"errors": {"phone": "This phone number is already linked to another account."}}, status=400)
+                request.user.phone = new_phone
+                request.user.save(update_fields=['phone'])
+                reset_cache = True  # Phone change → Shiprocket must re-verify
+
+        # ── Address fields → saved on SellerProfile ───────────────────────────
         address_field_map = {
             'pickup_address': 'pickup_address',
             'location_city': 'location_city',
@@ -393,29 +431,22 @@ class SellerPickupAddressView(generics.GenericAPIView):
         for key, model_field in address_field_map.items():
             if key in data:
                 new_val = (data[key] or "").strip()
-                if getattr(profile, model_field, "") != new_val:
+                if (getattr(profile, model_field) or "") != new_val:
                     setattr(profile, model_field, new_val or None)
-                    update_fields.append(model_field)
-                    address_changed = True
+                    profile_update_fields.append(model_field)
+                    reset_cache = True
 
-        # When address changes, invalidate the cached Shiprocket pickup location
-        # so it gets re-registered on the next shipment.
-        if address_changed:
+        # ── Reset Shiprocket cache when address or phone changes ─────────────
+        if reset_cache or data.get('reset_shiprocket_location'):
             profile.shiprocket_pickup_location = None
-            update_fields.append('shiprocket_pickup_location')
+            profile_update_fields.append('shiprocket_pickup_location')
 
-        # Allow explicit reset of cached pickup location (e.g. seller manually clears it)
-        if data.get('reset_shiprocket_location'):
-            profile.shiprocket_pickup_location = None
-            if 'shiprocket_pickup_location' not in update_fields:
-                update_fields.append('shiprocket_pickup_location')
-
-        if update_fields:
-            profile.save(update_fields=update_fields)
+        if profile_update_fields:
+            profile.save(update_fields=list(set(profile_update_fields)))
 
         return Response({
             "message": "Pickup address updated successfully.",
-            **self._serialize(profile),
+            **self._serialize(profile, request.user),
         })
 
 
