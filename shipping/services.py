@@ -348,12 +348,20 @@ class ShiprocketService:
         products = payload.get("products", [])
         invoice = (payload.get("invoice") or [{}])[0]
 
+        # Convert invoice_date from DD-MM-YYYY (NimbusPost format) to YYYY-MM-DD (Shiprocket format)
+        raw_date = invoice.get("invoice_date", "")
+        try:
+            from datetime import datetime as _dt
+            order_date = _dt.strptime(raw_date, "%d-%m-%Y").strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            from datetime import date as _date
+            order_date = _date.today().strftime("%Y-%m-%d")
+
         # Build Shiprocket order payload
         sr_payload = {
             "order_id": payload.get("order_id"),
-            "order_date": invoice.get("invoice_date", ""),
+            "order_date": order_date,
             "pickup_location": pickup.get("warehouse_name", "Primary"),
-            "channel_id": "",
             "billing_customer_name": payload.get("consignee_name", ""),
             "billing_last_name": "",
             "billing_address": payload.get("consignee_address", ""),
@@ -442,6 +450,30 @@ class ShiprocketService:
                 timeout=15,
             )
 
+        # Generate label immediately after AWB assignment
+        label_url = ""
+        if awb and shipment_id_sr:
+            label_resp = requests.post(
+                f"{SHIPROCKET_BASE}/courier/generate/label",
+                json={"shipment_id": [str(shipment_id_sr)]},
+                headers=cls._headers(token),
+                timeout=20,
+            )
+            if label_resp.status_code == 200:
+                lbody = label_resp.json()
+                label_url = (
+                    lbody.get("label_url")
+                    or (lbody.get("response") or {}).get("label_url")
+                    or ""
+                )
+                if not label_url:
+                    logger.warning("Shiprocket label not ready yet for shipment %s", shipment_id_sr)
+            else:
+                logger.warning(
+                    "Shiprocket generate label returned %s for shipment %s: %s",
+                    label_resp.status_code, shipment_id_sr, label_resp.text[:200],
+                )
+
         return {
             "status": True,
             "data": {
@@ -450,7 +482,7 @@ class ShiprocketService:
                 "awb_number": awb or "",
                 "courier_name": courier_name or "",
                 "status": "booked",
-                "label": "",
+                "label": label_url,
                 "manifest": "",
             },
         }

@@ -84,6 +84,61 @@ class SellerProfile(models.Model):
     def __str__(self):
         return self.store_name
 
+class SellerShippingConfig(models.Model):
+    """
+    Per-seller, per-category shipping fee tiers. Managed by superadmin only.
+
+    Fee resolution (ascending subtotal):
+      subtotal < tier1_max  →  tier1_fee  (highest, e.g. ₹99)
+      subtotal < tier2_max  →  tier2_fee  (lower,   e.g. ₹49)
+      subtotal >= tier2_max →  0 (free)
+    """
+    ITEM_CATEGORY = [('light', 'Light'), ('heavy', 'Heavy')]
+
+    seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='shipping_configs')
+    item_category = models.CharField(max_length=10, choices=ITEM_CATEGORY)
+
+    tier1_max = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        help_text='Subtotal (₹) below which tier1_fee applies',
+    )
+    tier1_fee = models.DecimalField(
+        max_digits=8, decimal_places=2,
+        help_text='Shipping fee for subtotals below tier1_max',
+    )
+    tier2_max = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        help_text='Subtotal (₹) below which tier2_fee applies (must be > tier1_max)',
+    )
+    tier2_fee = models.DecimalField(
+        max_digits=8, decimal_places=2,
+        help_text='Shipping fee for subtotals between tier1_max and tier2_max',
+    )
+    show_nudge_products = models.BooleanField(
+        default=False,
+        help_text="Show this seller's products in cart nudge to help buyers reach free shipping",
+    )
+
+    class Meta:
+        unique_together = ('seller', 'item_category')
+        verbose_name = 'Seller Shipping Config'
+        verbose_name_plural = 'Seller Shipping Configs'
+
+    def fee_for(self, subtotal: float) -> int:
+        if subtotal < float(self.tier1_max):
+            return int(self.tier1_fee)
+        if subtotal < float(self.tier2_max):
+            return int(self.tier2_fee)
+        return 0
+
+    def __str__(self):
+        try:
+            store = self.seller.seller_profile.store_name
+        except Exception:
+            store = str(self.seller_id)
+        return f'{store} / {self.item_category}'
+
+
 class AllowedSeller(models.Model):
     email = models.EmailField(unique=True, blank=True, null=True)
     phone = models.CharField(max_length=15, unique=True, blank=True, null=True)

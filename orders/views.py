@@ -46,15 +46,19 @@ def _sub_order_number(master: str, index: int) -> str:
     """JNG-2026-ABCDE-A, -B, -C"""
     return f"{master}-{_LETTER[index]}"
 
-def _shipping_fee_for_seller(subtotal: float, has_heavy: bool) -> int:
-    if has_heavy:
-        if subtotal < 999:   return 99
-        if subtotal < 2499:  return 49
+def _build_shipping_config_map(seller_ids):
+    """Fetch SellerShippingConfig rows for the given seller IDs in one query.
+    Returns dict keyed (seller_id_str, item_category) → config instance."""
+    from sellers.models import SellerShippingConfig
+    configs = SellerShippingConfig.objects.filter(seller_id__in=seller_ids)
+    return {(str(c.seller_id), c.item_category): c for c in configs}
+
+
+def _shipping_fee_for_seller(subtotal: float, config) -> int:
+    """Return shipping fee using DB config. Returns 0 (free) when no config set."""
+    if config is None:
         return 0
-    else:
-        if subtotal < 699:   return 99
-        if subtotal < 999:   return 49
-        return 0
+    return config.fee_for(subtotal)
 
 
 def _finalize_order(order, payment=None, payment_data=None):
@@ -208,6 +212,12 @@ class CheckoutView(generics.GenericAPIView):
 
         # SHIP-003: min order check removed; accept all cart values
 
+        # Resolve per-seller shipping configs in one query
+        shipping_config_map = _build_shipping_config_map(seller_buckets.keys())
+        for sid, bucket in seller_buckets.items():
+            cat = 'heavy' if bucket['has_heavy'] else 'light'
+            bucket['shipping_config'] = shipping_config_map.get((sid, cat))
+
         # Totals
         subtotal = sum(float(item.variant.price) * item.quantity for item in cart_items)
         gst_total = sum(
@@ -216,8 +226,11 @@ class CheckoutView(generics.GenericAPIView):
             if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
-        has_heavy = any(b['has_heavy'] for b in seller_buckets.values())
-        total_shipping = _shipping_fee_for_seller(subtotal, has_heavy)
+        # Master shipping = sum of per-seller fees (each seller has independent config)
+        total_shipping = sum(
+            _shipping_fee_for_seller(b['subtotal'], b['shipping_config'])
+            for b in seller_buckets.values()
+        )
         total_amount = subtotal + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
@@ -243,7 +256,7 @@ class CheckoutView(generics.GenericAPIView):
         dispatch_deadline = now + timedelta(hours=48)
 
         for idx, (sid, bucket) in enumerate(seller_buckets.items()):
-            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['has_heavy'])
+            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['shipping_config'])
             sub_order = SubOrder.objects.create(
                 order=order,
                 sub_order_number=_sub_order_number(order_number, idx),
@@ -432,7 +445,8 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    clear_buyer_cart_task.delay(str(order.user_id))
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -513,7 +527,8 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    clear_buyer_cart_task.delay(str(order.user_id))
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -740,17 +755,22 @@ class OrderListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'grower':
-            qs = Order.objects.filter(items__seller=user).distinct()
-        elif user.is_staff or user.role == 'admin':
+        if user.is_staff or user.role == 'admin':
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
 
         # Single query for items + their product images — eliminates all N+1
         items_qs = OrderItem.objects.select_related('product').prefetch_related('product__images')
+        sub_orders_qs = SubOrder.objects.select_related(
+            'seller', 'seller__seller_profile'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+        )
         return qs.prefetch_related(
             Prefetch('items', queryset=items_qs),
+            Prefetch('sub_orders', queryset=sub_orders_qs),
+            Prefetch('shipments', to_attr='shipments_prefetched'),
         ).order_by('-created_at')
 
 
@@ -760,9 +780,7 @@ class OrderDetailView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'grower':
-            qs = Order.objects.filter(items__seller=user).distinct()
-        elif user.is_staff or user.role == 'admin':
+        if user.is_staff or user.role == 'admin':
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
@@ -857,6 +875,18 @@ class SellerSubOrderListView(generics.ListAPIView):
         if self.request.query_params.get('no_pagination'):
             return None
         return super().paginate_queryset(queryset)
+
+
+class SellerSubOrderDetailView(APIView):
+    """GET /orders/seller/sub-orders/<pk>/ — fetch a single sub-order for the seller."""
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, pk):
+        try:
+            sub_order = SubOrder.objects.get(id=pk, seller=request.user)
+        except SubOrder.DoesNotExist:
+            return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
 
 
 class ConfirmSubOrderView(APIView):
@@ -995,11 +1025,19 @@ class SubOrderShipView(APIView):
             sub_order.status = 'packing'
             sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'updated_at'])
         else:
-            # Create NimbusPost order — pickup will be scheduled for the next day
             sub_order.status = 'packing'
             sub_order.save(update_fields=['status', 'updated_at'])
             from shipping.tasks import create_shipment_task
-            create_shipment_task.delay(str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id))
+            try:
+                create_shipment_task.delay(
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                )
+            except Exception as broker_err:
+                # Celery broker unavailable — run synchronously so the shipment still gets booked
+                logger.warning("Celery broker unavailable (%s); running create_shipment_task synchronously", broker_err)
+                create_shipment_task(
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                )
 
         buyer = sub_order.order.user
         if buyer:

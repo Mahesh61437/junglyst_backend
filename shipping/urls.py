@@ -15,5 +15,5 @@ urlpatterns = [
     path('package-image/', PackageImageUploadView.as_view(), name='package_image_upload'),
     path('pincode-check/', PincodeCheckView.as_view(), name='pincode_check'),
     path('webhook/nimbuspost/', NimbusPostWebhookView.as_view(), name='nimbuspost_webhook'),
-    path('webhook/shiprocket/', ShiprocketWebhookView.as_view(), name='shiprocket_webhook'),
+    path('webhook/courierservice/', ShiprocketWebhookView.as_view(), name='shiprocket_webhook'),
 ]

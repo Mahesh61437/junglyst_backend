@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from django.db.models import Sum, Count, Q
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
-from .models import SellerProfile, AllowedSeller
+from .models import SellerProfile, AllowedSeller, SellerShippingConfig
 from .serializers import SellerProfileSerializer
 from .encryption import encrypt_field, decrypt_field, mask_account
 from django.utils.text import slugify
@@ -412,3 +412,87 @@ class BankDetailsView(generics.GenericAPIView):
             "payout_account_masked": mask_account(raw_account),
             "ifsc_code_masked": raw_ifsc[:4] + '****' if len(raw_ifsc) > 4 else ('****' if raw_ifsc else ''),
         }, status=status.HTTP_200_OK)
+
+
+def _config_to_dict(cfg):
+    try:
+        store = cfg.seller.seller_profile.store_name
+    except Exception:
+        store = ''
+    return {
+        'id': cfg.id,
+        'seller_id': str(cfg.seller_id),
+        'store_name': store,
+        'item_category': cfg.item_category,
+        'tier1_max': float(cfg.tier1_max),
+        'tier1_fee': float(cfg.tier1_fee),
+        'tier2_max': float(cfg.tier2_max),
+        'tier2_fee': float(cfg.tier2_fee),
+        'show_nudge_products': cfg.show_nudge_products,
+    }
+
+
+class SellerShippingConfigListCreateView(generics.GenericAPIView):
+    """Superadmin: list all shipping configs or create/upsert one."""
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request):
+        configs = SellerShippingConfig.objects.select_related(
+            'seller__seller_profile'
+        ).order_by('seller__seller_profile__store_name', 'item_category')
+        return Response([_config_to_dict(c) for c in configs])
+
+    def post(self, request):
+        d = request.data
+        required = ['seller_id', 'item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee']
+        missing = [f for f in required if f not in d]
+        if missing:
+            return Response({'error': f'Missing fields: {missing}'}, status=400)
+        try:
+            cfg, created = SellerShippingConfig.objects.update_or_create(
+                seller_id=d['seller_id'],
+                item_category=d['item_category'],
+                defaults={
+                    'tier1_max': d['tier1_max'],
+                    'tier1_fee': d['tier1_fee'],
+                    'tier2_max': d['tier2_max'],
+                    'tier2_fee': d['tier2_fee'],
+                    'show_nudge_products': d.get('show_nudge_products', False),
+                }
+            )
+            cfg.refresh_from_db()
+            cfg.seller  # trigger select_related manually
+            return Response(_config_to_dict(cfg), status=201 if created else 200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=400)
+
+
+class SellerShippingConfigDetailView(generics.GenericAPIView):
+    """Superadmin: update or delete a single shipping config."""
+    permission_classes = [permissions.IsAdminUser]
+
+    def _get(self, pk):
+        try:
+            return SellerShippingConfig.objects.select_related(
+                'seller__seller_profile'
+            ).get(id=pk)
+        except SellerShippingConfig.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        cfg = self._get(pk)
+        if not cfg:
+            return Response({'error': 'Not found'}, status=404)
+        d = request.data
+        for field in ['tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee', 'show_nudge_products']:
+            if field in d:
+                setattr(cfg, field, d[field])
+        cfg.save()
+        return Response(_config_to_dict(cfg))
+
+    def delete(self, request, pk):
+        cfg = self._get(pk)
+        if not cfg:
+            return Response({'error': 'Not found'}, status=404)
+        cfg.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

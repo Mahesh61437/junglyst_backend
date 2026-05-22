@@ -44,17 +44,47 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 # ── Order list serializer ─────────────────────────────────────────────────────
 
+class SubOrderListSerializer(serializers.ModelSerializer):
+    """Lean sub-order serializer for the order list endpoint."""
+    items = OrderItemListSerializer(many=True, read_only=True)
+    seller_name = serializers.SerializerMethodField()
+    shipment = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SubOrder
+        fields = (
+            'id', 'sub_order_number', 'status', 'seller', 'seller_name',
+            'subtotal', 'shipping_fee', 'seller_total',
+            'awb_number', 'courier_name',
+            'created_at', 'items', 'shipment',
+        )
+
+    def get_seller_name(self, obj):
+        try:
+            return obj.seller.seller_profile.store_name
+        except Exception:
+            return obj.seller.get_full_name() or obj.seller.username
+
+    def get_shipment(self, obj):
+        shipment = obj.order.shipments.filter(seller=obj.seller).first()
+        if not shipment:
+            return None
+        from shipping.serializers import ShipmentSerializer
+        return ShipmentSerializer(shipment).data
+
+
 class OrderListSerializer(serializers.ModelSerializer):
     """Minimal serializer for GET /orders/ — only what the profile history tab needs."""
     items = OrderItemListSerializer(many=True, read_only=True)
+    sub_orders = SubOrderListSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
         fields = (
             'id', 'order_number', 'status', 'payment_status',
             'subtotal', 'shipping_fee', 'total_amount',
-            'is_paid', 'created_at',
-            'items',
+            'is_paid', 'created_at', 'shipping_address',
+            'items', 'sub_orders',
         )
 
 

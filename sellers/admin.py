@@ -1,11 +1,21 @@
 from django.contrib import admin
-from .models import SellerProfile, AllowedSeller
+from .models import SellerProfile, AllowedSeller, SellerShippingConfig
+
 
 @admin.register(AllowedSeller)
 class AllowedSellerAdmin(admin.ModelAdmin):
     list_display = ('email', 'phone', 'is_active', 'created_at')
     list_filter = ('is_active',)
     search_fields = ('email', 'phone')
+
+
+@admin.register(SellerShippingConfig)
+class SellerShippingConfigAdmin(admin.ModelAdmin):
+    list_display = ('__str__', 'item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee', 'show_nudge_products')
+    list_filter = ('item_category', 'show_nudge_products')
+    search_fields = ('seller__seller_profile__store_name', 'seller__email')
+    ordering = ('seller__seller_profile__store_name', 'item_category')
+
 
 @admin.register(SellerProfile)
 class SellerProfileAdmin(admin.ModelAdmin):
@@ -15,7 +25,7 @@ class SellerProfileAdmin(admin.ModelAdmin):
     prepopulated_fields = {'slug': ('store_name',)}
     list_editable = ('is_featured', 'identity_verified', 'is_active')
     ordering = ('sort_order', '-created_at')
-    
+
     fieldsets = (
         ('Basic Information', {
             'fields': ('user', 'store_name', 'slug', 'tagline', 'bio', 'is_active')
