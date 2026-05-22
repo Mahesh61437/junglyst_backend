@@ -151,13 +151,20 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'junglyst_backend.wsgi.application'
 
-# Email — Resend via django-anymail (HTTPS, no SMTP port issues on Railway)
+# Email
 RESEND_API_KEY = config('RESEND_API_KEY', default='')
-EMAIL_BACKEND = (
+_default_email_backend = (
     'anymail.backends.resend.EmailBackend'
     if RESEND_API_KEY
     else 'django.core.mail.backends.console.EmailBackend'
 )
+# Allow override via env (e.g. SMTP for local mailpit)
+EMAIL_BACKEND = config('EMAIL_BACKEND', default=_default_email_backend)
+EMAIL_HOST = config('EMAIL_HOST', default='localhost')
+EMAIL_PORT = config('EMAIL_PORT', default=25, cast=int)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=False, cast=bool)
 ANYMAIL = {
     'RESEND_API_KEY': RESEND_API_KEY,
 }

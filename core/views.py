@@ -1,4 +1,5 @@
 import uuid
+import datetime
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -23,6 +24,35 @@ from django.core.cache import cache
 import random
 from django.core.mail import send_mail
 from django.conf import settings
+from django.db import connection
+from django.db.models import Func, IntegerField
+from django.db.models.functions import Concat, Cast
+from django.db.models import Value, CharField
+
+
+class HashText(Func):
+    """PostgreSQL hashtext() — deterministic hash of any string to int."""
+    function = 'hashtext'
+    output_field = IntegerField()
+
+
+def _daily_seed_rand_order(queryset):
+    """
+    Returns queryset annotated with rand_order: a stable hash of (today's date + product id).
+    This produces the same scrambled order all day but changes nightly, so pagination is
+    consistent and sellers are naturally mixed across pages.
+    Falls back to random ordering on non-PostgreSQL (dev SQLite).
+    """
+    daily_seed = datetime.date.today().isoformat()
+    db_engine = connection.settings_dict.get('ENGINE', '')
+    if 'postgresql' in db_engine:
+        return queryset.annotate(
+            rand_order=HashText(
+                Concat(Value(daily_seed), Cast('id', output_field=CharField()))
+            )
+        ), 'rand_order'
+    # SQLite fallback for local dev — pagination is not stable but that's acceptable
+    return queryset, '?'
 
 User = get_user_model()
 
@@ -263,13 +293,14 @@ class ProductListView(generics.ListAPIView):
         return queryset
 
     def filter_queryset(self, queryset):
-        """Always put in-stock products first; user's chosen sort is the secondary key."""
+        """Always put in-stock products first; scramble sellers with a stable daily seed."""
         qs = super().filter_queryset(queryset)
         ordering_param = self.request.query_params.get('ordering')
         if ordering_param:
             secondary = [f.strip() for f in ordering_param.split(',')]
             return qs.order_by('-has_stock', *secondary)
-        return qs.order_by('-has_stock', '-created_at')
+        qs, rand_field = _daily_seed_rand_order(qs)
+        return qs.order_by('-has_stock', rand_field)
 
     def paginate_queryset(self, queryset):
         if self.request.query_params.get('no_pagination'):
@@ -744,9 +775,11 @@ class HomeDataView(generics.GenericAPIView):
         ).order_by('sort_order', '-rating')
 
         from django.db.models import Exists, OuterRef
-        products_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
+        _home_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
             has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
-        ).order_by('-has_stock', '-created_at')[:8]
+        )
+        _home_qs, _rand_field = _daily_seed_rand_order(_home_qs)
+        products_qs = _home_qs.order_by('-has_stock', _rand_field)[:8]
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),

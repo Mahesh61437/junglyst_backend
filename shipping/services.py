@@ -237,7 +237,7 @@ class NimbuspostService:
 
 SHIPROCKET_BASE = "https://apiv2.shiprocket.in/v1/external"
 SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket_token"
-SHIPROCKET_TOKEN_TTL = 3600 * 200  # 200 hours (tokens are valid for 240 h per docs)
+SHIPROCKET_TOKEN_TTL = 3600 * 230  # 230 hours (tokens valid for 240 h per docs; refresh before expiry)
 
 
 class ShiprocketService:
@@ -418,12 +418,13 @@ class ShiprocketService:
                     courier_id = sorted_c[0]["courier_id"]
 
         # Assign courier to generate AWB
+        # shipment_id must be a plain string (not a list) per Shiprocket API docs
         awb = None
         courier_name = None
         if courier_id:
             assign_resp = requests.post(
                 f"{SHIPROCKET_BASE}/courier/assign/awb",
-                json={"shipment_id": [str(shipment_id_sr)], "courier_id": str(courier_id)},
+                json={"shipment_id": str(shipment_id_sr), "courier_id": str(courier_id)},
                 headers=cls._headers(token),
                 timeout=20,
             )
@@ -432,11 +433,11 @@ class ShiprocketService:
                 awb = adata.get("awb_code") or adata.get("awb")
                 courier_name = adata.get("courier_name")
 
-        # Request pickup
+        # Request pickup — shipment_id must be a list of integers
         if awb:
             requests.post(
                 f"{SHIPROCKET_BASE}/courier/generate/pickup",
-                json={"shipment_id": [str(shipment_id_sr)]},
+                json={"shipment_id": [int(shipment_id_sr)]},
                 headers=cls._headers(token),
                 timeout=15,
             )
@@ -484,11 +485,13 @@ class ShiprocketService:
             return None
 
         from .models import Shipment
-        shipment_ids = list(
+        shipment_ids = [
+            int(sid) for sid in
             Shipment.objects.filter(awb_number__in=awb_numbers)
             .exclude(nimbuspost_id=None)
             .values_list("nimbuspost_id", flat=True)
-        )
+            if sid
+        ]
         if not shipment_ids:
             return {"status": False, "message": "No matching shipment IDs found"}
 
@@ -500,7 +503,8 @@ class ShiprocketService:
         )
         if resp.status_code == 200:
             body = resp.json()
-            label_url = body.get("label_url") or body.get("response", {}).get("label_url")
+            # API returns: {"label_created": 1, "label_url": "...", "response": "<string>"}
+            label_url = body.get("label_url")
             return {"status": bool(label_url), "data": label_url}
         logger.error("Shiprocket generate label failed: %s %s", resp.status_code, resp.text[:200])
         return None
@@ -514,11 +518,13 @@ class ShiprocketService:
             return None
 
         from .models import Shipment
-        shipment_ids = list(
+        shipment_ids = [
+            int(sid) for sid in
             Shipment.objects.filter(awb_number__in=awb_numbers)
             .exclude(nimbuspost_id=None)
             .values_list("nimbuspost_id", flat=True)
-        )
+            if sid
+        ]
         if not shipment_ids:
             return {"status": False, "message": "No matching shipment IDs found"}
 
