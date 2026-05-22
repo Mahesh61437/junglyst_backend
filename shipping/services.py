@@ -279,6 +279,111 @@ class ShiprocketService:
             "Content-Type": "application/json",
         }
 
+    # ── Pickup Location Management ────────────────────────────────────────────
+
+    @classmethod
+    def ensure_seller_pickup_location(cls, seller, profile) -> str:
+        """
+        Returns the Shiprocket pickup_location name for this seller.
+        - Cached in SellerProfile.shiprocket_pickup_location → return immediately.
+        - Not cached → register via Shiprocket API → cache → return.
+        - Name already exists in Shiprocket → fetch list, find match → cache → return.
+        - Any failure → falls back to SHIPROCKET_PICKUP_LOCATION setting.
+        """
+        import re
+        from django.conf import settings as _s
+        fallback = getattr(_s, 'SHIPROCKET_PICKUP_LOCATION', 'Primary')
+
+        cached = getattr(profile, 'shiprocket_pickup_location', None)
+        if cached:
+            return cached
+
+        token = cls.get_token()
+        if not token:
+            logger.error("Shiprocket auth failed — cannot register pickup for seller %s", seller.id)
+            return fallback
+
+        # Build a clean location name (Shiprocket only allows alphanumeric + spaces)
+        raw = profile.store_name or seller.get_full_name() or seller.username or 'Seller'
+        location_name = re.sub(r'[^A-Za-z0-9 ]', '', raw).strip()[:50] or f"Seller{str(seller.id)[:8]}"
+
+        phone = (
+            getattr(profile, 'phone', None) or
+            getattr(seller, 'phone', None) or
+            '9999999999'
+        )
+        phone_clean = str(phone).replace('+91', '').replace(' ', '').strip()[-10:]
+
+        resp = requests.post(
+            f"{SHIPROCKET_BASE}/settings/company/addpickup",
+            json={
+                "pickup_location": location_name,
+                "name": seller.get_full_name() or seller.username,
+                "email": seller.email or '',
+                "phone": phone_clean,
+                "address": getattr(profile, 'pickup_address', None) or getattr(profile, 'location_city', '') or '',
+                "address_2": "",
+                "city": getattr(profile, 'location_city', '') or '',
+                "state": getattr(profile, 'location_state', '') or '',
+                "country": "India",
+                "pin_code": str(getattr(profile, 'location_pincode', '') or ''),
+            },
+            headers=cls._headers(token),
+            timeout=20,
+        )
+
+        if resp.status_code in (200, 201):
+            body = resp.json()
+            registered = (body.get('data') or {}).get('pickup_location') or location_name
+            cls._cache_pickup_location(profile, registered)
+            logger.info("Registered Shiprocket pickup '%s' for seller %s", registered, seller.id)
+            return registered
+
+        # Already exists (422) or other issue — fetch list and match
+        logger.info(
+            "addpickup returned %s for seller %s — scanning existing locations",
+            resp.status_code, seller.id,
+        )
+        return cls._fetch_existing_pickup(profile, location_name, token, fallback)
+
+    @classmethod
+    def _cache_pickup_location(cls, profile, name: str):
+        try:
+            from sellers.models import SellerProfile
+            SellerProfile.objects.filter(pk=profile.pk).update(shiprocket_pickup_location=name)
+        except Exception as exc:
+            logger.warning("Could not cache shiprocket_pickup_location: %s", exc)
+
+    @classmethod
+    def _fetch_existing_pickup(cls, profile, desired_name: str, token: str, fallback: str) -> str:
+        """Fetch all registered Shiprocket pickup locations and return the best match."""
+        try:
+            resp = requests.get(
+                f"{SHIPROCKET_BASE}/settings/company/pickup",
+                headers=cls._headers(token),
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                locations = resp.json().get('data', {}).get('shipping_address', [])
+                # Exact name match first
+                for loc in locations:
+                    if loc.get('pickup_location', '').lower() == desired_name.lower():
+                        name = loc['pickup_location']
+                        cls._cache_pickup_location(profile, name)
+                        return name
+                # Fall back to first location in account
+                if locations:
+                    name = locations[0].get('pickup_location', fallback)
+                    cls._cache_pickup_location(profile, name)
+                    logger.warning(
+                        "No exact pickup match for '%s' — using first available '%s'",
+                        desired_name, name,
+                    )
+                    return name
+        except Exception as exc:
+            logger.error("Could not fetch Shiprocket pickup list: %s", exc)
+        return fallback
+
     # ── Rate & Serviceability ─────────────────────────────────────────────────
 
     @classmethod
@@ -357,11 +462,15 @@ class ShiprocketService:
             from datetime import date as _date
             order_date = _date.today().strftime("%Y-%m-%d")
 
+        # pickup_location is resolved by create_shipment_task via ensure_seller_pickup_location()
+        # and stored in payload["pickup"]["warehouse_name"] before this method is called.
+        pickup_location_name = pickup.get("warehouse_name") or "Primary"
+
         # Build Shiprocket order payload
         sr_payload = {
             "order_id": payload.get("order_id"),
             "order_date": order_date,
-            "pickup_location": pickup.get("warehouse_name", "Primary"),
+            "pickup_location": pickup_location_name,
             "billing_customer_name": payload.get("consignee_name", ""),
             "billing_last_name": "",
             "billing_address": payload.get("consignee_address", ""),

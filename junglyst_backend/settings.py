@@ -377,6 +377,9 @@ NIMBUSPOST_PASSWORD = config('NIMBUSPOST_PASSWORD', default='')
 NIMBUSPOST_WAREHOUSE_NAME = config('NIMBUSPOST_WAREHOUSE_NAME', default='Junglyst')
 SHIPROCKET_EMAIL = config('SHIPROCKET_EMAIL', default='')
 SHIPROCKET_PASSWORD = config('SHIPROCKET_PASSWORD', default='')
+# Must match exactly the pickup_location name registered in your Shiprocket account
+# (Shiprocket → Settings → Manage Pickup Addresses)
+SHIPROCKET_PICKUP_LOCATION = config('SHIPROCKET_PICKUP_LOCATION', default='Mahesh')
 
 FIREBASE_STORAGE_BUCKET = config('FIREBASE_STORAGE_BUCKET', default='')
 FIREBASE_SERVICE_ACCOUNT_JSON = config('FIREBASE_SERVICE_ACCOUNT_JSON', default='')

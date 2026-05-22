@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 PLANT_HSN_CODE = "0602"
 
 
-def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=None) -> dict:
+def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=None, pickup_location_override: str = None) -> dict:
     """Build the full NimbusPost shipment creation payload from a Junglyst sub-order."""
     addr = order.shipping_address or {}
 
@@ -35,7 +35,9 @@ def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=Non
     pickup_state = getattr(profile, "location_state", None) or "Karnataka"
     pickup_pincode = getattr(profile, "location_pincode", None) or "560001"
     pickup_address_str = getattr(profile, "pickup_address", None) or pickup_city
-    warehouse_name = getattr(profile, "store_name", None) or settings.NIMBUSPOST_WAREHOUSE_NAME
+    # pickup_location_override is the Shiprocket-registered name (resolved before this call).
+    # For NimbusPost the warehouse_name is used as a label only — store_name is fine.
+    warehouse_name = pickup_location_override or getattr(profile, "store_name", None) or settings.NIMBUSPOST_WAREHOUSE_NAME
 
     item_qs = OrderItem.objects.filter(order=order, seller=seller).select_related("variant", "product")
     if sub_order:
@@ -207,8 +209,19 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
                 _notify_admin_booking_failure(order, sub_order, msg)
                 return f"Failed after retries: {msg}"
 
-    payload = _build_shipment_payload(order, seller, courier_id, sub_order)
-    result = get_logistics_service().create_shipment(payload)
+    # For Shiprocket: ensure the seller has a registered pickup location.
+    # This auto-registers on first ship and caches the name in SellerProfile.
+    pickup_location_override = None
+    logistics_svc = get_logistics_service()
+    if hasattr(logistics_svc, 'ensure_seller_pickup_location'):
+        try:
+            profile = seller.seller_profile
+            pickup_location_override = logistics_svc.ensure_seller_pickup_location(seller, profile)
+        except Exception as exc:
+            logger.warning("Could not resolve Shiprocket pickup location for seller %s: %s", seller_id, exc)
+
+    payload = _build_shipment_payload(order, seller, courier_id, sub_order, pickup_location_override)
+    result = logistics_svc.create_shipment(payload)
 
     if not result or not result.get("status"):
         msg = (result or {}).get("message", "No response from NimbusPost")

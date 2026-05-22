@@ -42,7 +42,13 @@ class SellerProfile(models.Model):
     location_city = models.CharField(max_length=100, blank=True, null=True)
     location_state = models.CharField(max_length=100, blank=True, null=True)
     location_pincode = models.CharField(max_length=10, blank=True, null=True)
-    pickup_address = models.CharField(max_length=255, blank=True, null=True, help_text="Street address for NimbusPost pickup")
+    pickup_address = models.CharField(max_length=255, blank=True, null=True, help_text="Street address for pickup")
+    # Cached after first successful registration with Shiprocket.
+    # Must match exactly the name under Settings → Manage Pickup Addresses in Shiprocket.
+    shiprocket_pickup_location = models.CharField(
+        max_length=100, blank=True, null=True,
+        help_text="Shiprocket pickup location name (auto-set on first shipment)"
+    )
     
     # Authenticity & Skill Showcase
     expertise_tags = models.JSONField(default=list, blank=True)

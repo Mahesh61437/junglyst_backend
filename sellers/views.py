@@ -92,7 +92,10 @@ class GrowerDashboardView(generics.GenericAPIView):
                 "brand_color": profile.brand_color,
                 "bio": profile.bio,
                 "location_city": profile.location_city,
+                "location_state": profile.location_state,
                 "location_pincode": profile.location_pincode,
+                "pickup_address": profile.pickup_address,
+                "shiprocket_pickup_location": profile.shiprocket_pickup_location,
                 "rating": str(profile.rating),
                 "total_sales": str(profile.total_sales),
                 "shipping_days": profile.shipping_days or []
@@ -135,7 +138,9 @@ class GrowerDashboardView(generics.GenericAPIView):
         profile.bio = data.get('bio', profile.bio)
         profile.tagline = data.get('expertise', profile.tagline)
         profile.location_city = data.get('location_city', profile.location_city)
+        profile.location_state = data.get('location_state', profile.location_state)
         profile.location_pincode = data.get('location_pincode', profile.location_pincode)
+        profile.pickup_address = data.get('pickup_address', profile.pickup_address)
         profile.gst_number = data.get('tax_id', profile.gst_number)
         profile.payout_type = data.get('payout_type', profile.payout_type)
         profile.payout_account = data.get('payout_account', profile.payout_account)
@@ -332,6 +337,86 @@ class SellerPromotionView(generics.GenericAPIView):
 
         profile.save()
         return Response(SellerProfileSerializer(profile).data)
+
+
+class SellerPickupAddressView(generics.GenericAPIView):
+    """
+    GET  /api/sellers/pickup-address/  — returns seller's pickup address details
+    PATCH /api/sellers/pickup-address/ — updates fields; clears shiprocket_pickup_location
+                                         cache so it is re-registered on next shipment.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def _require_grower(self, user):
+        if user.role not in ('grower', 'admin'):
+            return Response({"error": "Access denied"}, status=403)
+        return None
+
+    def _serialize(self, profile):
+        return {
+            "pickup_address": profile.pickup_address or "",
+            "location_city": profile.location_city or "",
+            "location_state": profile.location_state or "",
+            "location_pincode": profile.location_pincode or "",
+            "shiprocket_pickup_location": profile.shiprocket_pickup_location or "",
+        }
+
+    def get(self, request):
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        try:
+            profile = request.user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+        return Response(self._serialize(profile))
+
+    def patch(self, request):
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        try:
+            profile = request.user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+
+        data = request.data
+        update_fields = []
+        address_changed = False
+
+        address_field_map = {
+            'pickup_address': 'pickup_address',
+            'location_city': 'location_city',
+            'location_state': 'location_state',
+            'location_pincode': 'location_pincode',
+        }
+        for key, model_field in address_field_map.items():
+            if key in data:
+                new_val = (data[key] or "").strip()
+                if getattr(profile, model_field, "") != new_val:
+                    setattr(profile, model_field, new_val or None)
+                    update_fields.append(model_field)
+                    address_changed = True
+
+        # When address changes, invalidate the cached Shiprocket pickup location
+        # so it gets re-registered on the next shipment.
+        if address_changed:
+            profile.shiprocket_pickup_location = None
+            update_fields.append('shiprocket_pickup_location')
+
+        # Allow explicit reset of cached pickup location (e.g. seller manually clears it)
+        if data.get('reset_shiprocket_location'):
+            profile.shiprocket_pickup_location = None
+            if 'shiprocket_pickup_location' not in update_fields:
+                update_fields.append('shiprocket_pickup_location')
+
+        if update_fields:
+            profile.save(update_fields=update_fields)
+
+        return Response({
+            "message": "Pickup address updated successfully.",
+            **self._serialize(profile),
+        })
 
 
 class BankDetailsView(generics.GenericAPIView):
