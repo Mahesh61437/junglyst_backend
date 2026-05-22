@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from django.db.models import Sum, Count, Q
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
-from .models import SellerProfile, AllowedSeller, SellerShippingConfig
+from .models import SellerProfile, AllowedSeller, SellerShippingConfig, ShippingDefaultConfig
 from .serializers import SellerProfileSerializer
 from .encryption import encrypt_field, decrypt_field, mask_account
 from django.utils.text import slugify
@@ -465,6 +465,46 @@ class SellerShippingConfigListCreateView(generics.GenericAPIView):
             return Response(_config_to_dict(cfg), status=201 if created else 200)
         except Exception as e:
             return Response({'error': str(e)}, status=400)
+
+
+class ShippingDefaultConfigView(generics.GenericAPIView):
+    """
+    Superadmin: read or update platform-wide default shipping tier values.
+    GET  /sellers/shipping-configs/defaults/  → { light: {...}, heavy: {...} }
+    PATCH /sellers/shipping-configs/defaults/ → body: { item_category, tier1_max, tier1_fee, tier2_max, tier2_fee }
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def _all_as_dict(self):
+        return {
+            d.item_category: {
+                'tier1_max': float(d.tier1_max),
+                'tier1_fee': float(d.tier1_fee),
+                'tier2_max': float(d.tier2_max),
+                'tier2_fee': float(d.tier2_fee),
+            }
+            for d in ShippingDefaultConfig.objects.all()
+        }
+
+    def get(self, request):
+        return Response(self._all_as_dict())
+
+    def patch(self, request):
+        category = request.data.get('item_category')
+        if category not in ('light', 'heavy'):
+            return Response({'error': "item_category must be 'light' or 'heavy'"}, status=400)
+        cfg, _ = ShippingDefaultConfig.objects.get_or_create(
+            item_category=category,
+            defaults={'tier1_max': 0, 'tier1_fee': 0, 'tier2_max': 0, 'tier2_fee': 0},
+        )
+        for field in ['tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee']:
+            if field in request.data:
+                setattr(cfg, field, request.data[field])
+        try:
+            cfg.save()
+        except Exception as e:
+            return Response({'error': str(e)}, status=400)
+        return Response(self._all_as_dict())
 
 
 class SellerShippingConfigDetailView(generics.GenericAPIView):

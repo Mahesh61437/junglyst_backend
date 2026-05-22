@@ -5,6 +5,7 @@ from .views import (
     PlatformStatsView, FeaturedCuratorView,
     SellerPromotionView, AdminSellerProfileEditView, BankDetailsView,
     SellerShippingConfigListCreateView, SellerShippingConfigDetailView,
+    ShippingDefaultConfigView,
 )
 
 urlpatterns = [
@@ -28,6 +29,7 @@ urlpatterns = [
     path('profiles/admin/allowed/<int:pk>/', AllowedSellerDestroyView.as_view(), name='admin_allowed_delete'),
 
     # Superadmin: per-seller shipping fee tier management
+    path('shipping-configs/defaults/', ShippingDefaultConfigView.as_view(), name='shipping_defaults'),
     path('shipping-configs/', SellerShippingConfigListCreateView.as_view(), name='shipping_config_list'),
     path('shipping-configs/<int:pk>/', SellerShippingConfigDetailView.as_view(), name='shipping_config_detail'),
 ]

@@ -139,6 +139,40 @@ class SellerShippingConfig(models.Model):
         return f'{store} / {self.item_category}'
 
 
+class ShippingDefaultConfig(models.Model):
+    """
+    Platform-wide default shipping tier values per item category.
+    Used to pre-fill the form when a superadmin adds a new seller config.
+    Managed via Django admin or PATCH /sellers/shipping-configs/defaults/.
+    """
+    ITEM_CATEGORY = [('light', 'Light'), ('heavy', 'Heavy')]
+
+    item_category = models.CharField(max_length=10, choices=ITEM_CATEGORY, unique=True)
+    tier1_max = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        help_text='Default subtotal (₹) below which tier1_fee applies',
+    )
+    tier1_fee = models.DecimalField(
+        max_digits=8, decimal_places=2,
+        help_text='Default shipping fee for subtotals below tier1_max',
+    )
+    tier2_max = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        help_text='Default subtotal (₹) below which tier2_fee applies',
+    )
+    tier2_fee = models.DecimalField(
+        max_digits=8, decimal_places=2,
+        help_text='Default shipping fee for subtotals between tier1_max and tier2_max',
+    )
+
+    class Meta:
+        verbose_name = 'Shipping Default Config'
+        verbose_name_plural = 'Shipping Default Configs'
+
+    def __str__(self):
+        return f'Default / {self.item_category}'
+
+
 class AllowedSeller(models.Model):
     email = models.EmailField(unique=True, blank=True, null=True)
     phone = models.CharField(max_length=15, unique=True, blank=True, null=True)

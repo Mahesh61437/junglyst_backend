@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import SellerProfile, AllowedSeller, SellerShippingConfig
+from .models import SellerProfile, AllowedSeller, SellerShippingConfig, ShippingDefaultConfig
 
 
 @admin.register(AllowedSeller)
@@ -7,6 +7,12 @@ class AllowedSellerAdmin(admin.ModelAdmin):
     list_display = ('email', 'phone', 'is_active', 'created_at')
     list_filter = ('is_active',)
     search_fields = ('email', 'phone')
+
+
+@admin.register(ShippingDefaultConfig)
+class ShippingDefaultConfigAdmin(admin.ModelAdmin):
+    list_display = ('item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee')
+    ordering = ('item_category',)
 
 
 @admin.register(SellerShippingConfig)
