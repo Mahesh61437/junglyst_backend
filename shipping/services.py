@@ -1137,3 +1137,49 @@ def get_logistics_service():
     if provider == LogisticsProvider.SHIPROCKET:
         return ShiprocketService
     return NimbuspostService
+
+
+def check_pincode_deliverable(pincode: str, origin_pincode: str | None = None) -> tuple[bool, str]:
+    """
+    Verify pincode serviceability against the active logistics provider API.
+    Returns (is_deliverable: bool, message: str).
+
+    Caches results for 6 hours to avoid repeated external API calls.
+    Falls back to local zone classification if the external API is unavailable.
+    """
+    from django.core.cache import cache
+    from django.conf import settings
+    from .pincode_zones import classify_pincode
+
+    if not pincode or not pincode.isdigit() or len(pincode) != 6:
+        return False, "Invalid pincode format."
+
+    svc = get_logistics_service()
+    provider_name = svc.__name__
+    cache_key = f"pincode_deliverable_v1_{provider_name}_{pincode}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached["deliverable"], cached["message"]
+
+    origin = origin_pincode or getattr(settings, "DEFAULT_ORIGIN_PINCODE", "560001")
+
+    try:
+        result = svc.check_serviceability(
+            origin_pincode=origin,
+            destination_pincode=pincode,
+            weight_kg=0.5,
+            order_value=100,
+        )
+        if result is not None:
+            couriers = result.get("data", [])
+            deliverable = len(couriers) > 0
+            message = "Delivery available." if deliverable else "Sorry, we don't deliver to your pincode yet."
+            cache.set(cache_key, {"deliverable": deliverable, "message": message}, 60 * 60 * 6)
+            return deliverable, message
+    except Exception as exc:
+        logger.warning("Logistics API pincode check failed for %s: %s", pincode, exc)
+
+    # Fall back to local zone classifier
+    zone_info = classify_pincode(pincode)
+    return zone_info["deliverable"], zone_info.get("message", "")

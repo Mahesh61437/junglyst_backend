@@ -18,6 +18,7 @@ from core.models import ProductVariant
 from shipping.models import ShippingAddress
 from shipping.serializers import ShippingAddressSerializer
 from shipping.pincode_zones import classify_pincode
+from shipping.services import check_pincode_deliverable
 from notifications.models import AppNotification
 from payments.models import Payment
 from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
@@ -176,12 +177,12 @@ class CheckoutView(generics.GenericAPIView):
             email = guest_info.get('email') or (request.user.email if request.user.is_authenticated else None)
             phone = guest_info.get('phone') or (request.user.phone if request.user.is_authenticated else None)
 
-        # Hard pincode zone check (SHIP-002) — always use the resolved address pincode
+        # Pincode deliverability check — verified against the active logistics provider API
         effective_pincode = str(pincode or (shipping_address or {}).get('pincode', '') or '')
         if effective_pincode:
-            zone_info = classify_pincode(effective_pincode)
-            if not zone_info['deliverable']:
-                return Response({"error": "Sorry, we don't deliver to your pincode yet."}, status=400)
+            is_deliverable, delivery_msg = check_pincode_deliverable(effective_pincode)
+            if not is_deliverable:
+                return Response({"error": delivery_msg or "Sorry, we don't deliver to your pincode yet."}, status=400)
 
         # Stock check + group items by seller
 
@@ -865,7 +866,24 @@ class SellerSubOrderListView(generics.ListAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        qs = SubOrder.objects.filter(seller=self.request.user, order__is_paid=True).select_related('order').prefetch_related('items')
+        from shipping.models import Shipment
+        from core.models import ProductImage
+        seller = self.request.user
+        items_qs = OrderItem.objects.select_related('product').prefetch_related(
+            Prefetch('product__images', queryset=ProductImage.objects.all()),
+        )
+        qs = SubOrder.objects.filter(
+            seller=seller, order__is_paid=True
+        ).select_related(
+            'order', 'order__user'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+            Prefetch(
+                'order__shipments',
+                queryset=Shipment.objects.filter(seller=seller),
+                to_attr='seller_shipments',
+            ),
+        )
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)

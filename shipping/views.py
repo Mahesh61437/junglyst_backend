@@ -9,7 +9,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from .models import ShippingAddress, Shipment, LogisticsProviderSettings, LogisticsProvider
 from .serializers import ShippingAddressSerializer, ShipmentSerializer
-from .services import get_logistics_service
+from .services import get_logistics_service, check_pincode_deliverable
 from .pincode_zones import classify_pincode
 
 logger = logging.getLogger(__name__)
@@ -715,7 +715,9 @@ class ShiprocketWebhookView(APIView):
 class PincodeCheckView(APIView):
     """
     GET /api/shipping/pincode-check/?pincode=XXXXXX
-    Returns zone classification and deliverability for a given Indian pincode.
+    Checks deliverability via the active logistics provider (Shiprocket or NimbusPost).
+    Falls back to local zone classification if the external API is unavailable.
+    Results are cached for 6 hours per provider.
     """
     permission_classes = (permissions.AllowAny,)
 
@@ -726,5 +728,14 @@ class PincodeCheckView(APIView):
                 {"error": "Invalid pincode. Must be a 6-digit number."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        result = classify_pincode(pincode)
+        deliverable, message = check_pincode_deliverable(pincode)
+        # Build a response compatible with the existing CartContext shape
+        zone_fallback = classify_pincode(pincode)
+        result = {
+            "pincode": pincode,
+            "deliverable": deliverable,
+            "zone": zone_fallback["zone"] if deliverable else "E",
+            "city": zone_fallback.get("city"),
+            "message": message,
+        }
         return Response(result)
