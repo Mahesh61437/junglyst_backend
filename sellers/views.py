@@ -113,7 +113,7 @@ class GrowerDashboardView(generics.GenericAPIView):
         
         if not is_allowed and seller.role != 'admin':
             return Response({
-                "error": "Access denied. Your credentials are not in our master curator registry. Please contact admin for invitation."
+                "error": "Access denied. Your credentials are not in our approved sellers list. Please contact admin for an invitation."
             }, status=403)
 
         if seller.role not in ['grower', 'admin', 'collector']:
@@ -127,7 +127,7 @@ class GrowerDashboardView(generics.GenericAPIView):
         if store_name:
             # Check if store name is already taken by another user
             if SellerProfile.objects.filter(store_name=store_name).exclude(user=seller).exists():
-                return Response({"error": "This studio name is already reserved in our sanctuary. Please choose another."}, status=400)
+                return Response({"error": "This store name is already taken. Please choose another."}, status=400)
             profile.store_name = store_name
             profile.slug = slugify(store_name)
             
@@ -159,7 +159,7 @@ class GrowerDashboardView(generics.GenericAPIView):
             seller.save(update_fields=['role', 'is_staff'])
 
         return Response({
-            "message": "Sanctuary Identity updated successfully",
+            "message": "Store profile updated successfully",
             "user": {
                 "id": str(seller.id),
                 "role": seller.role,

@@ -11,7 +11,7 @@ User = get_user_model()
 class UserSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     seller_profile = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = User
         fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile', 'is_staff', 'is_superuser')
@@ -25,6 +25,57 @@ class UserSerializer(serializers.ModelSerializer):
         try:
             return SellerProfileSerializer(obj.seller_profile).data
         except:
+            return None
+
+
+class PublicSellerProfileSerializer(serializers.Serializer):
+    """
+    Public-safe seller profile. Excludes PII (payout, GST, pickup address,
+    account holder name) and is used wherever a seller's profile is embedded
+    in a buyer-facing response (product detail, cart, etc.).
+    """
+    store_name = serializers.CharField()
+    slug = serializers.CharField()
+    logo_url = serializers.CharField(allow_null=True)
+    icon_url = serializers.CharField(allow_null=True)
+    banner_url = serializers.CharField(allow_null=True)
+    brand_color = serializers.CharField()
+    bio = serializers.CharField(allow_null=True)
+    tagline = serializers.CharField(allow_null=True)
+    location_city = serializers.CharField(allow_null=True)
+    location_state = serializers.CharField(allow_null=True)
+    expertise_tags = serializers.JSONField()
+    infrastructure_details = serializers.CharField(allow_null=True)
+    experience_years = serializers.IntegerField()
+    identity_verified = serializers.BooleanField()
+    is_featured = serializers.BooleanField()
+    rating = serializers.CharField()
+    shipping_days = serializers.JSONField()
+    next_shipping_date = serializers.SerializerMethodField()
+
+    def get_next_shipping_date(self, obj):
+        try:
+            d = obj.get_next_shipping_date()
+            return d.isoformat() if d else None
+        except Exception:
+            return None
+
+
+class PublicSellerSerializer(serializers.ModelSerializer):
+    """
+    Public-safe seller embed for product/cart responses. Only exposes id and the
+    public seller profile — no email, phone, full_name, or staff flags.
+    """
+    seller_profile = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ('id', 'seller_profile')
+
+    def get_seller_profile(self, obj):
+        try:
+            return PublicSellerProfileSerializer(obj.seller_profile).data
+        except Exception:
             return None
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -162,7 +213,7 @@ class ProductReviewSerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     variants = ProductVariantSerializer(many=True, required=False)
     images = ProductImageSerializer(many=True, required=False)
-    seller = UserSerializer(read_only=True)
+    seller = PublicSellerSerializer(read_only=True)
     categories = CategorySerializer(many=True, read_only=True)
     sub_category = SubCategorySerializer(read_only=True)
     category_id = serializers.IntegerField(write_only=True, required=False)
@@ -418,20 +469,20 @@ class ProductListSerializer(serializers.ModelSerializer):
         return v.stock if v else 0
 
     def get_seller(self, obj):
-        # Return minimal seller info
+        # Return minimal, public-safe seller info — store identity only, no PII
         try:
             profile = obj.seller.seller_profile
             return {
                 'id': str(obj.seller.id),
-                'full_name': obj.seller.get_full_name() or obj.seller.username,
                 'seller_profile': {
                     'store_name': profile.store_name,
                     'slug': profile.slug,
-                    'brand_color': profile.brand_color
+                    'brand_color': profile.brand_color,
+                    'icon_url': profile.icon_url,
                 }
             }
-        except:
-            return {'id': str(obj.seller.id), 'full_name': obj.seller.username}
+        except Exception:
+            return {'id': str(obj.seller.id), 'seller_profile': None}
 
     def get_category_name(self, obj):
         return obj.sub_category.name if obj.sub_category else (obj.categories.all()[0].name if obj.categories.exists() else None)

@@ -11,7 +11,7 @@ class SellerProfileManager(models.Manager):
         profile, created = self.get_or_create(
             user=user,
             defaults={
-                'store_name': f"{display_name}'s Sanctuary",
+                'store_name': f"{display_name}'s Store",
                 'slug': slugify(display_name),
                 'brand_color': '#0A3029'
             }
