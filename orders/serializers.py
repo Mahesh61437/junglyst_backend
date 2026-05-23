@@ -173,7 +173,7 @@ class SellerSubOrderSerializer(serializers.ModelSerializer):
             'confirmed_at', 'dispatch_deadline', 'dispatch_hours_remaining',
             'packaging_photos',
             'actual_weight_grams', 'actual_length_cm', 'actual_breadth_cm', 'actual_height_cm',
-            'awb_number', 'courier_name',
+            'awb_number', 'courier_name', 'booking_failure_reason',
             'created_at', 'updated_at',
             'items', 'shipment',
             'buyer_first_name', 'buyer_pincode',

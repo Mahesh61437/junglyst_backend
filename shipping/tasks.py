@@ -128,8 +128,12 @@ def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=Non
             "invoice_value": str(round(invoice_value, 2)),
         }],
         "pickup": {
-            "warehouse_name": warehouse_name[:20],
-            "name": seller.get_full_name() or seller.username,
+            # For Shiprocket this must be the exact registered pickup_location name —
+            # no truncation allowed (names can be up to 50 chars).
+            "warehouse_name": warehouse_name,
+            # Label FROM line: "Junglyst | {seller name}" so the label shows
+            # our brand name followed by the individual seller's name.
+            "name": f"Junglyst | {seller.get_full_name() or seller.username}",
             "address": pickup_address_str[:200],
             "city": pickup_city,
             "state": pickup_state,
@@ -207,10 +211,12 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
                 raise self.retry(exc=Exception(msg))
             except self.MaxRetriesExceededError:
                 _notify_admin_booking_failure(order, sub_order, msg)
+                _mark_booking_failed(sub_order, seller, msg)
                 return f"Failed after retries: {msg}"
 
-    # For Shiprocket: ensure the seller has a registered pickup location.
-    # This auto-registers on first ship and caches the name in SellerProfile.
+    # For Shiprocket: ensure the seller has a verified (status=1) pickup location.
+    # Returns None if the location is pending OTP — we MUST block in that case;
+    # using another location would print the wrong FROM address on the label.
     pickup_location_override = None
     logistics_svc = get_logistics_service()
     if hasattr(logistics_svc, 'ensure_seller_pickup_location'):
@@ -220,16 +226,28 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
         except Exception as exc:
             logger.warning("Could not resolve Shiprocket pickup location for seller %s: %s", seller_id, exc)
 
+        if pickup_location_override is None:
+            msg = (
+                "Your Shiprocket pickup location is not yet verified. "
+                "Please verify the OTP sent to your phone in the Shiprocket dashboard "
+                "(Settings → Manage Pickup Addresses) and then retry this shipment."
+            )
+            logger.error("Shiprocket pickup not verified for seller %s — blocking shipment", seller_id)
+            _mark_booking_failed(sub_order, seller, msg)
+            _notify_admin_booking_failure(order, sub_order, f"Seller {seller_id} has no verified Shiprocket pickup location.")
+            return f"Blocked: {msg}"
+
     payload = _build_shipment_payload(order, seller, courier_id, sub_order, pickup_location_override)
     result = logistics_svc.create_shipment(payload)
 
     if not result or not result.get("status"):
-        msg = (result or {}).get("message", "No response from NimbusPost")
+        msg = (result or {}).get("message", "No response from logistics provider")
         logger.error("Shipment creation failed for %s: %s", sub_order_id or order_id, msg)
         try:
             raise self.retry(exc=Exception(msg))
         except self.MaxRetriesExceededError:
             _notify_admin_booking_failure(order, sub_order, msg)
+            _mark_booking_failed(sub_order, seller, msg)
             return f"Failed after retries: {msg}"
 
     data = result["data"]
@@ -269,11 +287,12 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
         except Exception as exc:
             logger.warning("Fallback label fetch raised: %s", exc)
 
-    # Write AWB back to SubOrder — status stays 'packing'; 'shipped' comes from webhook
+    # Write AWB back to SubOrder and confirm status='booked' (courier assigned, pickup pending)
     if sub_order and awb:
         SubOrder.objects.filter(id=sub_order.id).update(
             awb_number=awb,
             courier_name=courier,
+            status='booked',
         )
 
     # Write AWB to master Order (first sub-order wins) — don't promote status here
@@ -292,6 +311,31 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
 
     logger.info("Shipment created: %s AWB=%s", sub_order_id or order_id, awb)
     return {"awb_number": awb, "shipment_id": np_shipment_id, "label_url": label, "courier_name": courier}
+
+
+def _mark_booking_failed(sub_order, seller, reason: str):
+    """Set sub-order status to booking_failed, save reason, and alert the seller."""
+    if not sub_order:
+        return
+    try:
+        from orders.models import SubOrder as _SubOrder
+        _SubOrder.objects.filter(id=sub_order.id).update(
+            status='booking_failed',
+            booking_failure_reason=reason[:1000],  # cap length
+        )
+        from notifications.models import AppNotification
+        AppNotification.objects.create(
+            user=seller,
+            title='Courier Booking Failed',
+            message=(
+                f"We couldn't automatically book a courier for "
+                f"{sub_order.sub_order_number}. Reason: {reason}. "
+                f"Please retry or enter an AWB manually from your dashboard."
+            ),
+        )
+        logger.info("Marked sub-order %s as booking_failed: %s", sub_order.id, reason)
+    except Exception as exc:
+        logger.error("_mark_booking_failed: could not update sub-order %s: %s", sub_order.id if sub_order else '?', exc)
 
 
 def _notify_admin_booking_failure(order, sub_order, reason):
@@ -320,16 +364,33 @@ def _notify_admin_booking_failure(order, sub_order, reason):
 @shared_task
 def sync_all_shipment_statuses():
     """Periodic task: sync statuses for all active shipments (run hourly via Celery Beat)."""
+    # Courier API status → SubOrder status
     NP_TO_SUBORDER = {
-        "booked": "shipped", "pickup_scheduled": "shipped", "picked_up": "shipped",
-        "in_transit": "in_transit", "out_for_delivery": "out_for_delivery",
-        "delivered": "delivered", "delivery_failed": "delivery_failed",
-        "rto_initiated": "delivery_failed", "rto_delivered": "cancelled",
-        "cancelled": "cancelled",
+        "booked":            "booked",
+        "pickup_scheduled":  "booked",
+        "picked_up":         "shipped",
+        "in_transit":        "in_transit",
+        "out_for_delivery":  "out_for_delivery",
+        "delivered":         "delivered",
+        "delivery_failed":   "delivery_failed",
+        "rto_initiated":     "delivery_failed",
+        "rto_delivered":     "cancelled",
+        "cancelled":         "cancelled",
+    }
+
+    # SubOrder status → valid Order.status (OrderStatus choices)
+    SUBORDER_TO_ORDER = {
+        "booked":            "processing",
+        "shipped":           "shipped",
+        "in_transit":        "shipped",
+        "out_for_delivery":  "shipped",
+        "delivered":         "delivered",
+        "delivery_failed":   "shipped",   # still in courier's hands (RTO etc.)
+        "cancelled":         "cancelled",
     }
 
     active = Shipment.objects.exclude(
-        status__in=["delivered", "cancelled", "returned", "pending"]
+        status__in=["delivered", "cancelled", "returned"]
     ).filter(awb_number__isnull=False)
 
     updated = 0
@@ -337,12 +398,17 @@ def sync_all_shipment_statuses():
         result = get_logistics_service().track_shipment(shipment.awb_number)
         if result and result.get("status"):
             raw = (result.get("data", {}).get("status") or "").lower().replace(" ", "_")
-            new_status = NP_TO_SUBORDER.get(raw, raw)
-            if new_status and new_status != shipment.status:
-                shipment.status = new_status
+            new_sub_status = NP_TO_SUBORDER.get(raw, raw)
+            if new_sub_status and new_sub_status != shipment.status:
+                shipment.status = new_sub_status
                 shipment.save(update_fields=["status", "updated_at"])
-                Order.objects.filter(id=shipment.order_id).update(status=new_status)
-                SubOrder.objects.filter(awb_number=shipment.awb_number).update(status=new_status)
+                SubOrder.objects.filter(awb_number=shipment.awb_number).update(status=new_sub_status)
+
+                # Map to a valid Order status and update the parent Order
+                new_order_status = SUBORDER_TO_ORDER.get(new_sub_status)
+                if new_order_status:
+                    Order.objects.filter(id=shipment.order_id).update(status=new_order_status)
+
                 updated += 1
 
     return f"Synced {updated} shipment statuses."

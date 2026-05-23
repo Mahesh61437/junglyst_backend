@@ -15,5 +15,11 @@ urlpatterns = [
     path('package-image/', PackageImageUploadView.as_view(), name='package_image_upload'),
     path('pincode-check/', PincodeCheckView.as_view(), name='pincode_check'),
     path('webhook/nimbuspost/', NimbusPostWebhookView.as_view(), name='nimbuspost_webhook'),
+    # Shiprocket webhook — register this URL in your Shiprocket dashboard:
+    #   https://<domain>/api/shipping/webhook/courierservice/
+    #
+    # NOTE: Shiprocket rejects webhook URLs that contain the words
+    # "shiprocket", "kartrocket", "sr", or "kr" — so the path must
+    # stay as "courierservice" (or any other neutral word).
     path('webhook/courierservice/', ShiprocketWebhookView.as_view(), name='shiprocket_webhook'),
 ]

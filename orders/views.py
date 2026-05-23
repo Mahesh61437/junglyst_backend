@@ -1000,7 +1000,7 @@ class SubOrderShipView(APIView):
         except SubOrder.DoesNotExist:
             return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        if sub_order.status not in ('confirmed', 'packing'):
+        if sub_order.status not in ('confirmed', 'packing', 'booking_failed'):
             return Response({'error': f'Cannot ship: current status is {sub_order.status}'}, status=status.HTTP_400_BAD_REQUEST)
 
         if not sub_order.packaging_photos:
@@ -1018,14 +1018,24 @@ class SubOrderShipView(APIView):
         manual_awb = request.data.get('awb_number')
         manual_courier = request.data.get('courier_name')
 
+        # On rebook after failure, clear the stale failure reason and any pending
+        # Shipment record so the task's duplicate-guard doesn't block it.
+        if sub_order.status == 'booking_failed':
+            SubOrder.objects.filter(id=sub_order.id).update(booking_failure_reason=None)
+            from shipping.models import Shipment
+            Shipment.objects.filter(order=sub_order.order, seller=request.user, status='pending').delete()
+
         if manual_awb:
-            # Manual AWB entry — seller is confirming shipment with their own courier
+            # Manual AWB entry — seller confirming with their own courier; mark as booked immediately
             sub_order.awb_number = manual_awb
             sub_order.courier_name = manual_courier or 'Manual'
-            sub_order.status = 'packing'
-            sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'updated_at'])
+            sub_order.status = 'booked'
+            sub_order.booking_failure_reason = None
+            sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'booking_failure_reason', 'updated_at'])
         else:
-            sub_order.status = 'packing'
+            # Celery will book courier async; mark as 'booked' right away so the
+            # order moves from "Pending" to "Booking Courier" tab immediately.
+            sub_order.status = 'booked'
             sub_order.save(update_fields=['status', 'updated_at'])
             from shipping.tasks import create_shipment_task
             try:
@@ -1115,7 +1125,9 @@ _SELLER_MSGS = {
 _VALID_TRANSITIONS = {
     'placed':           {'confirmed', 'cancelled'},
     'confirmed':        {'packing', 'cancelled'},
-    'packing':          {'shipped', 'cancelled'},
+    'packing':          {'booked', 'shipped', 'cancelled'},
+    'booked':           {'booking_failed', 'shipped', 'cancelled'},
+    'booking_failed':   {'packing', 'booked', 'cancelled'},       # seller retries or manual AWB
     'shipped':          {'in_transit', 'delivered', 'delivery_failed', 'cancelled'},
     'in_transit':       {'out_for_delivery', 'delivered', 'delivery_failed', 'cancelled'},
     'out_for_delivery': {'delivered', 'delivery_failed'},
