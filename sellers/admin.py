@@ -1,8 +1,35 @@
 from django.contrib import admin
+from django import forms
 from .models import (
     SellerProfile, AllowedSeller, SellerShippingConfig,
     ShippingDefaultConfig, SellerBlackoutDate,
 )
+
+
+# ── Custom Forms ────────────────────────────────────────────────────────────
+
+class SellerShippingConfigForm(forms.ModelForm):
+    """Custom form to ensure all shipping tier choices are visible."""
+    item_category = forms.ChoiceField(
+        choices=SellerShippingConfig.ITEM_CATEGORY,
+        help_text='Select shipping category: Light (plants/moss), Heavy (rocks/substrate), or Hybrid (mixed items)'
+    )
+    
+    class Meta:
+        model = SellerShippingConfig
+        fields = ('seller', 'item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee', 'show_nudge_products')
+
+
+class ShippingDefaultConfigForm(forms.ModelForm):
+    """Custom form to ensure all shipping tier choices are visible."""
+    item_category = forms.ChoiceField(
+        choices=ShippingDefaultConfig.ITEM_CATEGORY,
+        help_text='Select default shipping category: Light, Heavy, or Hybrid (Light + Heavy)'
+    )
+    
+    class Meta:
+        model = ShippingDefaultConfig
+        fields = ('item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee')
 
 
 @admin.register(SellerBlackoutDate)
@@ -27,16 +54,58 @@ class AllowedSellerAdmin(admin.ModelAdmin):
 
 @admin.register(ShippingDefaultConfig)
 class ShippingDefaultConfigAdmin(admin.ModelAdmin):
+    form = ShippingDefaultConfigForm
     list_display = ('item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee')
     ordering = ('item_category',)
+    fieldsets = (
+        ('Category', {
+            'fields': ('item_category',)
+        }),
+        ('Tier 1 (Low Orders)', {
+            'fields': ('tier1_max', 'tier1_fee'),
+            'description': 'Subtotal below tier1_max will use tier1_fee'
+        }),
+        ('Tier 2 (Medium Orders)', {
+            'fields': ('tier2_max', 'tier2_fee'),
+            'description': 'Subtotal between tier1_max and tier2_max will use tier2_fee'
+        }),
+        ('Tier 3 (High Orders)', {
+            'fields': (),
+            'description': 'Subtotal above tier2_max → Free shipping'
+        }),
+    )
 
 
 @admin.register(SellerShippingConfig)
 class SellerShippingConfigAdmin(admin.ModelAdmin):
+    form = SellerShippingConfigForm
     list_display = ('__str__', 'item_category', 'tier1_max', 'tier1_fee', 'tier2_max', 'tier2_fee', 'show_nudge_products')
     list_filter = ('item_category', 'show_nudge_products')
     search_fields = ('seller__seller_profile__store_name', 'seller__email')
     ordering = ('seller__seller_profile__store_name', 'item_category')
+    
+    fieldsets = (
+        ('Seller & Category', {
+            'fields': ('seller', 'item_category'),
+            'description': 'Select seller and shipping category. Hybrid applies when cart has both light and heavy items.'
+        }),
+        ('Tier 1 (Low Orders)', {
+            'fields': ('tier1_max', 'tier1_fee'),
+            'description': 'Subtotal below tier1_max will use tier1_fee'
+        }),
+        ('Tier 2 (Medium Orders)', {
+            'fields': ('tier2_max', 'tier2_fee'),
+            'description': 'Subtotal between tier1_max and tier2_max will use tier2_fee'
+        }),
+        ('Tier 3 (High Orders)', {
+            'fields': (),
+            'description': 'Subtotal above tier2_max → Free shipping'
+        }),
+        ('Options', {
+            'fields': ('show_nudge_products',),
+            'description': 'Show this seller\'s products in cart nudge to help buyers reach free shipping'
+        }),
+    )
 
 
 @admin.register(SellerProfile)

@@ -121,8 +121,9 @@ class CartSerializer(serializers.ModelSerializer):
 
     def get_seller_weight_summary(self, obj):
         """
-        Per-seller aggregated weight breakdown.
+        Per-seller aggregated weight breakdown with shipping category.
         Helps sellers know total actual + volumetric weight they need to pack.
+        Also indicates shipping category: light, heavy, or hybrid (both light and heavy).
         Returns a dict keyed by seller_id.
         """
         from decimal import Decimal
@@ -140,6 +141,7 @@ class CartSerializer(serializers.ModelSerializer):
                     'total_actual_weight_g': 0,
                     'total_volumetric_weight_g': 0,
                     'has_heavy': False,
+                    'has_light': False,
                     'item_count': 0,
                 }
 
@@ -158,14 +160,24 @@ class CartSerializer(serializers.ModelSerializer):
             sellers[seller_id]['total_volumetric_weight_g'] += vol_g * qty
             sellers[seller_id]['item_count'] += qty
 
+            # Track both light and heavy items
             if v.item_category == 'heavy':
                 sellers[seller_id]['has_heavy'] = True
+            elif v.item_category == 'light':
+                sellers[seller_id]['has_light'] = True
 
-        # Add chargeable weight = max(actual, volumetric)
+        # Add chargeable weight = max(actual, volumetric) and determine shipping category
         for s in sellers.values():
             s['chargeable_weight_g'] = max(
                 s['total_actual_weight_g'],
                 s['total_volumetric_weight_g']
             )
+            # Determine shipping category: hybrid if both light and heavy
+            if s['has_light'] and s['has_heavy']:
+                s['shipping_category'] = 'hybrid'
+            elif s['has_heavy']:
+                s['shipping_category'] = 'heavy'
+            else:
+                s['shipping_category'] = 'light'
 
         return list(sellers.values())

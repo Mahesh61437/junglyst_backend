@@ -63,8 +63,6 @@ DEFAULT_WIDTH_CM        = Decimal("10.0")
 DEFAULT_HEIGHT_CM       = Decimal("5.0")
 DEFAULT_PACKED_WEIGHT_G = 100               # grams, packed for shipping
 
-JUNGLYST_CATEGORY = "Aquascaping"           # parent category (must exist in DB)
-
 # petkadai sub_category_name → JungLyst SubCategory display name
 # Keys are lowercased for case-insensitive matching
 SUBCAT_DISPLAY: dict[str, str] = {
@@ -80,6 +78,10 @@ SUBCAT_DISPLAY: dict[str, str] = {
     "cutting":        "Cuttings",
     "moss":           "Mosses",
     "floating":       "Floating Plants",
+    "colorful fishes": "Colorful Fishes",
+    "betta fish":      "Betta Fish",
+    "led lights":      "LED Lights",
+    "aquarium planted lights": "LED Lights",
 }
 
 
@@ -146,10 +148,21 @@ def _safe_slug(name: str, existing: set[str], max_len: int = 110) -> str:
 
 # ── SubCategory resolution ─────────────────────────────────────────────────────
 
-def _resolve_subcat_display(raw_name: str | None) -> str:
+def _resolve_subcat_display(raw_name: str | None, cat_name: str) -> str:
     """Map petkadai sub_category_name to a clean JungLyst display name."""
     if not raw_name:
-        return "Live Plants"
+        defaults = {
+            "Plants": "Live Plants",
+            "Fish & Aquarium Care": "Fish Food",
+            "Aquarium Accessories": "Tank Accessories",
+            "Aquarium Filters": "Internal Filters",
+            "Aquascaping": "Starter Packs",
+            "Aquarium Tanks": "Moulded Tanks",
+            "Aquarium Lights": "LED Lights",
+            "Brand & Specialized": "DOOA System",
+        }
+        return defaults.get(cat_name, "General")
+
     lower = raw_name.lower()
     for key, display in SUBCAT_DISPLAY.items():
         if key in lower:
@@ -237,15 +250,8 @@ class Command(BaseCommand):
         seller = self._resolve_seller(User, options["seller_id"])
         self.stdout.write(f"Seller  : {seller.email}  (id={seller.id})")
 
-        # ── Parent category (must exist — run seed_categories first) ───────────
-        try:
-            cat = Category.objects.get(name=JUNGLYST_CATEGORY)
-        except Category.DoesNotExist:
-            raise CommandError(
-                f"Category '{JUNGLYST_CATEGORY}' not found.\n"
-                "Run:  python manage.py seed_categories"
-            )
-        self.stdout.write(f"Category: {cat.name}\n")
+        # ── Category Cache ─────────────────────────────────────────────────────
+        category_cache: dict[str, Category] = {}
 
         # ── Pre-fetch all existing slugs to avoid collision queries in loop ────
         existing_slugs: set[str] = set(
@@ -265,6 +271,20 @@ class Command(BaseCommand):
                 self.stderr.write(self.style.ERROR(f"  [{idx}] Skipping — no name in record."))
                 errors += 1
                 continue
+
+            # Resolve Category
+            cat_names = product_data.get("categories", [])
+            cat_name = cat_names[0] if cat_names else "Aquascaping"
+
+            if cat_name not in category_cache:
+                try:
+                    category_cache[cat_name] = Category.objects.get(name=cat_name)
+                except Category.DoesNotExist:
+                    self.stderr.write(self.style.ERROR(f"  [{idx}] Category '{cat_name}' not found in DB. Skipping."))
+                    errors += 1
+                    continue
+            
+            cat = category_cache[cat_name]
 
             # Collision-safe slug
             slug = _safe_slug(name, existing_slugs)
@@ -404,7 +424,7 @@ class Command(BaseCommand):
 
         # ── Resolve SubCategory (auto-create if missing) ───────────────────────
         raw_sub_name  = product_data.get("sub_category_name")
-        sub_display   = _resolve_subcat_display(raw_sub_name)
+        sub_display   = _resolve_subcat_display(raw_sub_name, cat.name)
         sub           = self._get_or_create_subcat(SubCategory, cat, sub_display)
 
         # ── Idempotency check ──────────────────────────────────────────────────

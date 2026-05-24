@@ -191,8 +191,10 @@ class SellerShippingConfig(models.Model):
       subtotal < tier1_max  →  tier1_fee  (highest, e.g. ₹99)
       subtotal < tier2_max  →  tier2_fee  (lower,   e.g. ₹49)
       subtotal >= tier2_max →  0 (free)
+    
+    Categories: light, heavy, hybrid (hybrid applies when cart has both light and heavy items)
     """
-    ITEM_CATEGORY = [('light', 'Light'), ('heavy', 'Heavy')]
+    ITEM_CATEGORY = [('light', 'Light'), ('heavy', 'Heavy'), ('hybrid', 'Hybrid (Light + Heavy)')]
 
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='shipping_configs')
     item_category = models.CharField(max_length=10, choices=ITEM_CATEGORY)
@@ -243,8 +245,9 @@ class ShippingDefaultConfig(models.Model):
     Platform-wide default shipping tier values per item category.
     Used to pre-fill the form when a superadmin adds a new seller config.
     Managed via Django admin or PATCH /sellers/shipping-configs/defaults/.
+    Categories: light, heavy, hybrid (hybrid applies when cart has both light and heavy items)
     """
-    ITEM_CATEGORY = [('light', 'Light'), ('heavy', 'Heavy')]
+    ITEM_CATEGORY = [('light', 'Light'), ('heavy', 'Heavy'), ('hybrid', 'Hybrid (Light + Heavy)')]
 
     item_category = models.CharField(max_length=10, choices=ITEM_CATEGORY, unique=True)
     tier1_max = models.DecimalField(
