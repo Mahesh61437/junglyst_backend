@@ -7,13 +7,13 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem
+from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem, BugReport
 from cart.models import Cart, CartItem
 from orders.models import Order
 from .serializers import (
     RegisterSerializer, CustomTokenObtainPairSerializer, UserSerializer,
     ProductSerializer, ProductListSerializer, ProductReviewSerializer, CategorySerializer, SubCategorySerializer,
-    CategoryShippingRateSerializer, CartSerializer
+    CategoryShippingRateSerializer, CartSerializer, BugReportSerializer
 )
 from .storage import upload_to_firebase
 
@@ -867,3 +867,51 @@ def sitemap_xml(request):
         
     xml.append('</urlset>')
     return HttpResponse("\n".join(xml), content_type="application/xml")
+
+class BugReportListCreateView(generics.ListCreateAPIView):
+    queryset = BugReport.objects.all()
+    serializer_class = BugReportSerializer
+    permission_classes = (permissions.AllowAny,)
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated and (user.is_staff or user.role == 'admin' or user.is_superuser):
+            return super().get_queryset()
+        return BugReport.objects.none()
+
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        
+        # Handle up to 5 images
+        images = []
+        user_id = request.user.id if request.user.is_authenticated else 'guest'
+        
+        for i in range(5):
+            file_obj = request.FILES.get(f'image_{i}')
+            if file_obj:
+                try:
+                    url = upload_to_firebase(file_obj, user_id, 'bug_report')
+                    images.append(url)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).exception("BugReport image upload failed")
+        
+        # We need to parse description and contact_info from request.data
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Save images in serializer's validated_data or just save it directly
+        serializer.validated_data['images'] = images
+        
+        if request.user.is_authenticated:
+            serializer.save(user=request.user, images=images)
+        else:
+            serializer.save(images=images)
+            
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+class BugReportDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = BugReport.objects.all()
+    serializer_class = BugReportSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)

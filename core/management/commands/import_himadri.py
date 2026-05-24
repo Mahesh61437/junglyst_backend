@@ -36,6 +36,13 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils.text import slugify
 
+# plant_defaults.py lives one level above junglyst_backend/
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.normpath(
+    _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..")
+))
+from plant_defaults import apply_plant_defaults, extract_stock_count as _extract_stock_count
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 DEFAULT_JSON = os.path.normpath(
@@ -287,10 +294,9 @@ def _extract_temp(description: str) -> str:
     return ""
 
 
-def _calc_base_price(retail_price, gst: Decimal, commission: Decimal) -> Decimal:
-    retail = Decimal(str(retail_price))
-    divisor = Decimal("1") + (gst / Decimal("100")) + (commission / Decimal("100"))
-    return (retail / divisor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def _to_decimal(value) -> Decimal:
+    """Convert a raw price value to Decimal, rounded to 2dp."""
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _himadri_key(product_url: str) -> str:
@@ -548,16 +554,22 @@ class Command(BaseCommand):
         ph = _extract_ph(raw_desc + " " + short_desc)
         temp = _extract_temp(raw_desc + " " + short_desc)
 
-        # Resolve individual care fields (structured block wins; fallback to text inference)
-        light_req  = parsed["light_requirements"] or "Medium"
-        co2_req    = parsed["co2_requirement"]    or "Low"
-        care_level = parsed["care_level"]         or "Easy"
-        growth     = parsed["growth_rate"]        or _infer_growth_from_text(short_desc)
+        # Keep None when the structured block has no signal — plant_defaults will fill it.
+        # Generic fallbacks are applied AFTER apply_plant_defaults below.
+        light_req  = parsed["light_requirements"]   # may be None
+        co2_req    = parsed["co2_requirement"]      # may be None
+        care_level = parsed["care_level"]           # may be None
+        growth     = parsed["growth_rate"] or _infer_growth_from_text(short_desc) or None
 
-        # ── FIX 3: Stock fallback — if count unknown but product is listed as in_stock ─
+        # Stock: parse number from stock_status text, then fall back to
+        # description fields.  Default to 0 when count is undetectable.
         stock = _parse_stock(stock_status)
-        if stock == 0 and raw.get("in_stock"):
-            stock = 10   # default quantity when count is undetectable from page
+        if stock == 0:
+            stock = (
+                _extract_stock_count(raw_desc)
+                or _extract_stock_count(short_desc)
+                or 0
+            )
 
         variant_type = _infer_variant_type(name, categories)
         variant_name = _infer_variant_name(name)
@@ -578,20 +590,33 @@ class Command(BaseCommand):
             return ("created" if not existing else "updated"), 0, 0
 
         # ── Product ──────────────────────────────────────────────────────────
-        product_fields = dict(
-            name=name,
-            tagline=tagline,
-            description=clean_description,
-            seller=seller,
-            sub_category=sub,
+        # Build a plain dict first so apply_plant_defaults can fill gaps
+        _p = dict(
             scientific_name=scientific_name,
             care_level=care_level,
             light_requirements=light_req,
             growth_rate=growth,
             co2_requirement=co2_req,
+            origin=origin,
+            description=clean_description,
+        )
+        apply_plant_defaults(_p, name)
+
+        # Last-resort generic fallbacks (only if still None after plant_defaults)
+        product_fields = dict(
+            name=name,
+            tagline=tagline,
+            description=_p["description"] or name,
+            seller=seller,
+            sub_category=sub,
+            scientific_name=_p["scientific_name"] or None,
+            care_level=_p["care_level"]                 or "Easy",
+            light_requirements=_p["light_requirements"] or "Medium",
+            growth_rate=_p["growth_rate"]               or "Moderate",
+            co2_requirement=_p["co2_requirement"]       or "Low",
             water_temperature=temp,
             ph_range=ph,
-            origin=origin,
+            origin=_p["origin"] or None,
             is_rare=False,
             is_active=True,
             is_draft=False,
@@ -613,16 +638,10 @@ class Command(BaseCommand):
         product.categories.set([cat])
 
         # ── Variant ───────────────────────────────────────────────────────────
-        base_price = (
-            _calc_base_price(sale_price, DEFAULT_GST_RATE, DEFAULT_COMMISSION_RATE)
-            if sale_price
-            else Decimal("0.00")
-        )
-        compare_at = (
-            Decimal(str(regular_price)).quantize(Decimal("0.01"))
-            if regular_price and regular_price != sale_price
-            else None
-        )
+        # base_price = website price as-is
+        # price      = recalculated by variant.save() as base_price * (1 + commission/100)
+        base_price = _to_decimal(sale_price) if sale_price else Decimal("0.00")
+        compare_at = _to_decimal(regular_price) if regular_price and regular_price != sale_price else None
 
         variant_qs = ProductVariant.all_objects.filter(product=product, name=variant_name)
         if variant_qs.exists():

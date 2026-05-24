@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from core.models import (
-    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview
+    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview, BugReport
 )
 from cart.models import Cart, CartItem
 
@@ -536,3 +536,9 @@ class CartSerializer(serializers.ModelSerializer):
             (item.variant.price if item.variant else item.product.price) * item.quantity 
             for item in obj.items.all()
         )
+
+class BugReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BugReport
+        fields = ('id', 'user', 'contact_info', 'description', 'images', 'status', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'created_at', 'updated_at', 'user', 'images')
