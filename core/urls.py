@@ -9,6 +9,7 @@ from .views import (
     ImageUploadView, GrowerProductCreateView, AdminProductCreateView,
     ProductCopyView, ProductBulkActionView, SyncCartView, WishlistView, HomeDataView,
     ForgotPasswordView, ResetPasswordView,
+    BugReportListCreateView, BugReportDetailView,
     PublicConfigurationView, ConfigurationAdminView, ConfigurationAdminDetailView
 )
 
@@ -51,6 +52,10 @@ urlpatterns = [
 
     # Home page aggregate
     path('home/', HomeDataView.as_view(), name='home_data'),
+
+    # Bug Reports
+    path('bug-reports/', BugReportListCreateView.as_view(), name='bug_report_list'),
+    path('bug-reports/<uuid:pk>/', BugReportDetailView.as_view(), name='bug_report_detail'),
 
     # Configuration — generic key/value settings
     path('config/public/<str:name>/', PublicConfigurationView.as_view(), name='config_public'),

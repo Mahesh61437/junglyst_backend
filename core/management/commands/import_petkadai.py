@@ -124,20 +124,9 @@ def _ext_from_url(url: str, content_type: str) -> str:
 
 # ── Price helpers ──────────────────────────────────────────────────────────────
 
-def _calc_base_price(
-    final_price: float | Decimal,
-    gst: Decimal = DEFAULT_GST_RATE,
-    commission: Decimal = DEFAULT_COMMISSION_RATE,
-) -> Decimal:
-    """
-    Reverse-engineer base_price from the buyer-facing final price.
-
-    JungLyst formula:  price = base * (1 + gst/100 + commission/100)
-    Therefore:         base  = price / (1 + gst/100 + commission/100)
-    """
-    retail   = Decimal(str(final_price))
-    divisor  = Decimal("1") + (gst / Decimal("100")) + (commission / Decimal("100"))
-    return (retail / divisor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def _to_decimal(value) -> Decimal:
+    """Convert a raw price value to Decimal, rounded to 2dp."""
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 # ── Slug helpers ───────────────────────────────────────────────────────────────
@@ -478,13 +467,10 @@ class Command(BaseCommand):
         raw_compare      = variant_data.get("compare_at_price")
         stock            = int(variant_data.get("stock") or 0)
         v_is_active      = bool(variant_data.get("is_active", True))
+        item_cat         = variant_data.get("item_category") or "light"
 
-        # Use pre-computed base_price from scraper; fall back to back-calculation
-        base_price = (
-            Decimal(str(raw_base)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            if raw_base
-            else _calc_base_price(raw_price)
-        )
+        # base_price = website price (set by scraper); fall back to raw_price if absent
+        base_price = _to_decimal(raw_base if raw_base else raw_price)
         compare_at = (
             Decimal(str(raw_compare)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             if raw_compare
@@ -505,7 +491,7 @@ class Command(BaseCommand):
             variant.length           = DEFAULT_LENGTH_CM
             variant.width            = DEFAULT_WIDTH_CM
             variant.height           = DEFAULT_HEIGHT_CM
-            variant.item_category    = "light"
+            variant.item_category    = item_cat
             variant.packed_weight_grams = DEFAULT_PACKED_WEIGHT_G
             variant.is_active        = v_is_active
             variant.save()   # triggers price auto-calculation
@@ -525,7 +511,7 @@ class Command(BaseCommand):
                 length              = DEFAULT_LENGTH_CM,
                 width               = DEFAULT_WIDTH_CM,
                 height              = DEFAULT_HEIGHT_CM,
-                item_category       = "light",
+                item_category       = item_cat,
                 packed_weight_grams = DEFAULT_PACKED_WEIGHT_G,
                 is_active           = v_is_active,
             )

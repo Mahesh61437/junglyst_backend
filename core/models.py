@@ -392,3 +392,20 @@ class Configuration(models.Model):
 
     def __str__(self):
         return self.name
+
+class BugReport(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='bug_reports')
+    contact_info = models.CharField(max_length=255, null=True, blank=True, help_text="Email or Phone for guest users")
+    description = models.TextField()
+    images = models.JSONField(default=list, blank=True, help_text="List of Firebase image URLs")
+    status = models.CharField(max_length=20, choices=[('unresolved', 'Unresolved'), ('resolved', 'Resolved')], default='unresolved')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        status_label = dict(self._meta.get_field('status').choices).get(self.status, self.status)
+        return f"BugReport {self.id} - {status_label}"
