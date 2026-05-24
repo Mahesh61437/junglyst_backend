@@ -18,6 +18,7 @@ from core.models import ProductVariant
 from shipping.models import ShippingAddress
 from shipping.serializers import ShippingAddressSerializer
 from shipping.pincode_zones import classify_pincode
+from shipping.services import check_pincode_deliverable
 from notifications.models import AppNotification
 from payments.models import Payment
 from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
@@ -176,12 +177,12 @@ class CheckoutView(generics.GenericAPIView):
             email = guest_info.get('email') or (request.user.email if request.user.is_authenticated else None)
             phone = guest_info.get('phone') or (request.user.phone if request.user.is_authenticated else None)
 
-        # Hard pincode zone check (SHIP-002) — always use the resolved address pincode
+        # Pincode deliverability check — verified against the active logistics provider API
         effective_pincode = str(pincode or (shipping_address or {}).get('pincode', '') or '')
         if effective_pincode:
-            zone_info = classify_pincode(effective_pincode)
-            if not zone_info['deliverable']:
-                return Response({"error": "Sorry, we don't deliver to your pincode yet."}, status=400)
+            is_deliverable, delivery_msg = check_pincode_deliverable(effective_pincode)
+            if not is_deliverable:
+                return Response({"error": delivery_msg or "Sorry, we don't deliver to your pincode yet."}, status=400)
 
         # Stock check + group items by seller
 
@@ -856,7 +857,24 @@ class SellerSubOrderListView(generics.ListAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        qs = SubOrder.objects.filter(seller=self.request.user, order__is_paid=True).select_related('order').prefetch_related('items')
+        from shipping.models import Shipment
+        from core.models import ProductImage
+        seller = self.request.user
+        items_qs = OrderItem.objects.select_related('product').prefetch_related(
+            Prefetch('product__images', queryset=ProductImage.objects.all()),
+        )
+        qs = SubOrder.objects.filter(
+            seller=seller, order__is_paid=True
+        ).select_related(
+            'order', 'order__user'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+            Prefetch(
+                'order__shipments',
+                queryset=Shipment.objects.filter(seller=seller),
+                to_attr='seller_shipments',
+            ),
+        )
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -991,7 +1009,7 @@ class SubOrderShipView(APIView):
         except SubOrder.DoesNotExist:
             return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        if sub_order.status not in ('confirmed', 'packing'):
+        if sub_order.status not in ('confirmed', 'packing', 'booking_failed'):
             return Response({'error': f'Cannot ship: current status is {sub_order.status}'}, status=status.HTTP_400_BAD_REQUEST)
 
         if not sub_order.packaging_photos:
@@ -1009,14 +1027,24 @@ class SubOrderShipView(APIView):
         manual_awb = request.data.get('awb_number')
         manual_courier = request.data.get('courier_name')
 
+        # On rebook after failure, clear the stale failure reason and any pending
+        # Shipment record so the task's duplicate-guard doesn't block it.
+        if sub_order.status == 'booking_failed':
+            SubOrder.objects.filter(id=sub_order.id).update(booking_failure_reason=None)
+            from shipping.models import Shipment
+            Shipment.objects.filter(order=sub_order.order, seller=request.user, status='pending').delete()
+
         if manual_awb:
-            # Manual AWB entry — seller is confirming shipment with their own courier
+            # Manual AWB entry — seller confirming with their own courier; mark as booked immediately
             sub_order.awb_number = manual_awb
             sub_order.courier_name = manual_courier or 'Manual'
-            sub_order.status = 'packing'
-            sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'updated_at'])
+            sub_order.status = 'booked'
+            sub_order.booking_failure_reason = None
+            sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'booking_failure_reason', 'updated_at'])
         else:
-            sub_order.status = 'packing'
+            # Celery will book courier async; mark as 'booked' right away so the
+            # order moves from "Pending" to "Booking Courier" tab immediately.
+            sub_order.status = 'booked'
             sub_order.save(update_fields=['status', 'updated_at'])
             from shipping.tasks import create_shipment_task
             try:
@@ -1106,7 +1134,9 @@ _SELLER_MSGS = {
 _VALID_TRANSITIONS = {
     'placed':           {'confirmed', 'cancelled'},
     'confirmed':        {'packing', 'cancelled'},
-    'packing':          {'shipped', 'cancelled'},
+    'packing':          {'booked', 'shipped', 'cancelled'},
+    'booked':           {'booking_failed', 'shipped', 'cancelled'},
+    'booking_failed':   {'packing', 'booked', 'cancelled'},       # seller retries or manual AWB
     'shipped':          {'in_transit', 'delivered', 'delivery_failed', 'cancelled'},
     'in_transit':       {'out_for_delivery', 'delivered', 'delivery_failed', 'cancelled'},
     'out_for_delivery': {'delivered', 'delivery_failed'},

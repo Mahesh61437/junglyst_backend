@@ -54,7 +54,9 @@ class SubOrderStatus(models.TextChoices):
     PLACED = 'placed', _('Placed')
     CONFIRMED = 'confirmed', _('Confirmed')
     PACKING = 'packing', _('Packing')
-    SHIPPED = 'shipped', _('Shipped')
+    BOOKED = 'booked', _('Courier Booked')          # AWB assigned, awaiting courier pickup
+    BOOKING_FAILED = 'booking_failed', _('Booking Failed')  # Auto-booking exhausted retries
+    SHIPPED = 'shipped', _('Shipped')               # Courier picked up the package
     IN_TRANSIT = 'in_transit', _('In Transit')
     OUT_FOR_DELIVERY = 'out_for_delivery', _('Out for Delivery')
     DELIVERED = 'delivered', _('Delivered')
@@ -92,6 +94,7 @@ class SubOrder(SoftDeleteModel):
     # Shipment
     awb_number = models.CharField(max_length=100, null=True, blank=True)
     courier_name = models.CharField(max_length=100, null=True, blank=True)
+    booking_failure_reason = models.TextField(null=True, blank=True)  # set when status=booking_failed
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

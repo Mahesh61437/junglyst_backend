@@ -173,14 +173,20 @@ class SellerSubOrderSerializer(serializers.ModelSerializer):
             'confirmed_at', 'dispatch_deadline', 'dispatch_hours_remaining',
             'packaging_photos',
             'actual_weight_grams', 'actual_length_cm', 'actual_breadth_cm', 'actual_height_cm',
-            'awb_number', 'courier_name',
+            'awb_number', 'courier_name', 'booking_failure_reason',
             'created_at', 'updated_at',
             'items', 'shipment',
             'buyer_first_name', 'buyer_pincode',
         )
 
     def get_shipment(self, obj):
-        shipment = obj.order.shipments.filter(seller=obj.seller).first()
+        # Use prefetched shipments (to_attr='seller_shipments') when available
+        # to avoid N+1 queries on the fulfillment page.
+        prefetched = getattr(obj.order, 'seller_shipments', None)
+        if prefetched is not None:
+            shipment = prefetched[0] if prefetched else None
+        else:
+            shipment = obj.order.shipments.filter(seller=obj.seller).first()
         return ShipmentSerializer(shipment).data if shipment else None
 
     def get_dispatch_hours_remaining(self, obj):

@@ -480,13 +480,25 @@ class IsAdminOrSuperAdmin(permissions.BasePermission):
 # ── Public read ───────────────────────────────────────────────────────────────
 
 class CategoryListView(generics.ListAPIView):
-    queryset = Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
     serializer_class = CategorySerializer
     permission_classes = (permissions.AllowAny,)
     pagination_class = None  # always return all categories in one response
 
     _CACHE_KEY = 'categories_list_v2'
     _CACHE_TTL = 60 * 60 * 24  # 24 hours
+
+    def get_queryset(self):
+        # select_related('category') on subcategories eliminates N+1 queries caused by
+        # SubCategory.effective_gst and .effective_commission accessing the parent FK.
+        from django.db.models import Prefetch
+        from .models import SubCategory, CategoryShippingRate
+        return Category.objects.prefetch_related(
+            Prefetch(
+                'subcategories',
+                queryset=SubCategory.objects.select_related('category').prefetch_related('shipping_rates'),
+            ),
+            'shipping_rates',
+        ).all()
 
     def get(self, request, *args, **kwargs):
         # Explicit cache.get/set — cache_page is incompatible with DRF's
@@ -515,7 +527,15 @@ class CategoryAdminView(generics.ListCreateAPIView):
     permission_classes = (permissions.AllowAny,)
 
     def get_queryset(self):
-        return Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
+        from django.db.models import Prefetch
+        from .models import SubCategory
+        return Category.objects.prefetch_related(
+            Prefetch(
+                'subcategories',
+                queryset=SubCategory.objects.select_related('category').prefetch_related('shipping_rates'),
+            ),
+            'shipping_rates',
+        ).all()
 
     def post(self, request, *args, **kwargs):
         self.permission_classes = (IsAdminOrSuperAdmin,)
@@ -535,7 +555,15 @@ class CategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (IsAdminOrSuperAdmin,)
 
     def get_queryset(self):
-        return Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
+        from django.db.models import Prefetch
+        from .models import SubCategory
+        return Category.objects.prefetch_related(
+            Prefetch(
+                'subcategories',
+                queryset=SubCategory.objects.select_related('category').prefetch_related('shipping_rates'),
+            ),
+            'shipping_rates',
+        ).all()
 
     def perform_update(self, serializer):
         data = self.request.data
@@ -543,9 +571,11 @@ class CategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
             serializer.save(slug=slugify(data['name']))
         else:
             serializer.save()
+        cache.delete(CategoryListView._CACHE_KEY)
 
     def perform_destroy(self, instance):
-        instance.delete()  # soft-delete via SoftDeleteModel
+        instance.delete()
+        cache.delete(CategoryListView._CACHE_KEY)
 
 
 # ── Admin CRUD — SubCategories ────────────────────────────────────────────────
@@ -576,6 +606,7 @@ class SubCategoryAdminView(generics.ListCreateAPIView):
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        cache.delete(CategoryListView._CACHE_KEY)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -592,9 +623,11 @@ class SubCategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
             serializer.save(slug=slugify(data['name']))
         else:
             serializer.save()
+        cache.delete(CategoryListView._CACHE_KEY)
 
     def perform_destroy(self, instance):
         instance.delete()
+        cache.delete(CategoryListView._CACHE_KEY)
 
 
 # ── Admin CRUD — Shipping Rates ───────────────────────────────────────────────

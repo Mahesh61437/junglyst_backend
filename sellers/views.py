@@ -133,6 +133,48 @@ class GrowerDashboardView(generics.GenericAPIView):
                 return Response({"error": "This store name is already taken. Please choose another."}, status=400)
             profile.store_name = store_name
             profile.slug = slugify(store_name)
+
+        # Validate mandatory pickup location fields
+        final_pickup_address = data.get('pickup_address', profile.pickup_address)
+        final_location_city = data.get('location_city', profile.location_city)
+        final_location_state = data.get('location_state', profile.location_state)
+        final_location_pincode = data.get('location_pincode', profile.location_pincode)
+        
+        phone_val = data.get('phone')
+        if phone_val is not None:
+            final_phone = phone_val.strip().replace('+91', '').replace(' ', '').replace('-', '')
+        else:
+            final_phone = (seller.phone or '').replace('+91', '').replace(' ', '').replace('-', '')
+
+        if not final_pickup_address or not final_pickup_address.strip():
+            return Response({"error": "Pickup street address is required."}, status=400)
+        if not final_location_city or not final_location_city.strip():
+            return Response({"error": "City is required."}, status=400)
+        if not final_location_state or not final_location_state.strip():
+            return Response({"error": "State is required."}, status=400)
+        if not final_location_pincode or not final_location_pincode.strip():
+            return Response({"error": "Pincode is required."}, status=400)
+            
+        pincode_clean = final_location_pincode.strip()
+        if not pincode_clean.isdigit() or len(pincode_clean) != 6:
+            return Response({"error": "Pincode must be exactly 6 digits."}, status=400)
+
+        if not final_phone or not final_phone.strip():
+            return Response({"error": "Phone number is required for pickup coordination."}, status=400)
+        if not final_phone.isdigit() or len(final_phone) != 10:
+            return Response({"error": "Phone number must be a valid 10-digit Indian mobile number."}, status=400)
+
+        # Update phone number if provided and changed
+        if phone_val is not None:
+            new_phone = phone_val.strip().replace('+91', '').replace(' ', '').replace('-', '')
+            current_phone = (seller.phone or '').replace('+91', '').replace(' ', '').replace('-', '')
+            if current_phone != new_phone:
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
+                if User.objects.filter(phone=new_phone).exclude(pk=seller.pk).exists():
+                    return Response({"error": "This phone number is already linked to another account."}, status=400)
+                seller.phone = new_phone
+                seller.save(update_fields=['phone'])
             
         profile.logo_url = data.get('logo_url', profile.logo_url)
         profile.icon_url = data.get('icon_url', profile.icon_url)
@@ -140,10 +182,10 @@ class GrowerDashboardView(generics.GenericAPIView):
         profile.brand_color = data.get('brand_color', profile.brand_color)
         profile.bio = data.get('bio', profile.bio)
         profile.tagline = data.get('expertise', profile.tagline)
-        profile.location_city = data.get('location_city', profile.location_city)
-        profile.location_state = data.get('location_state', profile.location_state)
-        profile.location_pincode = data.get('location_pincode', profile.location_pincode)
-        profile.pickup_address = data.get('pickup_address', profile.pickup_address)
+        profile.location_city = final_location_city
+        profile.location_state = final_location_state
+        profile.location_pincode = pincode_clean
+        profile.pickup_address = final_pickup_address
         profile.gst_number = data.get('tax_id', profile.gst_number)
         profile.payout_type = data.get('payout_type', profile.payout_type)
         profile.payout_account = data.get('payout_account', profile.payout_account)
@@ -342,11 +384,29 @@ class SellerPromotionView(generics.GenericAPIView):
         return Response(SellerProfileSerializer(profile).data)
 
 
+def _shiprocket_status_for_profile(seller, profile) -> dict:
+    """
+    Returns the seller's current Shiprocket pickup status dict.
+    Calls ShiprocketService only if Shiprocket is the active provider.
+    Falls back gracefully if Shiprocket is not configured.
+    """
+    try:
+        from shipping.services import get_logistics_service
+        svc = get_logistics_service()
+        if hasattr(svc, 'check_pickup_status'):
+            return svc.check_pickup_status(seller, profile)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("_shiprocket_status_for_profile failed: %s", exc)
+    return {"status": "unknown", "location_name": None, "message": ""}
+
+
 class SellerPickupAddressView(generics.GenericAPIView):
     """
-    GET  /api/sellers/pickup-address/  — returns seller's pickup address details
-    PATCH /api/sellers/pickup-address/ — updates fields; clears shiprocket_pickup_location
-                                         cache so it is re-registered on next shipment.
+    GET   /api/sellers/pickup-address/          — returns address + Shiprocket verification status
+    PATCH /api/sellers/pickup-address/          — saves address, immediately registers with
+                                                  Shiprocket, returns verification status
+    POST  /api/sellers/pickup-address/register/ — re-attempts Shiprocket registration / status refresh
     """
     permission_classes = (permissions.IsAuthenticated,)
 
@@ -355,7 +415,9 @@ class SellerPickupAddressView(generics.GenericAPIView):
             return Response({"error": "Access denied"}, status=403)
         return None
 
-    def _serialize(self, profile, user=None):
+    def _serialize(self, profile, user=None, shiprocket_status: dict | None = None):
+        if shiprocket_status is None:
+            shiprocket_status = _shiprocket_status_for_profile(user or profile, profile)
         return {
             "phone": (user.phone if user else "") or "",
             "pickup_address": profile.pickup_address or "",
@@ -363,6 +425,9 @@ class SellerPickupAddressView(generics.GenericAPIView):
             "location_state": profile.location_state or "",
             "location_pincode": profile.location_pincode or "",
             "shiprocket_pickup_location": profile.shiprocket_pickup_location or "",
+            # Verification status surface to the frontend
+            "shiprocket_status": shiprocket_status.get("status", "unknown"),
+            "shiprocket_status_message": shiprocket_status.get("message", ""),
         }
 
     def get(self, request):
@@ -415,14 +480,13 @@ class SellerPickupAddressView(generics.GenericAPIView):
             new_phone = data['phone'].strip().replace('+91', '').replace(' ', '').replace('-', '')
             current_phone = (request.user.phone or '').replace('+91', '').replace(' ', '').replace('-', '')
             if current_phone != new_phone:
-                # Ensure uniqueness (another user might have this phone)
                 from django.contrib.auth import get_user_model
                 User = get_user_model()
                 if User.objects.filter(phone=new_phone).exclude(pk=request.user.pk).exists():
                     return Response({"errors": {"phone": "This phone number is already linked to another account."}}, status=400)
                 request.user.phone = new_phone
                 request.user.save(update_fields=['phone'])
-                reset_cache = True  # Phone change → Shiprocket must re-verify
+                reset_cache = True
 
         # ── Address fields → saved on SellerProfile ───────────────────────────
         address_field_map = {
@@ -447,10 +511,159 @@ class SellerPickupAddressView(generics.GenericAPIView):
         if profile_update_fields:
             profile.save(update_fields=list(set(profile_update_fields)))
 
+        # ── Immediately attempt Shiprocket registration after save ────────────
+        # This registers the address in Shiprocket and sends the OTP to the seller's phone.
+        # The response tells the seller whether to verify an OTP or if they're already active.
+        sr_status = {"status": "unknown", "location_name": None, "message": ""}
+        if not data.get('reset_shiprocket_location'):
+            try:
+                from shipping.services import get_logistics_service
+                svc = get_logistics_service()
+                if hasattr(svc, 'ensure_seller_pickup_location'):
+                    location_name = svc.ensure_seller_pickup_location(request.user, profile)
+                    # Re-fetch status so the response reflects the actual current state
+                    if hasattr(svc, 'check_pickup_status'):
+                        sr_status = svc.check_pickup_status(request.user, profile)
+                    else:
+                        sr_status = {
+                            "status": "active" if location_name else "pending",
+                            "location_name": location_name,
+                            "message": "Pickup location ready." if location_name else (
+                                "OTP sent to your phone. Verify in Shiprocket dashboard to activate."
+                            ),
+                        }
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Post-save Shiprocket registration failed: %s", exc)
+                sr_status = {"status": "unknown", "location_name": None, "message": str(exc)}
+
         return Response({
-            "message": "Pickup address updated successfully.",
-            **self._serialize(profile, request.user),
+            "message": "Pickup address saved." + (
+                " Check your phone to verify the OTP in Shiprocket." if sr_status.get("status") == "pending" else
+                " Your pickup location is active and ready." if sr_status.get("status") == "active" else ""
+            ),
+            **self._serialize(profile, request.user, shiprocket_status=sr_status),
         })
+
+    def post(self, request):
+        """
+        POST /api/sellers/pickup-address/register/
+        Re-attempts Shiprocket registration and returns the current verification status.
+        Call this after the seller has verified the OTP to refresh the cached status.
+        """
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        try:
+            profile = request.user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+
+        if not all([profile.pickup_address, profile.location_city, profile.location_state, profile.location_pincode]):
+            return Response({"error": "Complete your pickup address before registering."}, status=400)
+
+        sr_status = {"status": "unknown", "location_name": None, "message": ""}
+        try:
+            from shipping.services import get_logistics_service
+            svc = get_logistics_service()
+            if hasattr(svc, 'ensure_seller_pickup_location'):
+                # Clears stale cache so we re-check Shiprocket fresh
+                profile.shiprocket_pickup_location = None
+                profile.save(update_fields=['shiprocket_pickup_location'])
+                location_name = svc.ensure_seller_pickup_location(request.user, profile)
+                if hasattr(svc, 'check_pickup_status'):
+                    sr_status = svc.check_pickup_status(request.user, profile)
+                else:
+                    sr_status = {
+                        "status": "active" if location_name else "pending",
+                        "location_name": location_name,
+                        "message": "Active." if location_name else "Still pending OTP verification.",
+                    }
+            else:
+                sr_status = {"status": "not_applicable", "location_name": None,
+                             "message": "Shiprocket is not the active logistics provider."}
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error("Shiprocket registration refresh failed for seller %s: %s", request.user.id, exc)
+            sr_status = {"status": "unknown", "location_name": None, "message": str(exc)}
+
+        profile.refresh_from_db(fields=['shiprocket_pickup_location'])
+        return Response({**self._serialize(profile, request.user, shiprocket_status=sr_status)})
+
+
+class SellerPickupOTPView(generics.GenericAPIView):
+    """
+    POST  /api/sellers/pickup-address/otp/  — register address in Shiprocket (sends OTP SMS)
+    PATCH /api/sellers/pickup-address/otp/  — verify the 6-digit OTP entered by the seller
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def _require_grower(self, user):
+        if user.role not in ('grower', 'admin'):
+            return Response({"error": "Access denied"}, status=403)
+        return None
+
+    def post(self, request):
+        """Send (or resend) the Shiprocket pickup verification OTP."""
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        try:
+            profile = request.user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+
+        try:
+            from shipping.services import get_logistics_service
+            svc = get_logistics_service()
+            if not hasattr(svc, 'send_pickup_otp'):
+                return Response({"status": "not_applicable", "message": "OTP not required for your logistics provider.", "phone_hint": ""})
+            result = svc.send_pickup_otp(request.user, profile)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error("send_pickup_otp error for seller %s: %s", request.user.id, exc)
+            return Response({"status": "failed", "message": str(exc), "phone_hint": ""}, status=500)
+
+        http_status = 200 if result.get("status") in ("sent", "already_active") else 400
+        return Response(result, status=http_status)
+
+    def patch(self, request):
+        """Verify the OTP the seller received via SMS."""
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        try:
+            profile = request.user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return Response({"error": "Seller profile not found"}, status=404)
+
+        otp = (request.data.get('otp') or '').strip()
+        if not otp:
+            return Response({"error": "OTP is required."}, status=400)
+
+        try:
+            from shipping.services import get_logistics_service
+            svc = get_logistics_service()
+            if not hasattr(svc, 'verify_pickup_otp'):
+                return Response({"status": "not_applicable", "message": "OTP verification not required for your logistics provider.", "location_name": None})
+            result = svc.verify_pickup_otp(request.user, profile, otp)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error("verify_pickup_otp error for seller %s: %s", request.user.id, exc)
+            return Response({"status": "failed", "message": str(exc), "location_name": None}, status=500)
+
+        # Re-read cached location after potential update
+        profile.refresh_from_db(fields=['shiprocket_pickup_location'])
+
+        if result.get("status") == "active":
+            sr_status = {"status": "active", "location_name": result.get("location_name"), "message": result.get("message", "")}
+        else:
+            sr_status = _shiprocket_status_for_profile(request.user, profile)
+
+        # Return merged response: OTP result + serialized pickup address
+        view = SellerPickupAddressView()
+        serialized = view._serialize(profile, request.user, shiprocket_status=sr_status)
+        return Response({**result, **serialized}, status=200 if result.get("status") == "active" else 400)
 
 
 class BankDetailsView(generics.GenericAPIView):
