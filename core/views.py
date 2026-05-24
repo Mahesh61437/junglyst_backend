@@ -54,6 +54,50 @@ def _daily_seed_rand_order(queryset):
     # SQLite fallback for local dev — pagination is not stable but that's acceptable
     return queryset, '?'
 
+
+def apply_fairness_engine(queryset, limit=500):
+    """
+    Applies the Multi-Vendor Fairness Engine to a queryset of products.
+    1. Fetches a candidate pool of up to `limit` products ordered by seller_id, -created_at.
+    2. Shuffles the candidate pool using Fisher-Yates.
+    3. Filters to ensure no seller dominates (MAX_PER_SELLER).
+    4. Stable-sorts in-stock products to the top.
+    """
+    # Fetch configured MAX_PER_SELLER from Configuration database if exists
+    max_per_seller = 2
+    try:
+        config_obj = Configuration.objects.filter(name='feed_settings').first()
+        if config_obj and 'max_per_seller' in config_obj.data:
+            max_per_seller = int(config_obj.data['max_per_seller'])
+    except Exception:
+        pass
+
+    # 1. Fetch candidate pool using indexed sorts
+    pool_qs = queryset.order_by('seller_id', '-created_at')[:limit]
+    candidate_pool = list(pool_qs)
+
+    # 2. In-Memory Randomization (Fisher-Yates Shuffle)
+    n = len(candidate_pool)
+    for i in range(n - 1, 0, -1):
+        j = random.randint(0, i)
+        candidate_pool[i], candidate_pool[j] = candidate_pool[j], candidate_pool[i]
+
+    # 3. Interleaving & Fairness Filter (Diversity Layer)
+    final_feed = []
+    seller_counts = {}
+
+    for product in candidate_pool:
+        s_id = product.seller_id
+        count = seller_counts.get(s_id, 0)
+        if count < max_per_seller:
+            final_feed.append(product)
+            seller_counts[s_id] = count + 1
+
+    # 4. Sort in-stock products first (stable sort)
+    final_feed.sort(key=lambda p: getattr(p, 'has_stock', False), reverse=True)
+
+    return final_feed
+
 User = get_user_model()
 
 def link_ghost_orders(user):
@@ -293,14 +337,23 @@ class ProductListView(generics.ListAPIView):
         return queryset
 
     def filter_queryset(self, queryset):
-        """Always put in-stock products first; scramble sellers with a stable daily seed."""
+        """Always put in-stock products first; apply fairness engine unless bypassed."""
         qs = super().filter_queryset(queryset)
-        ordering_param = self.request.query_params.get('ordering')
-        if ordering_param:
-            secondary = [f.strip() for f in ordering_param.split(',')]
-            return qs.order_by('-has_stock', *secondary)
-        qs, rand_field = _daily_seed_rand_order(qs)
-        return qs.order_by('-has_stock', rand_field)
+        params = self.request.query_params
+        
+        # Bypass fairness engine if there's an explicit ordering, seller filter, or search query.
+        if (params.get('ordering') or 
+            params.get('seller') or 
+            params.get('seller_slug') or 
+            params.get('search')):
+            ordering_param = params.get('ordering')
+            if ordering_param:
+                secondary = [f.strip() for f in ordering_param.split(',')]
+                return qs.order_by('-has_stock', *secondary)
+            return qs.order_by('-has_stock', '-created_at')
+
+        # Otherwise, apply Multi-Vendor Fairness Engine
+        return apply_fairness_engine(qs)
 
     def paginate_queryset(self, queryset):
         if self.request.query_params.get('no_pagination'):
@@ -855,8 +908,7 @@ class HomeDataView(generics.GenericAPIView):
         _home_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
             has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
         )
-        _home_qs, _rand_field = _daily_seed_rand_order(_home_qs)
-        products_qs = _home_qs.order_by('-has_stock', _rand_field)[:8]
+        products_qs = apply_fairness_engine(_home_qs)[:8]
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
