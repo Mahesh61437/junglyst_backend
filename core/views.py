@@ -223,19 +223,18 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
 def _product_queryset():
     return Product.objects.select_related(
         'seller', 'seller__seller_profile',
-        'sub_category', 'sub_category__category',
     ).prefetch_related(
         'variants', 'images', 'categories',
-        'categories__subcategories', 'tags',
+        'categories__subcategories', 'tags', 'sub_categories', 'sub_categories__category'
     )
 
 
 def _product_list_queryset():
     """Lighter queryset for the shop list page"""
     return Product.objects.select_related(
-        'seller', 'seller__seller_profile', 'sub_category'
+        'seller', 'seller__seller_profile'
     ).prefetch_related(
-        'variants', 'images', 'categories'
+        'variants', 'images', 'categories', 'sub_categories'
     )
 
 
@@ -243,7 +242,7 @@ class ProductListView(generics.ListAPIView):
     serializer_class = ProductListSerializer
     permission_classes = (permissions.AllowAny,)
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
-    filterset_fields = ('categories', 'sub_category', 'seller', 'is_active', 'is_rare')
+    filterset_fields = ('categories', 'sub_categories', 'seller', 'is_active', 'is_rare')
     search_fields = ('name', 'tags__name', 'scientific_name')
     ordering_fields = ('created_at', 'rating')
     
@@ -314,7 +313,7 @@ class ProductListView(generics.ListAPIView):
         # Subcategory filter
         sub_cat_id = params.get('sub_category_id')
         if sub_cat_id:
-            queryset = queryset.filter(sub_category_id=sub_cat_id)
+            queryset = queryset.filter(sub_categories__id=sub_cat_id).distinct()
 
         # Category filter by name (comma-separated for multi-select)
         category_name = params.get('category')
@@ -486,7 +485,6 @@ class ProductCopyView(generics.GenericAPIView):
             tagline=original.tagline,
             description=original.description,
             seller=seller,
-            sub_category=original.sub_category,
             scientific_name=original.scientific_name,
             care_level=original.care_level,
             light_requirements=original.light_requirements,
@@ -499,6 +497,8 @@ class ProductCopyView(generics.GenericAPIView):
             co2_requirement=original.co2_requirement,
         )
         new_product.save()
+
+        new_product.sub_categories.set(original.sub_categories.all())
 
         for cat in original.categories.all():
             new_product.categories.add(cat)

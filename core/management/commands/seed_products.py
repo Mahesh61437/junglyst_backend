@@ -403,9 +403,11 @@ class Command(BaseCommand):
                     ph_range=tmpl.get('ph_range') or '',
                     origin=tmpl.get('origin') or '',
                     is_rare=tmpl.get('is_rare', False),
-                    sub_category=sub_obj,
                     is_active=True,
                 )
+
+                if sub_obj:
+                    product.sub_categories.set([sub_obj])
 
                 if cat_obj:
                     product.categories.add(cat_obj)

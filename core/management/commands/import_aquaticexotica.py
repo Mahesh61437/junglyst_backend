@@ -50,13 +50,13 @@ DEFAULT_HEIGHT_CM = Decimal("10.0")
 DEFAULT_PACKED_WEIGHT_GRAMS = 200
 
 CATEGORY_MAP: dict[str, tuple[str, str]] = {
-    "Aquatic Plants":   ("Aquascaping",              "Starter Packs"),
-    "Rhizome plants":   ("Aquascaping",              "Starter Packs"),
-    "Moss":             ("Aquascaping",              "Starter Packs"),
-    "Terrarium Plants": ("Terrarium & Paludarium",   "Terrarium Accessories"),
-    "Indoor Plants":    ("Terrarium & Paludarium",   "Terrarium Accessories"),
-    "Exotic Plants":    ("Terrarium & Paludarium",   "Terrarium Accessories"),
-    "Premium":          ("Brand & Specialized",      "DOOA System"),
+    "Aquatic Plants":   ("Plants",                   "Aquatic Plants"),
+    "Rhizome plants":   ("Plants",                   "Aquatic Plants"),
+    "Moss":             ("Terrarium & Paludarium",   "Terrarium Moss"),
+    "Terrarium Plants": ("Terrarium & Paludarium",   "Terrarium Plants"),
+    "Indoor Plants":    ("Terrarium & Paludarium",   "Terrarium Plants"),
+    "Exotic Plants":    ("Terrarium & Paludarium",   "Terrarium Plants"),
+    "Premium":          ("Plants",                   "Rare & Exotic"),
 }
 
 
@@ -184,19 +184,65 @@ def _infer_care(description_html: str) -> dict[str, str]:
 def _resolve_category(product: dict):
     from core.models import Category, SubCategory
     cat_names = [c.get("name", "") for c in (product.get("categories") or []) if c.get("name")]
-    for name in cat_names:
-        if name in CATEGORY_MAP:
-            cat_name, sub_name = CATEGORY_MAP[name]
+    names_set = set(cat_names)
+    
+    mapped_subs = []
+    
+    # 1. Mosses (aquatic vs terrarium)
+    if "Moss" in names_set:
+        if "Aquatic Plants" in names_set:
+            mapped_subs.append(("Plants", "Aquatic Moss"))
+        else:
+            mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+
+    # 2. Rhizome plants
+    if "Rhizome plants" in names_set:
+        if "Exotic Plants" in names_set or "Premium" in names_set:
+            mapped_subs.append(("Plants", "Rare & Exotic"))
+        else:
+            mapped_subs.append(("Plants", "Aquatic Plants"))
+
+    # 3. Aquatic Plants (other than Rhizome/Moss already matched)
+    if "Aquatic Plants" in names_set:
+        is_already_matched = any(c == "Plants" for c, _ in mapped_subs)
+        if not is_already_matched:
+            if "Exotic Plants" in names_set or "Premium" in names_set:
+                mapped_subs.append(("Plants", "Rare & Exotic"))
+            else:
+                mapped_subs.append(("Plants", "Aquatic Plants"))
+
+    # 4. Exotic/Indoor/Terrarium Plants (non-aquatic or dual-purpose)
+    if "Exotic Plants" in names_set or "Indoor Plants" in names_set or "Terrarium Plants" in names_set:
+        if "Moss" not in names_set:
+            mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # Deduplicate mapped_subs
+    mapped_subs = list(dict.fromkeys(mapped_subs))
+
+    # Fallback to single category map
+    if not mapped_subs:
+        for name in cat_names:
+            if name in CATEGORY_MAP:
+                mapped_subs.append(CATEGORY_MAP[name])
+                break
+
+    cats = []
+    subs = []
+    for cat_name, sub_name in mapped_subs:
+        try:
+            cat_obj = Category.objects.get(name=cat_name)
+            if cat_obj not in cats:
+                cats.append(cat_obj)
             try:
-                cat = Category.objects.get(name=cat_name)
-            except Category.DoesNotExist:
-                continue
-            try:
-                sub = SubCategory.objects.get(category=cat, name=sub_name)
+                sub_obj = SubCategory.objects.get(category=cat_obj, name=sub_name)
+                if sub_obj not in subs:
+                    subs.append(sub_obj)
             except SubCategory.DoesNotExist:
-                sub = None
-            return cat, sub, cat_names
-    return None, None, cat_names
+                pass
+        except Category.DoesNotExist:
+            pass
+
+    return cats, subs, cat_names
 
 
 def _ae_key(ae_id: int) -> str:
@@ -409,7 +455,7 @@ class Command(BaseCommand):
         rating = Decimal(str(raw.get("rating") or "5.0"))
 
         care = _infer_care(description_html)
-        cat, sub, _ = _resolve_category(raw)
+        cat, subs, _ = _resolve_category(raw)
         description = _strip_html(description_html, max_len=8000)
 
         # Look up by the old ae-{id} key first (backward compat), then by new name slug
@@ -429,7 +475,6 @@ class Command(BaseCommand):
             tagline="",
             description=description,
             seller=seller,
-            sub_category=sub,
             scientific_name="",
             care_level=care["care_level"],
             light_requirements=care["light_requirements"],
@@ -458,7 +503,10 @@ class Command(BaseCommand):
             action = "created"
 
         if cat:
-            product.categories.set([cat])
+            product.categories.set(cat)
+
+        if subs:
+            product.sub_categories.set(subs)
 
         tag_names = [t.get("name") for t in (raw.get("tagDetails") or []) if t.get("name")]
         tags = []

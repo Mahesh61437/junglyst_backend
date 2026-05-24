@@ -162,7 +162,7 @@ class Product(SoftDeleteModel):
 
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='products')
     categories = models.ManyToManyField(Category, related_name='products', blank=True)
-    sub_category = models.ForeignKey(SubCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='products')
+    sub_categories = models.ManyToManyField(SubCategory, related_name='products', blank=True)
     tags = models.ManyToManyField(Tag, related_name='products', blank=True)
     
     scientific_name = models.CharField(max_length=255, blank=True, null=True)

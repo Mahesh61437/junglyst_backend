@@ -52,10 +52,14 @@ class CategoryShippingRateAdmin(admin.ModelAdmin):
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ('name', 'seller', 'sub_category', 'care_level', 'is_rare', 'is_active', 'is_deleted')
-    list_filter = ('seller', 'sub_category', 'care_level', 'is_rare', 'is_active', 'is_deleted')
+    list_display = ('name', 'seller', 'get_sub_categories', 'care_level', 'is_rare', 'is_active', 'is_deleted')
+    list_filter = ('seller', 'care_level', 'is_rare', 'is_active', 'is_deleted')
     prepopulated_fields = {'slug': ('name',)}
     search_fields = ('name', 'scientific_name')
+
+    def get_sub_categories(self, obj):
+        return ", ".join(sub.name for sub in obj.sub_categories.all())
+    get_sub_categories.short_description = 'Subcategories'
 
 
 @admin.register(ProductVariant)

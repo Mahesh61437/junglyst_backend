@@ -428,7 +428,6 @@ class Command(BaseCommand):
             tagline            = (product_data.get("tagline") or "")[:499] or None,
             description        = product_data.get("description") or name,
             seller             = seller,
-            sub_category       = sub,
             scientific_name    = product_data.get("scientific_name") or None,
             care_level         = product_data.get("care_level")         or "Easy",
             light_requirements = product_data.get("light_requirements") or "Medium",
@@ -454,8 +453,10 @@ class Command(BaseCommand):
             product.save()
             action  = "created"
 
-        # Assign parent category (M2M)
+        # Assign parent category (M2M) and subcategory
         product.categories.set([cat])
+        if sub:
+            product.sub_categories.set([sub])
 
         # ── ProductVariant (upsert by product + variant name) ──────────────────
         vname    = (variant_data.get("name") or "Standard")[:100]

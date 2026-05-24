@@ -250,9 +250,11 @@ class ProductSerializer(serializers.ModelSerializer):
     images = ProductImageSerializer(many=True, required=False)
     seller = PublicSellerSerializer(read_only=True)
     categories = CategorySerializer(many=True, read_only=True)
-    sub_category = SubCategorySerializer(read_only=True)
+    sub_categories = SubCategorySerializer(many=True, read_only=True)
+    sub_category = serializers.SerializerMethodField()
     category_id = serializers.IntegerField(write_only=True, required=False)
     sub_category_id = serializers.IntegerField(write_only=True, required=False)
+    sub_category_ids = serializers.ListField(child=serializers.IntegerField(), write_only=True, required=False)
     seller_id = serializers.UUIDField(write_only=True, required=False)
     image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
@@ -283,6 +285,12 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_category(self, obj):
         categories = obj.categories.all()
         return categories[0].name if categories else None
+
+    def get_sub_category(self, obj):
+        subcategories = obj.sub_categories.all()
+        if subcategories:
+            return SubCategorySerializer(subcategories[0], context=self.context).data
+        return None
 
     def _first_variant(self, obj):
         # Uses prefetch cache — avoids 9 separate DB hits per product
@@ -335,6 +343,7 @@ class ProductSerializer(serializers.ModelSerializer):
         images_data = validated_data.pop('images', [])
         category_id = validated_data.pop('category_id', None)
         sub_category_id = validated_data.pop('sub_category_id', None)
+        sub_category_ids = validated_data.pop('sub_category_ids', None)
         seller_id = validated_data.pop('seller_id', None)
         if seller_id and 'seller' not in validated_data:
             try:
@@ -350,14 +359,17 @@ class ProductSerializer(serializers.ModelSerializer):
             except Category.DoesNotExist:
                 pass
 
-        if sub_category_id:
-            try:
-                sub_cat = SubCategory.objects.get(id=sub_category_id)
-                product.sub_category = sub_cat
-                product.categories.add(sub_cat.category)
-                product.save()
-            except SubCategory.DoesNotExist:
-                pass
+        sub_ids = []
+        if sub_category_ids:
+            sub_ids.extend(sub_category_ids)
+        if sub_category_id and sub_category_id not in sub_ids:
+            sub_ids.append(sub_category_id)
+
+        if sub_ids:
+            sub_cats = SubCategory.objects.filter(id__in=sub_ids)
+            product.sub_categories.set(sub_cats)
+            for sc in sub_cats:
+                product.categories.add(sc.category)
 
         created_variants = []
         for variant_data in variants_data:
@@ -385,7 +397,8 @@ class ProductSerializer(serializers.ModelSerializer):
         variants_data = validated_data.pop('variants', _missing)
         images_data = validated_data.pop('images', _missing)
         category_id = validated_data.pop('category_id', None)
-        sub_category_id = validated_data.pop('sub_category_id', None)
+        sub_category_id = validated_data.pop('sub_category_id', _missing)
+        sub_category_ids = validated_data.pop('sub_category_ids', _missing)
         seller_id = validated_data.pop('seller_id', None)
         if seller_id:
             try:
@@ -404,15 +417,23 @@ class ProductSerializer(serializers.ModelSerializer):
             except Category.DoesNotExist:
                 pass
 
-        if sub_category_id:
-            try:
-                sub_cat = SubCategory.objects.get(id=sub_category_id)
-                instance.sub_category = sub_cat
-                if sub_cat.category not in instance.categories.all():
-                    instance.categories.add(sub_cat.category)
-                instance.save()
-            except SubCategory.DoesNotExist:
-                pass
+        sub_ids = []
+        should_update = False
+        if sub_category_ids is not _missing:
+            should_update = True
+            if sub_category_ids:
+                sub_ids.extend(sub_category_ids)
+        if sub_category_id is not _missing:
+            should_update = True
+            if sub_category_id and sub_category_id not in sub_ids:
+                sub_ids.append(sub_category_id)
+
+        if should_update:
+            sub_cats = SubCategory.objects.filter(id__in=sub_ids)
+            instance.sub_categories.set(sub_cats)
+            for sc in sub_cats:
+                if sc.category not in instance.categories.all():
+                    instance.categories.add(sc.category)
 
         if variants_data is not _missing:
             existing_variants = {str(v.id): v for v in instance.variants.all()}
@@ -520,7 +541,11 @@ class ProductListSerializer(serializers.ModelSerializer):
             return {'id': str(obj.seller.id), 'seller_profile': None}
 
     def get_category_name(self, obj):
-        return obj.sub_category.name if obj.sub_category else (obj.categories.all()[0].name if obj.categories.exists() else None)
+        subcategories = obj.sub_categories.all()
+        if subcategories:
+            return subcategories[0].name
+        categories = obj.categories.all()
+        return categories[0].name if categories else None
 
     def get_variants(self, obj):
         # Return only what ProductCard needs: id, price, stock, compare_at_price

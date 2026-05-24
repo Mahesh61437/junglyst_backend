@@ -608,7 +608,6 @@ class Command(BaseCommand):
             tagline=tagline,
             description=_p["description"] or name,
             seller=seller,
-            sub_category=sub,
             scientific_name=_p["scientific_name"] or None,
             care_level=_p["care_level"]                 or "Easy",
             light_requirements=_p["light_requirements"] or "Medium",
@@ -636,6 +635,8 @@ class Command(BaseCommand):
             action = "created"
 
         product.categories.set([cat])
+        if sub:
+            product.sub_categories.set([sub])
 
         # ── Variant ───────────────────────────────────────────────────────────
         # base_price = website price as-is
