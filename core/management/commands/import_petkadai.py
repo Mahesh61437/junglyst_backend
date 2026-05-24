@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 import mimetypes
 import os
 import time
@@ -55,7 +56,7 @@ DEFAULT_JSON = os.path.normpath(
 REQUEST_TIMEOUT   = 30
 RETRY_DELAY       = 2
 
-DEFAULT_GST_RATE        = Decimal("12.00")   # standard GST for live plants
+DEFAULT_GST_RATE        = Decimal("0.00")    # scraped prices already include GST
 DEFAULT_COMMISSION_RATE = Decimal("10.00")   # platform commission
 DEFAULT_WEIGHT_KG       = Decimal("0.10")    # TC / bunch plants are very light
 DEFAULT_LENGTH_CM       = Decimal("15.0")
@@ -280,9 +281,17 @@ class Command(BaseCommand):
                 try:
                     category_cache[cat_name] = Category.objects.get(name=cat_name)
                 except Category.DoesNotExist:
-                    self.stderr.write(self.style.ERROR(f"  [{idx}] Category '{cat_name}' not found in DB. Skipping."))
-                    errors += 1
-                    continue
+                    # Auto-create missing categories
+                    base_slug = slugify(cat_name) or "category"
+                    cat_slug = base_slug
+                    n = 1
+                    while Category.all_objects.filter(slug=cat_slug).exists():
+                        cat_slug = f"{base_slug}-{n}"
+                        n += 1
+                        
+                    cat = Category.objects.create(name=cat_name, slug=cat_slug)
+                    self.stdout.write(self.style.WARNING(f"    Auto-created Category: {cat.name}"))
+                    category_cache[cat_name] = cat
             
             cat = category_cache[cat_name]
 
@@ -498,6 +507,17 @@ class Command(BaseCommand):
         )
 
         variant_qs = ProductVariant.all_objects.filter(product=product, name=vname)
+        
+        # Ensure SKU uniqueness across the entire DB to prevent IntegrityError
+        if sku:
+            if variant_qs.exists():
+                existing_variant = variant_qs.first()
+                if ProductVariant.all_objects.filter(sku=sku).exclude(id=existing_variant.id).exists():
+                    sku = f"{sku}-{uuid.uuid4().hex[:6]}"
+            else:
+                if ProductVariant.all_objects.filter(sku=sku).exists():
+                    sku = f"{sku}-{uuid.uuid4().hex[:6]}"
+
         if variant_qs.exists():
             variant                  = variant_qs.first()
             variant.variant_type     = vtype
@@ -541,36 +561,38 @@ class Command(BaseCommand):
         img_ok = img_fail = 0
 
         if images_data:
+            has_existing_images = False
             if action == "updated":
-                # Clear old images before re-importing
-                ProductImage.all_objects.filter(product=product).delete()
+                has_existing_images = ProductImage.all_objects.filter(product=product).exists()
 
-            seen: set[str] = set()
-            for img_rec in images_data:
-                src_url = img_rec.get("image_url") or ""
-                if not src_url or src_url in seen:
-                    continue
-                seen.add(src_url)
+            # Skip image processing entirely if the product already has images
+            if not has_existing_images:
+                seen: set[str] = set()
+                for img_rec in images_data:
+                    src_url = img_rec.get("image_url") or ""
+                    if not src_url or src_url in seen:
+                        continue
+                    seen.add(src_url)
 
-                order      = int(img_rec.get("order", 0))
-                is_primary = bool(img_rec.get("is_primary", order == 0))
+                    order      = int(img_rec.get("order", 0))
+                    is_primary = bool(img_rec.get("is_primary", order == 0))
 
-                if skip_images:
-                    # Store petkadai CDN URL directly (no Firebase re-upload)
-                    final_url = src_url
-                else:
-                    final_url = self._upload_image(src_url, seller.id, upload_fn)
+                    if skip_images:
+                        # Store petkadai CDN URL directly (no Firebase re-upload)
+                        final_url = src_url
+                    else:
+                        final_url = self._upload_image(src_url, seller.id, upload_fn)
 
-                if final_url:
-                    ProductImage.objects.create(
-                        product    = product,
-                        variant    = variant,
-                        image_url  = final_url,
-                        is_primary = is_primary,
-                        order      = order,
-                    )
-                    img_ok += 1
-                else:
-                    img_fail += 1
+                    if final_url:
+                        ProductImage.objects.create(
+                            product    = product,
+                            variant    = variant,
+                            image_url  = final_url,
+                            is_primary = is_primary,
+                            order      = order,
+                        )
+                        img_ok += 1
+                    else:
+                        img_fail += 1
 
         return action, img_ok, img_fail
