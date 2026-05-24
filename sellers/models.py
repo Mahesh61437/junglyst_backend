@@ -1,9 +1,24 @@
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from django.db import models
+from django.utils import timezone
 from core.models import User
 from django.utils.text import slugify
 
 WEEKDAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+# Hard cap so we never loop forever if a seller blacks out every upcoming day
+MAX_SHIPPING_LOOKAHEAD_DAYS = 90
+
+# Default dispatch days for a fresh seller — Mon/Wed/Fri (0, 2, 4).
+# Applied automatically at profile creation and as a fallback so checkout
+# never blocks just because a seller skipped the (optional) onboarding step.
+DEFAULT_SHIPPING_DAYS = [0, 2, 4]
+
+
+def _default_shipping_days():
+    # Return a fresh list — JSONField default must be a callable, never a mutable literal
+    return list(DEFAULT_SHIPPING_DAYS)
+
 
 class SellerProfileManager(models.Manager):
     def get_or_get_default(self, user):
@@ -13,7 +28,8 @@ class SellerProfileManager(models.Manager):
             defaults={
                 'store_name': f"{display_name}'s Store",
                 'slug': slugify(display_name),
-                'brand_color': '#0A3029'
+                'brand_color': '#0A3029',
+                'shipping_days': _default_shipping_days(),
             }
         )
         return profile, created
@@ -28,7 +44,7 @@ class SellerProfile(models.Model):
     brand_color = models.CharField(max_length=7, default='#0A3029')
     bio = models.TextField(blank=True, null=True)
     tagline = models.CharField(max_length=255, blank=True, null=True)
-    
+
     gst_number = models.CharField(max_length=15, blank=True, null=True)
     gst_document_url = models.URLField(max_length=1000, blank=True, null=True)
 
@@ -38,7 +54,7 @@ class SellerProfile(models.Model):
     payout_account = models.CharField(max_length=500, blank=True, null=True)
     ifsc_code = models.CharField(max_length=500, blank=True, null=True)
     account_holder_name = models.CharField(max_length=255, blank=True, null=True)
-    
+
     location_city = models.CharField(max_length=100, blank=True, null=True)
     location_state = models.CharField(max_length=100, blank=True, null=True)
     location_pincode = models.CharField(max_length=10, blank=True, null=True)
@@ -49,24 +65,32 @@ class SellerProfile(models.Model):
         max_length=100, blank=True, null=True,
         help_text="Shiprocket pickup location name (auto-set on first shipment)"
     )
-    
+
     # Authenticity & Skill Showcase
     expertise_tags = models.JSONField(default=list, blank=True)
     infrastructure_details = models.TextField(blank=True, null=True)
     experience_years = models.PositiveIntegerField(default=0)
     identity_verified = models.BooleanField(default=False)
-    
+
     # Promotion & Carousel Control
     is_featured = models.BooleanField(default=False)
     sort_order = models.PositiveIntegerField(default=0)
-    
+
     total_sales = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     rating = models.DecimalField(max_digits=3, decimal_places=1, default=5.0)
-    
-    # Shipping schedule: list of weekday ints (0=Monday … 6=Sunday)
+
+    # Shipping schedule: list of weekday ints (0=Monday … 6=Sunday).
+    # Defaults to Mon/Wed/Fri so new sellers can sell immediately even if they
+    # skip the dispatch-days step during onboarding.
     shipping_days = models.JSONField(
-        default=list, blank=True,
-        help_text='Weekdays the seller ships: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun',
+        default=_default_shipping_days, blank=True,
+        help_text='Weekdays the seller ships: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun. Defaults to Mon/Wed/Fri.',
+    )
+
+    # Orders placed on a shipping day before this time ship that day; after, they roll over.
+    daily_cutoff_time = models.TimeField(
+        default=time(12, 0),
+        help_text='Daily order cut-off (IST). Orders placed on a shipping day after this time roll to next shipping day.',
     )
 
     is_active = models.BooleanField(default=True)
@@ -74,21 +98,90 @@ class SellerProfile(models.Model):
 
     objects = SellerProfileManager()
 
-    def get_next_shipping_date(self):
-        """Return the nearest upcoming date (today included) when this seller ships."""
+    def _blackout_dates(self):
+        """Set of all individual dates currently blacked out for this seller."""
+        out = set()
+        # Avoid touching DB before the related table exists (e.g. during migrations / fresh installs)
+        try:
+            ranges = list(self.blackout_dates.all().values('start_date', 'end_date'))
+        except Exception:
+            return out
+        for r in ranges:
+            d = r['start_date']
+            end = r['end_date']
+            while d <= end:
+                out.add(d)
+                d += timedelta(days=1)
+        return out
+
+    def get_next_shipping_date(self, as_of=None):
+        """
+        Return the nearest upcoming date this seller will actually dispatch.
+
+        Honors:
+          - shipping_days (which weekdays they ship)
+          - daily_cutoff_time (if today is a shipping day but it's past the cut-off, roll forward)
+          - blackout dates (vacation / OOO — skip them)
+
+        as_of: datetime in project TZ (Asia/Kolkata). Defaults to now().
+        Returns a date, or None if no shipping_days configured.
+        """
         days = sorted(set(d for d in (self.shipping_days or []) if isinstance(d, int) and 0 <= d <= 6))
         if not days:
             return None
-        today = date.today()
-        current_weekday = today.weekday()  # 0=Monday
-        for day in days:
-            if day >= current_weekday:
-                return today + timedelta(days=day - current_weekday)
-        # Wrap to next week
-        return today + timedelta(days=7 - current_weekday + days[0])
+
+        if as_of is None:
+            as_of = timezone.localtime()
+        elif timezone.is_naive(as_of):
+            as_of = timezone.make_aware(as_of)
+        else:
+            as_of = timezone.localtime(as_of)
+
+        today = as_of.date()
+        now_t = as_of.time()
+        cutoff = self.daily_cutoff_time or time(12, 0)
+        blackouts = self._blackout_dates()
+
+        for offset in range(MAX_SHIPPING_LOOKAHEAD_DAYS):
+            candidate = today + timedelta(days=offset)
+            if candidate.weekday() not in days:
+                continue
+            if candidate in blackouts:
+                continue
+            # Same-day shipping only if it's before cutoff
+            if offset == 0 and now_t >= cutoff:
+                continue
+            return candidate
+        return None
 
     def __str__(self):
         return self.store_name
+
+
+class SellerBlackoutDate(models.Model):
+    """A range of dates the seller will not ship (vacation, sick, OOO)."""
+    seller = models.ForeignKey(
+        SellerProfile, on_delete=models.CASCADE, related_name='blackout_dates'
+    )
+    start_date = models.DateField()
+    end_date = models.DateField(help_text='Inclusive — last unavailable day')
+    reason = models.CharField(max_length=200, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['start_date']
+        indexes = [models.Index(fields=['seller', 'start_date'])]
+        verbose_name = 'Seller Blackout Date'
+        verbose_name_plural = 'Seller Blackout Dates'
+
+    def __str__(self):
+        return f'{self.seller.store_name}: {self.start_date} → {self.end_date}'
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if self.end_date < self.start_date:
+            raise ValidationError({'end_date': 'end_date must be on or after start_date'})
+
 
 class SellerShippingConfig(models.Model):
     """

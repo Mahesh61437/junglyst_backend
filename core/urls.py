@@ -9,7 +9,8 @@ from .views import (
     ImageUploadView, GrowerProductCreateView, AdminProductCreateView,
     ProductCopyView, ProductBulkActionView, SyncCartView, WishlistView, HomeDataView,
     ForgotPasswordView, ResetPasswordView,
-    BugReportListCreateView, BugReportDetailView
+    BugReportListCreateView, BugReportDetailView,
+    PublicConfigurationView, ConfigurationAdminView, ConfigurationAdminDetailView
 )
 
 urlpatterns = [
@@ -55,4 +56,9 @@ urlpatterns = [
     # Bug Reports
     path('bug-reports/', BugReportListCreateView.as_view(), name='bug_report_list'),
     path('bug-reports/<uuid:pk>/', BugReportDetailView.as_view(), name='bug_report_detail'),
+
+    # Configuration — generic key/value settings
+    path('config/public/<str:name>/', PublicConfigurationView.as_view(), name='config_public'),
+    path('config/', ConfigurationAdminView.as_view(), name='config_list'),
+    path('config/<str:name>/', ConfigurationAdminDetailView.as_view(), name='config_detail'),
 ]

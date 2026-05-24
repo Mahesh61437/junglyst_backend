@@ -6,8 +6,11 @@ from django.db.models import Sum, Count, Q
 logger = logging.getLogger(__name__)
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
-from .models import SellerProfile, AllowedSeller, SellerShippingConfig, ShippingDefaultConfig
-from .serializers import SellerProfileSerializer
+from .models import (
+    SellerProfile, AllowedSeller, SellerShippingConfig,
+    ShippingDefaultConfig, SellerBlackoutDate,
+)
+from .serializers import SellerProfileSerializer, SellerBlackoutDateSerializer
 from .encryption import encrypt_field, decrypt_field, mask_account
 from django.utils.text import slugify
 
@@ -101,7 +104,19 @@ class GrowerDashboardView(generics.GenericAPIView):
                 "shiprocket_pickup_location": profile.shiprocket_pickup_location,
                 "rating": str(profile.rating),
                 "total_sales": str(profile.total_sales),
-                "shipping_days": profile.shipping_days or []
+                "shipping_days": profile.shipping_days or [],
+                "daily_cutoff_time": profile.daily_cutoff_time.strftime('%H:%M') if profile.daily_cutoff_time else '12:00',
+                "next_shipping_date": (profile.get_next_shipping_date().isoformat()
+                                       if profile.get_next_shipping_date() else None),
+                "blackout_dates": [
+                    {
+                        "id": b.id,
+                        "start_date": b.start_date.isoformat(),
+                        "end_date": b.end_date.isoformat(),
+                        "reason": b.reason or '',
+                    }
+                    for b in profile.blackout_dates.all()
+                ],
             }
         }
         
@@ -194,6 +209,21 @@ class GrowerDashboardView(generics.GenericAPIView):
             days = data.get('shipping_days')
             if isinstance(days, list):
                 profile.shipping_days = [int(d) for d in days if isinstance(d, (int, float)) and 0 <= int(d) <= 6]
+
+        if 'daily_cutoff_time' in data:
+            cutoff_raw = (data.get('daily_cutoff_time') or '').strip()
+            from datetime import time as _time
+            parsed = None
+            for fmt in ('%H:%M', '%H:%M:%S'):
+                try:
+                    from datetime import datetime as _dt
+                    parsed = _dt.strptime(cutoff_raw, fmt).time()
+                    break
+                except (ValueError, TypeError):
+                    continue
+            if parsed is None:
+                return Response({"error": "daily_cutoff_time must be HH:MM (24-hour)."}, status=400)
+            profile.daily_cutoff_time = parsed
 
         profile.save()
 
@@ -869,4 +899,67 @@ class SellerShippingConfigDetailView(generics.GenericAPIView):
         if not cfg:
             return Response({'error': 'Not found'}, status=404)
         cfg.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── Blackout dates (vacation / OOO) — seller self-serve ──────────────────────
+
+class SellerBlackoutListCreateView(generics.GenericAPIView):
+    """
+    GET  /api/sellers/blackouts/  — list current seller's upcoming blackouts
+    POST /api/sellers/blackouts/  — create a blackout range
+        body: { start_date: 'YYYY-MM-DD', end_date: 'YYYY-MM-DD', reason?: str }
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def _require_grower(self, user):
+        if user.role not in ('grower', 'admin'):
+            return Response({"error": "Access denied"}, status=403)
+        return None
+
+    def _profile(self, user):
+        try:
+            return user.seller_profile
+        except SellerProfile.DoesNotExist:
+            return None
+
+    def get(self, request):
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        profile = self._profile(request.user)
+        if not profile:
+            return Response({"error": "Seller profile not found"}, status=404)
+        # Hide past blackouts to keep the list focused
+        from django.utils import timezone as _tz
+        today = _tz.localdate()
+        blackouts = profile.blackout_dates.filter(end_date__gte=today).order_by('start_date')
+        return Response(SellerBlackoutDateSerializer(blackouts, many=True).data)
+
+    def post(self, request):
+        denied = self._require_grower(request.user)
+        if denied:
+            return denied
+        profile = self._profile(request.user)
+        if not profile:
+            return Response({"error": "Seller profile not found"}, status=404)
+        serializer = SellerBlackoutDateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save(seller=profile)
+        return Response(SellerBlackoutDateSerializer(instance).data, status=201)
+
+
+class SellerBlackoutDestroyView(generics.GenericAPIView):
+    """DELETE /api/sellers/blackouts/<pk>/ — remove a blackout range."""
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def delete(self, request, pk):
+        if request.user.role not in ('grower', 'admin'):
+            return Response({"error": "Access denied"}, status=403)
+        try:
+            profile = request.user.seller_profile
+            blackout = SellerBlackoutDate.objects.get(pk=pk, seller=profile)
+        except (SellerProfile.DoesNotExist, SellerBlackoutDate.DoesNotExist):
+            return Response({"error": "Blackout not found"}, status=404)
+        blackout.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)

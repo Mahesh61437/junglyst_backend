@@ -6,6 +6,7 @@ from .views import (
     SellerPromotionView, AdminSellerProfileEditView, BankDetailsView,
     SellerShippingConfigListCreateView, SellerShippingConfigDetailView,
     ShippingDefaultConfigView, SellerPickupAddressView, SellerPickupOTPView,
+    SellerBlackoutListCreateView, SellerBlackoutDestroyView,
 )
 
 urlpatterns = [
@@ -20,6 +21,8 @@ urlpatterns = [
     path('pickup-address/', SellerPickupAddressView.as_view(), name='seller_pickup_address'),
     path('pickup-address/register/', SellerPickupAddressView.as_view(), name='seller_pickup_register'),
     path('pickup-address/otp/', SellerPickupOTPView.as_view(), name='seller_pickup_otp'),
+    path('blackouts/', SellerBlackoutListCreateView.as_view(), name='seller_blackouts'),
+    path('blackouts/<int:pk>/', SellerBlackoutDestroyView.as_view(), name='seller_blackout_delete'),
     path('check-approval/', CheckSellerApprovalView.as_view(), name='check_seller_approval'),
     path('check-email/', CheckEmailAllowedView.as_view(), name='check_email_allowed'),
     path('platform-stats/', PlatformStatsView.as_view(), name='platform_stats'),

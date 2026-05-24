@@ -6,6 +6,7 @@ from datetime import datetime, timezone as dt_timezone
 from .models import CompetitionEntry
 from .serializers import CompetitionEntrySerializer
 from core.storage import upload_to_firebase
+from core.config_utils import get_config
 
 LAUNCH_DATE = datetime(2026, 5, 25, 0, 0, 0, tzinfo=dt_timezone.utc)
 MAX_ENTRIES = 500
@@ -21,6 +22,9 @@ class CompetitionStatusView(APIView):
 
         winner = CompetitionEntry.objects.filter(is_winner=True).first()
 
+        settings_data = get_config('competition_settings') or {}
+        result_announcement_date = settings_data.get('result_announcement_date')
+
         return Response({
             'launch_date': LAUNCH_DATE.isoformat(),
             'is_open': is_open,
@@ -32,6 +36,7 @@ class CompetitionStatusView(APIView):
             'winner': {'name': winner.name} if winner else None,
             'prize_amount': 1000,
             'prize_currency': 'INR',
+            'result_announcement_date': result_announcement_date,
         })
 
 

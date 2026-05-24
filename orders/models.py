@@ -82,6 +82,11 @@ class SubOrder(SoftDeleteModel):
     confirmed_at = models.DateTimeField(null=True, blank=True)
     dispatch_deadline = models.DateTimeField(null=True, blank=True)  # confirmed_at + 48 h
 
+    # Snapshot of the shipping promise shown to the buyer at checkout
+    promised_ship_date = models.DateField(null=True, blank=True)
+    promised_delivery_min = models.DateField(null=True, blank=True)
+    promised_delivery_max = models.DateField(null=True, blank=True)
+
     # Packaging photos (stored as JSON list of URLs)
     packaging_photos = models.JSONField(default=list)
 
