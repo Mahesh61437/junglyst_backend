@@ -8,6 +8,9 @@ class CartSellerSerializer(serializers.Serializer):
     id = serializers.UUIDField()
     store_name = serializers.SerializerMethodField()
     shipping_days = serializers.SerializerMethodField()
+    daily_cutoff_time = serializers.SerializerMethodField()
+    blackout_dates = serializers.SerializerMethodField()
+    next_shipping_date = serializers.SerializerMethodField()
     slug = serializers.SerializerMethodField()
 
     def get_slug(self, obj):
@@ -27,6 +30,29 @@ class CartSellerSerializer(serializers.Serializer):
             return obj.seller_profile.shipping_days or []
         except Exception:
             return []
+
+    def get_daily_cutoff_time(self, obj):
+        try:
+            t = obj.seller_profile.daily_cutoff_time
+            return t.strftime('%H:%M') if t else '12:00'
+        except Exception:
+            return '12:00'
+
+    def get_blackout_dates(self, obj):
+        try:
+            return [
+                {'start_date': b.start_date.isoformat(), 'end_date': b.end_date.isoformat()}
+                for b in obj.seller_profile.blackout_dates.all()
+            ]
+        except Exception:
+            return []
+
+    def get_next_shipping_date(self, obj):
+        try:
+            d = obj.seller_profile.get_next_shipping_date()
+            return d.isoformat() if d else None
+        except Exception:
+            return None
 
 
 class CartImageSerializer(serializers.Serializer):

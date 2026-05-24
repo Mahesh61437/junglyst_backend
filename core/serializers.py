@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from core.models import (
-    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview
+    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview, Configuration
 )
 from cart.models import Cart, CartItem
 
@@ -51,7 +51,22 @@ class PublicSellerProfileSerializer(serializers.Serializer):
     is_featured = serializers.BooleanField()
     rating = serializers.CharField()
     shipping_days = serializers.JSONField()
+    daily_cutoff_time = serializers.SerializerMethodField()
+    blackout_dates = serializers.SerializerMethodField()
     next_shipping_date = serializers.SerializerMethodField()
+
+    def get_daily_cutoff_time(self, obj):
+        t = getattr(obj, 'daily_cutoff_time', None)
+        return t.strftime('%H:%M') if t else '12:00'
+
+    def get_blackout_dates(self, obj):
+        try:
+            return [
+                {'start_date': b.start_date.isoformat(), 'end_date': b.end_date.isoformat()}
+                for b in obj.blackout_dates.all()
+            ]
+        except Exception:
+            return []
 
     def get_next_shipping_date(self, obj):
         try:
@@ -146,6 +161,26 @@ class TagSerializer(serializers.ModelSerializer):
     class Meta:
         model = Tag
         fields = '__all__'
+
+
+class ConfigurationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Configuration
+        fields = ('id', 'name', 'data', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'created_at', 'updated_at')
+
+    def validate_name(self, value):
+        value = (value or '').strip()
+        if not value:
+            raise serializers.ValidationError('Name is required.')
+        return value
+
+    def validate_data(self, value):
+        if value is None:
+            return {}
+        if not isinstance(value, (dict, list)):
+            raise serializers.ValidationError('Data must be a JSON object or array.')
+        return value
 
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)

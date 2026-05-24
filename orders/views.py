@@ -17,7 +17,7 @@ from cart.models import Cart
 from core.models import ProductVariant
 from shipping.models import ShippingAddress
 from shipping.serializers import ShippingAddressSerializer
-from shipping.pincode_zones import classify_pincode
+from shipping.pincode_zones import classify_pincode, transit_days_for_zone
 from shipping.services import check_pincode_deliverable
 from notifications.models import AppNotification
 from payments.models import Payment
@@ -211,6 +211,34 @@ class CheckoutView(generics.GenericAPIView):
         if len(seller_buckets) > 3:
             return Response({"error": "Cart supports up to 3 sellers. Please remove items."}, status=400)
 
+        # Shipping availability: snapshot each seller's next dispatch date.
+        # Empty shipping_days isn't blocking — model defaults to Mon/Wed/Fri at
+        # creation and existing rows are backfilled. We still guard the rare
+        # case where every upcoming day is blacked out, since that means the
+        # seller genuinely can't ship anything for the next 90 days.
+        from sellers.models import _default_shipping_days
+        for sid, bucket in seller_buckets.items():
+            seller_user = bucket['seller']
+            try:
+                seller_profile = seller_user.seller_profile
+            except Exception:
+                seller_profile = None
+            store = (seller_profile.store_name if seller_profile else 'A seller in your cart')
+            if seller_profile and not (seller_profile.shipping_days or []):
+                # Belt-and-braces — if somehow still empty in the DB, fall back to defaults
+                seller_profile.shipping_days = _default_shipping_days()
+                seller_profile.save(update_fields=['shipping_days'])
+            next_ship = seller_profile.get_next_shipping_date() if seller_profile else None
+            if not next_ship:
+                return Response({
+                    "error": f"{store} is on a break and not accepting orders right now. Please remove their items or try again later."
+                }, status=400)
+            bucket['next_shipping_date'] = next_ship
+
+        # Compute promised delivery range from the buyer's pincode zone
+        zone_for_eta = (classify_pincode(effective_pincode).get('zone') if effective_pincode else None)
+        min_transit, max_transit = transit_days_for_zone(zone_for_eta)
+
         # SHIP-003: min order check removed; accept all cart values
 
         # Resolve per-seller shipping configs in one query
@@ -258,6 +286,9 @@ class CheckoutView(generics.GenericAPIView):
 
         for idx, (sid, bucket) in enumerate(seller_buckets.items()):
             seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['shipping_config'])
+            promised_ship = bucket.get('next_shipping_date')
+            promised_min = (promised_ship + timedelta(days=min_transit)) if promised_ship else None
+            promised_max = (promised_ship + timedelta(days=max_transit)) if promised_ship else None
             sub_order = SubOrder.objects.create(
                 order=order,
                 sub_order_number=_sub_order_number(order_number, idx),
@@ -267,6 +298,9 @@ class CheckoutView(generics.GenericAPIView):
                 seller_total=bucket['subtotal'] + seller_shipping,
                 status='pending',
                 dispatch_deadline=dispatch_deadline,
+                promised_ship_date=promised_ship,
+                promised_delivery_min=promised_min,
+                promised_delivery_max=promised_max,
             )
 
             for item in bucket['items']:

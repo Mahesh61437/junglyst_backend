@@ -7,13 +7,13 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem
+from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem, Configuration
 from cart.models import Cart, CartItem
 from orders.models import Order
 from .serializers import (
     RegisterSerializer, CustomTokenObtainPairSerializer, UserSerializer,
     ProductSerializer, ProductListSerializer, ProductReviewSerializer, CategorySerializer, SubCategorySerializer,
-    CategoryShippingRateSerializer, CartSerializer
+    CategoryShippingRateSerializer, CartSerializer, ConfigurationSerializer
 )
 from .storage import upload_to_firebase
 
@@ -646,6 +646,46 @@ class ShippingRateAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CategoryShippingRateSerializer
     permission_classes = (IsAdminOrSuperAdmin,)
     queryset = CategoryShippingRate.objects.all()
+
+
+# ── Configuration — generic key/value settings ────────────────────────────────
+
+# Names that are safe to read without authentication (frontend may need them
+# to render public-facing copy like the competition result-announcement date).
+PUBLIC_CONFIGURATION_NAMES = {
+    'competition_settings',
+}
+
+
+class PublicConfigurationView(generics.GenericAPIView):
+    """Public read of a whitelisted configuration entry by name."""
+    permission_classes = (permissions.AllowAny,)
+    serializer_class = ConfigurationSerializer
+
+    def get(self, request, name):
+        if name not in PUBLIC_CONFIGURATION_NAMES:
+            return Response({'error': 'Configuration not publicly accessible.'}, status=404)
+        try:
+            config = Configuration.objects.get(name=name)
+        except Configuration.DoesNotExist:
+            return Response({'name': name, 'data': {}}, status=200)
+        return Response(ConfigurationSerializer(config).data)
+
+
+class ConfigurationAdminView(generics.ListCreateAPIView):
+    """List or create configuration entries. Super-admin only."""
+    serializer_class = ConfigurationSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+    queryset = Configuration.objects.all().order_by('name')
+
+
+class ConfigurationAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """Retrieve/update/delete a configuration by name. Super-admin only."""
+    serializer_class = ConfigurationSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+    queryset = Configuration.objects.all()
+    lookup_field = 'name'
+
 
 class ImageUploadView(generics.GenericAPIView):
     permission_classes = (permissions.IsAuthenticated,)

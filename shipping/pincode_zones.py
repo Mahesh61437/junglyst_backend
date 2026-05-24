@@ -136,3 +136,19 @@ def classify_pincode(pincode: str) -> dict:
         "city": None,
         "message": "Delivery available.",
     }
+
+
+# Zone → (min_transit_days, max_transit_days) after dispatch.
+# Must stay in sync with junglyst_frontend/src/context/CartContext.jsx::transitDays.
+_TRANSIT_DAYS = {
+    "A": (1, 2),
+    "B": (2, 3),
+    "C": (3, 5),
+    "D_whitelisted": (4, 6),
+}
+
+
+def transit_days_for_zone(zone: str | None) -> tuple[int, int]:
+    """Return (min_days, max_days) of carrier transit after dispatch."""
+    return _TRANSIT_DAYS.get(zone or "", (3, 5))
+

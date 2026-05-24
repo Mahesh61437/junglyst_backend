@@ -1,5 +1,21 @@
 from django.contrib import admin
-from .models import SellerProfile, AllowedSeller, SellerShippingConfig, ShippingDefaultConfig
+from .models import (
+    SellerProfile, AllowedSeller, SellerShippingConfig,
+    ShippingDefaultConfig, SellerBlackoutDate,
+)
+
+
+@admin.register(SellerBlackoutDate)
+class SellerBlackoutDateAdmin(admin.ModelAdmin):
+    list_display = ('seller', 'start_date', 'end_date', 'reason', 'created_at')
+    list_filter = ('start_date', 'end_date')
+    search_fields = ('seller__store_name', 'reason')
+    ordering = ('-start_date',)
+
+
+class SellerBlackoutInline(admin.TabularInline):
+    model = SellerBlackoutDate
+    extra = 0
 
 
 @admin.register(AllowedSeller)
@@ -31,6 +47,7 @@ class SellerProfileAdmin(admin.ModelAdmin):
     prepopulated_fields = {'slug': ('store_name',)}
     list_editable = ('is_featured', 'identity_verified', 'is_active')
     ordering = ('sort_order', '-created_at')
+    inlines = [SellerBlackoutInline]
 
     fieldsets = (
         ('Basic Information', {
@@ -43,8 +60,8 @@ class SellerProfileAdmin(admin.ModelAdmin):
             'fields': ('is_featured', 'sort_order', 'identity_verified', 'expertise_tags', 'experience_years')
         }),
         ('Shipping Schedule', {
-            'fields': ('shipping_days',),
-            'description': 'Select weekdays this seller ships. 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun. Example: [0, 2, 4] for Mon/Wed/Fri.',
+            'fields': ('shipping_days', 'daily_cutoff_time'),
+            'description': 'Select weekdays this seller ships. 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun. Example: [0, 2, 4] for Mon/Wed/Fri. Orders placed after daily_cutoff_time on a shipping day roll to the next shipping day.',
         }),
         ('Operations', {
             'fields': ('location_city', 'location_pincode', 'gst_number', 'gst_document_url')
