@@ -674,7 +674,27 @@ class PaymentStatusView(APIView):
                 url = f"https://api.razorpay.com/v1/orders/{razorpay_order_id}/payments"
                 r = req.get(url, auth=(key_id, key_secret), timeout=10)
                 if r.status_code == 200:
-                    for p in r.json().get('items', []):
+                    items = r.json().get('items', [])
+                    # Zero payment attempts at Razorpay = user closed the modal
+                    # without entering payment details. Mark cancelled so the
+                    # frontend can stop polling immediately.
+                    if not items:
+                        if payment.status not in ('captured', 'failed', 'cancelled'):
+                            payment.status = 'cancelled'
+                            payment.gateway_status = 'cancelled'
+                            payment.save(update_fields=['status', 'gateway_status', 'updated_at'])
+                            order = payment.order
+                            if order.status == 'pending':
+                                order.status = 'failed'
+                                order.payment_status = 'failed'
+                                order.save(update_fields=['status', 'payment_status', 'updated_at'])
+                            try:
+                                from payments.tasks import cancel_payment_checks
+                                cancel_payment_checks(payment.id)
+                            except Exception:
+                                pass
+                        return Response({"status": "cancelled"})
+                    for p in items:
                         pstatus = p.get('status', '')
                         if pstatus == 'captured':
                             try:
@@ -719,38 +739,6 @@ class CancelOrderView(APIView):
 
         return Response({'message': 'Order cancelled successfully'})
 
-
-class PaymentStatusView(APIView):
-    permission_classes = (permissions.AllowAny,)
-
-    def get(self, request):
-        razorpay_order_id = request.query_params.get('razorpay_order_id')
-        cashfree_order_id = request.query_params.get('cashfree_order_id')
-
-        if razorpay_order_id:
-            payment = Payment.objects.filter(razorpay_order_id=razorpay_order_id).select_related('order').first()
-        elif cashfree_order_id:
-            if not hasattr(Payment, 'cashfree_order_id'):
-                return Response(
-                    {"error": "Cashfree payment lookup is not available on this backend."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            payment = Payment.objects.filter(cashfree_order_id=cashfree_order_id).select_related('order').first()
-        else:
-            return Response(
-                {"error": "Provide razorpay_order_id or cashfree_order_id."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if not payment:
-            return Response({"error": "Payment not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        order = payment.order
-        if payment.status in ('captured', 'completed') or order.payment_status in ('captured', 'completed') or order.is_paid:
-            return Response({"status": "success", "order": OrderSerializer(order).data})
-        if payment.status in ('failed', 'cancelled'):
-            return Response({"status": "failed"})
-        return Response({"status": "processing"})
 
 class OrderListView(generics.ListAPIView):
     serializer_class = OrderListSerializer
