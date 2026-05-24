@@ -1,6 +1,9 @@
+import logging
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from django.db.models import Sum, Count, Q
+
+logger = logging.getLogger(__name__)
 from core.models import ProductVariant, Product
 from orders.models import OrderItem
 from .models import SellerProfile, AllowedSeller, SellerShippingConfig, ShippingDefaultConfig
@@ -579,8 +582,9 @@ class SellerShippingConfigListCreateView(generics.GenericAPIView):
             cfg.refresh_from_db()
             cfg.seller  # trigger select_related manually
             return Response(_config_to_dict(cfg), status=201 if created else 200)
-        except Exception as e:
-            return Response({'error': str(e)}, status=400)
+        except Exception:
+            logger.exception("Failed to upsert shipping config: data=%s", request.data)
+            return Response({'error': 'Failed to save shipping config. Check server logs.'}, status=400)
 
 
 class ShippingDefaultConfigView(generics.GenericAPIView):
@@ -618,8 +622,9 @@ class ShippingDefaultConfigView(generics.GenericAPIView):
                 setattr(cfg, field, request.data[field])
         try:
             cfg.save()
-        except Exception as e:
-            return Response({'error': str(e)}, status=400)
+        except Exception:
+            logger.exception("Failed to save ShippingDefaultConfig: data=%s", request.data)
+            return Response({'error': 'Failed to save default shipping config. Check server logs.'}, status=400)
         return Response(self._all_as_dict())
 
 

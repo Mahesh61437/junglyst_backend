@@ -319,10 +319,13 @@ class CheckoutView(generics.GenericAPIView):
                     "amount": total_amount,
                     "currency": "INR",
                 }, status=201)
-            except Exception as e:
-                print(f"DEBUG: Cashfree failed: {str(e)}")
+            except Exception:
+                # Log full traceback server-side; return a generic message to the
+                # client so we never echo exception text (which may contain URLs,
+                # request headers, or upstream API error bodies) into the browser.
+                logger.exception("Cashfree order initialization failed for order %s", order.order_number)
                 return Response({
-                    "error": f"Failed to initialize payment gateway: {str(e)}"
+                    "error": "Payment gateway is temporarily unavailable. Please try again in a moment."
                 }, status=400)
 
         # Razorpay
@@ -352,10 +355,10 @@ class CheckoutView(generics.GenericAPIView):
                 "amount": total_amount,
                 "currency": "INR",
             }, status=201)
-        except Exception as e:
-            print(f"DEBUG: Razorpay failed: {str(e)}")
+        except Exception:
+            logger.exception("Razorpay order initialization failed for order %s", order.order_number)
             return Response({
-                "error": f"Failed to initialize payment gateway: {str(e)}"
+                "error": "Payment gateway is temporarily unavailable. Please try again in a moment."
             }, status=400)
 
 class VerifyPaymentView(generics.GenericAPIView):

@@ -627,8 +627,12 @@ class ImageUploadView(generics.GenericAPIView):
         try:
             url = upload_to_firebase(file_obj, request.user.id, file_type)
             return Response({"url": url}, status=201)
-        except Exception as e:
-            return Response({"error": str(e)}, status=500)
+        except Exception:
+            # Firebase exceptions can include service-account paths or bucket
+            # internals — never echo them to the client.
+            import logging
+            logging.getLogger(__name__).exception("Firebase image upload failed for user %s", request.user.id)
+            return Response({"error": "Image upload failed. Please try again."}, status=500)
 
 class SyncCartView(generics.GenericAPIView):
     permission_classes = (permissions.IsAuthenticated,)

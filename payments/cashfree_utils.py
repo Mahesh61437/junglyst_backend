@@ -44,8 +44,10 @@ def create_cashfree_order(order_id, order_amount, customer_details, order_curren
     response = requests.post(url, json=payload, headers=headers, timeout=25)
     if response.status_code == 200:
         return response.json()
-    else:
-        raise Exception(f"Cashfree order creation failed: {response.text}")
+    # Status code only — body may include API key fragments or upstream details
+    # we don't want bubbling out to clients via str(exception). Caller is
+    # expected to log full response via logger.exception().
+    raise Exception(f"Cashfree order creation failed: HTTP {response.status_code}")
 
 def verify_cashfree_payment(order_id):
     """
