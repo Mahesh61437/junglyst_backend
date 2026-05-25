@@ -188,33 +188,36 @@ def _resolve_category(product: dict):
     
     mapped_subs = []
     
-    # 1. Mosses (aquatic vs terrarium)
-    if "Moss" in names_set:
-        if "Aquatic Plants" in names_set:
-            mapped_subs.append(("Plants", "Aquatic Moss"))
-        else:
-            mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+    # 1. Aquatic Mosses (e.g. Christmas Moss)
+    # Aquatic Mosses (e.g. Christmas Moss) → Plants > Aquatic Moss + Terrarium moss + Aquatic plants +  Terrarium & Paludarium
+    if "Moss" in names_set and "Aquatic Plants" in names_set:
+        mapped_subs.append(("Plants", "Aquatic Moss"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+        mapped_subs.append(("Plants", "Aquatic Plants"))
 
-    # 2. Rhizome plants
-    if "Rhizome plants" in names_set:
-        if "Exotic Plants" in names_set or "Premium" in names_set:
-            mapped_subs.append(("Plants", "Rare & Exotic"))
-        else:
-            mapped_subs.append(("Plants", "Aquatic Plants"))
+    # 2. Terrarium Mosses (e.g. Sheet/Mood Moss)
+    # Terrarium Mosses (e.g. Sheet/Mood Moss) → Terrarium & Paludarium > Terrarium moss + Plants
+    elif "Moss" in names_set:
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+        mapped_subs.append(("Plants", "Mosses"))
 
-    # 3. Aquatic Plants (other than Rhizome/Moss already matched)
-    if "Aquatic Plants" in names_set:
-        is_already_matched = any(c == "Plants" for c, _ in mapped_subs)
-        if not is_already_matched:
-            if "Exotic Plants" in names_set or "Premium" in names_set:
-                mapped_subs.append(("Plants", "Rare & Exotic"))
-            else:
-                mapped_subs.append(("Plants", "Aquatic Plants"))
+    # 3. Rare/Exotic Rhizomes & Aquatic Plants (e.g. Bucephalandra)
+    # Rare/Exotic Rhizomes & Aquatic Plants (e.g. Bucephalandra) → Plants > Rare & Exotic + Aquatic plants + Terrarium & Paludarium
+    elif ("Rhizome plants" in names_set or "Aquatic Plants" in names_set) and ("Exotic Plants" in names_set or "Premium" in names_set):
+        mapped_subs.append(("Plants", "Rare & Exotic"))
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
 
-    # 4. Exotic/Indoor/Terrarium Plants (non-aquatic or dual-purpose)
-    if "Exotic Plants" in names_set or "Indoor Plants" in names_set or "Terrarium Plants" in names_set:
-        if "Moss" not in names_set:
-            mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+    # 4. Standard Rhizomes & Aquatic Plants (e.g. Anubias)
+    # Standard Rhizomes & Aquatic Plants (e.g. Anubias) → Plants > Aquatic Plants + Terrarium & Paludarium
+    elif "Rhizome plants" in names_set or "Aquatic Plants" in names_set:
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # 5. Exotic/Indoor/Terrarium Plants (Non-Aquatic) (e.g. Peperomia, Fittonia, Ferns)
+    # Exotic/Indoor/Terrarium Plants (Non-Aquatic) (e.g. Peperomia, Fittonia, Ferns) → Terrarium & Paludarium > Terrarium Plants
+    elif "Exotic Plants" in names_set or "Indoor Plants" in names_set or "Terrarium Plants" in names_set:
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
 
     # Deduplicate mapped_subs
     mapped_subs = list(dict.fromkeys(mapped_subs))
