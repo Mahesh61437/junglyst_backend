@@ -186,7 +186,7 @@ class CheckoutView(generics.GenericAPIView):
 
         # Stock check + group items by seller
 
-        seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy}
+        seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
         for item in cart_items:
             if item.quantity > item.variant.stock:
                 return Response({
@@ -200,12 +200,16 @@ class CheckoutView(generics.GenericAPIView):
                     'items': [],
                     'subtotal': 0,
                     'has_heavy': False,
+                    'has_light': False,
                 }
             price = float(item.variant.price) * item.quantity
             seller_buckets[sid]['items'].append(item)
             seller_buckets[sid]['subtotal'] += price
+            # Track both light and heavy items to detect hybrid carts
             if item.variant.item_category == 'heavy':
                 seller_buckets[sid]['has_heavy'] = True
+            elif item.variant.item_category == 'light':
+                seller_buckets[sid]['has_light'] = True
 
         # SHIP-003: max 3 sellers
         if len(seller_buckets) > 3:
@@ -244,7 +248,14 @@ class CheckoutView(generics.GenericAPIView):
         # Resolve per-seller shipping configs in one query
         shipping_config_map = _build_shipping_config_map(seller_buckets.keys())
         for sid, bucket in seller_buckets.items():
-            cat = 'heavy' if bucket['has_heavy'] else 'light'
+            # Determine shipping category: hybrid if both light and heavy, else heavy or light
+            if bucket['has_light'] and bucket['has_heavy']:
+                cat = 'hybrid'
+            elif bucket['has_heavy']:
+                cat = 'heavy'
+            else:
+                cat = 'light'
+            bucket['shipping_category'] = cat
             bucket['shipping_config'] = shipping_config_map.get((sid, cat))
 
         # Totals

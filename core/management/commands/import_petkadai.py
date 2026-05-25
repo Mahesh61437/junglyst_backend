@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import json
+import uuid
 import mimetypes
 import os
 import time
@@ -55,15 +56,13 @@ DEFAULT_JSON = os.path.normpath(
 REQUEST_TIMEOUT   = 30
 RETRY_DELAY       = 2
 
-DEFAULT_GST_RATE        = Decimal("12.00")   # standard GST for live plants
+DEFAULT_GST_RATE        = Decimal("0.00")    # scraped prices already include GST
 DEFAULT_COMMISSION_RATE = Decimal("10.00")   # platform commission
 DEFAULT_WEIGHT_KG       = Decimal("0.10")    # TC / bunch plants are very light
 DEFAULT_LENGTH_CM       = Decimal("15.0")
 DEFAULT_WIDTH_CM        = Decimal("10.0")
 DEFAULT_HEIGHT_CM       = Decimal("5.0")
 DEFAULT_PACKED_WEIGHT_G = 100               # grams, packed for shipping
-
-JUNGLYST_CATEGORY = "Aquascaping"           # parent category (must exist in DB)
 
 # petkadai sub_category_name → JungLyst SubCategory display name
 # Keys are lowercased for case-insensitive matching
@@ -80,6 +79,10 @@ SUBCAT_DISPLAY: dict[str, str] = {
     "cutting":        "Cuttings",
     "moss":           "Mosses",
     "floating":       "Floating Plants",
+    "colorful fishes": "Colorful Fishes",
+    "betta fish":      "Betta Fish",
+    "led lights":      "LED Lights",
+    "aquarium planted lights": "LED Lights",
 }
 
 
@@ -146,10 +149,21 @@ def _safe_slug(name: str, existing: set[str], max_len: int = 110) -> str:
 
 # ── SubCategory resolution ─────────────────────────────────────────────────────
 
-def _resolve_subcat_display(raw_name: str | None) -> str:
+def _resolve_subcat_display(raw_name: str | None, cat_name: str) -> str:
     """Map petkadai sub_category_name to a clean JungLyst display name."""
     if not raw_name:
-        return "Live Plants"
+        defaults = {
+            "Plants": "Live Plants",
+            "Fish & Aquarium Care": "Fish Food",
+            "Aquarium Accessories": "Tank Accessories",
+            "Aquarium Filters": "Internal Filters",
+            "Aquascaping": "Starter Packs",
+            "Aquarium Tanks": "Moulded Tanks",
+            "Aquarium Lights": "LED Lights",
+            "Brand & Specialized": "DOOA System",
+        }
+        return defaults.get(cat_name, "General")
+
     lower = raw_name.lower()
     for key, display in SUBCAT_DISPLAY.items():
         if key in lower:
@@ -237,15 +251,8 @@ class Command(BaseCommand):
         seller = self._resolve_seller(User, options["seller_id"])
         self.stdout.write(f"Seller  : {seller.email}  (id={seller.id})")
 
-        # ── Parent category (must exist — run seed_categories first) ───────────
-        try:
-            cat = Category.objects.get(name=JUNGLYST_CATEGORY)
-        except Category.DoesNotExist:
-            raise CommandError(
-                f"Category '{JUNGLYST_CATEGORY}' not found.\n"
-                "Run:  python manage.py seed_categories"
-            )
-        self.stdout.write(f"Category: {cat.name}\n")
+        # ── Category Cache ─────────────────────────────────────────────────────
+        category_cache: dict[str, Category] = {}
 
         # ── Pre-fetch all existing slugs to avoid collision queries in loop ────
         existing_slugs: set[str] = set(
@@ -265,6 +272,28 @@ class Command(BaseCommand):
                 self.stderr.write(self.style.ERROR(f"  [{idx}] Skipping — no name in record."))
                 errors += 1
                 continue
+
+            # Resolve Category
+            cat_names = product_data.get("categories", [])
+            cat_name = cat_names[0] if cat_names else "Aquascaping"
+
+            if cat_name not in category_cache:
+                try:
+                    category_cache[cat_name] = Category.objects.get(name=cat_name)
+                except Category.DoesNotExist:
+                    # Auto-create missing categories
+                    base_slug = slugify(cat_name) or "category"
+                    cat_slug = base_slug
+                    n = 1
+                    while Category.all_objects.filter(slug=cat_slug).exists():
+                        cat_slug = f"{base_slug}-{n}"
+                        n += 1
+                        
+                    cat = Category.objects.create(name=cat_name, slug=cat_slug)
+                    self.stdout.write(self.style.WARNING(f"    Auto-created Category: {cat.name}"))
+                    category_cache[cat_name] = cat
+            
+            cat = category_cache[cat_name]
 
             # Collision-safe slug
             slug = _safe_slug(name, existing_slugs)
@@ -404,7 +433,7 @@ class Command(BaseCommand):
 
         # ── Resolve SubCategory (auto-create if missing) ───────────────────────
         raw_sub_name  = product_data.get("sub_category_name")
-        sub_display   = _resolve_subcat_display(raw_sub_name)
+        sub_display   = _resolve_subcat_display(raw_sub_name, cat.name)
         sub           = self._get_or_create_subcat(SubCategory, cat, sub_display)
 
         # ── Idempotency check ──────────────────────────────────────────────────
@@ -479,6 +508,17 @@ class Command(BaseCommand):
         )
 
         variant_qs = ProductVariant.all_objects.filter(product=product, name=vname)
+        
+        # Ensure SKU uniqueness across the entire DB to prevent IntegrityError
+        if sku:
+            if variant_qs.exists():
+                existing_variant = variant_qs.first()
+                if ProductVariant.all_objects.filter(sku=sku).exclude(id=existing_variant.id).exists():
+                    sku = f"{sku}-{uuid.uuid4().hex[:6]}"
+            else:
+                if ProductVariant.all_objects.filter(sku=sku).exists():
+                    sku = f"{sku}-{uuid.uuid4().hex[:6]}"
+
         if variant_qs.exists():
             variant                  = variant_qs.first()
             variant.variant_type     = vtype
@@ -522,36 +562,38 @@ class Command(BaseCommand):
         img_ok = img_fail = 0
 
         if images_data:
+            has_existing_images = False
             if action == "updated":
-                # Clear old images before re-importing
-                ProductImage.all_objects.filter(product=product).delete()
+                has_existing_images = ProductImage.all_objects.filter(product=product).exists()
 
-            seen: set[str] = set()
-            for img_rec in images_data:
-                src_url = img_rec.get("image_url") or ""
-                if not src_url or src_url in seen:
-                    continue
-                seen.add(src_url)
+            # Skip image processing entirely if the product already has images
+            if not has_existing_images:
+                seen: set[str] = set()
+                for img_rec in images_data:
+                    src_url = img_rec.get("image_url") or ""
+                    if not src_url or src_url in seen:
+                        continue
+                    seen.add(src_url)
 
-                order      = int(img_rec.get("order", 0))
-                is_primary = bool(img_rec.get("is_primary", order == 0))
+                    order      = int(img_rec.get("order", 0))
+                    is_primary = bool(img_rec.get("is_primary", order == 0))
 
-                if skip_images:
-                    # Store petkadai CDN URL directly (no Firebase re-upload)
-                    final_url = src_url
-                else:
-                    final_url = self._upload_image(src_url, seller.id, upload_fn)
+                    if skip_images:
+                        # Store petkadai CDN URL directly (no Firebase re-upload)
+                        final_url = src_url
+                    else:
+                        final_url = self._upload_image(src_url, seller.id, upload_fn)
 
-                if final_url:
-                    ProductImage.objects.create(
-                        product    = product,
-                        variant    = variant,
-                        image_url  = final_url,
-                        is_primary = is_primary,
-                        order      = order,
-                    )
-                    img_ok += 1
-                else:
-                    img_fail += 1
+                    if final_url:
+                        ProductImage.objects.create(
+                            product    = product,
+                            variant    = variant,
+                            image_url  = final_url,
+                            is_primary = is_primary,
+                            order      = order,
+                        )
+                        img_ok += 1
+                    else:
+                        img_fail += 1
 
         return action, img_ok, img_fail

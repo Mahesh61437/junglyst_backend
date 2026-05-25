@@ -283,12 +283,13 @@ class ProductVariant(SoftDeleteModel):
     class ItemCategory(models.TextChoices):
         LIGHT = 'light', 'Light Item'
         HEAVY = 'heavy', 'Heavy Item'
+        HYBRID = 'hybrid', 'Hybrid (Light + Heavy)'
 
     item_category = models.CharField(
         max_length=10,
         choices=ItemCategory.choices,
         default=ItemCategory.LIGHT,
-        help_text="Light: plants/moss/isopods. Heavy: rocks/substrate/hardscape.",
+        help_text="Light: plants/moss/isopods. Heavy: rocks/substrate/hardscape. Hybrid: mixed items.",
     )
     packed_weight_grams = models.PositiveIntegerField(
         null=True, blank=True,
