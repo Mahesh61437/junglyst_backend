@@ -56,11 +56,25 @@ class CartViewSet(viewsets.ModelViewSet):
             return Response({"error": "variant_id is required"}, status=400)
             
         try:
-            variant = ProductVariant.objects.get(id=variant_id)
+            variant = ProductVariant.objects.select_related('product').get(id=variant_id)
         except ProductVariant.DoesNotExist:
             return Response({"error": "Variant not found"}, status=404)
-            
+
         cart = self.get_cart(request)
+
+        # SHIP-003: enforce the 3-seller cap server-side. The frontend has an
+        # optimistic check, but it loses races, can be skipped by the guest→login
+        # cart merge in syncCartWithBackend, and is bypassed by any direct API call.
+        # Only checkout previously enforced this, which let buyers accumulate carts
+        # they couldn't actually place. Cap here is the single source of truth.
+        incoming_seller_id = variant.product.seller_id
+        existing_seller_ids = set(
+            cart.items.exclude(variant=variant).values_list('product__seller_id', flat=True)
+        )
+        if incoming_seller_id not in existing_seller_ids and len(existing_seller_ids) >= 3:
+            return Response({
+                "error": "Your cart supports up to 3 sellers. Remove an item to add from a new seller."
+            }, status=400)
 
         # Use all_objects to handle soft-deleted items (unique constraint includes deleted rows)
         try:
