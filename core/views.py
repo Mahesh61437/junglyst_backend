@@ -1,5 +1,4 @@
 import uuid
-import datetime
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -24,79 +23,10 @@ from django.core.cache import cache
 import random
 from django.core.mail import send_mail
 from django.conf import settings
-from django.db import connection
-from django.db.models import Func, IntegerField
-from django.db.models.functions import Concat, Cast
-from django.db.models import Value, CharField
-
-
-class HashText(Func):
-    """PostgreSQL hashtext() — deterministic hash of any string to int."""
-    function = 'hashtext'
-    output_field = IntegerField()
-
-
-def _daily_seed_rand_order(queryset):
-    """
-    Returns queryset annotated with rand_order: a stable hash of (today's date + product id).
-    This produces the same scrambled order all day but changes nightly, so pagination is
-    consistent and sellers are naturally mixed across pages.
-    Falls back to random ordering on non-PostgreSQL (dev SQLite).
-    """
-    daily_seed = datetime.date.today().isoformat()
-    db_engine = connection.settings_dict.get('ENGINE', '')
-    if 'postgresql' in db_engine:
-        return queryset.annotate(
-            rand_order=HashText(
-                Concat(Value(daily_seed), Cast('id', output_field=CharField()))
-            )
-        ), 'rand_order'
-    # SQLite fallback for local dev — pagination is not stable but that's acceptable
-    return queryset, '?'
-
-
-def apply_fairness_engine(queryset, limit=500):
-    """
-    Applies the Multi-Vendor Fairness Engine to a queryset of products.
-    1. Fetches a candidate pool of up to `limit` products ordered by seller_id, -created_at.
-    2. Shuffles the candidate pool using Fisher-Yates.
-    3. Filters to ensure no seller dominates (MAX_PER_SELLER).
-    4. Stable-sorts in-stock products to the top.
-    """
-    # Fetch configured MAX_PER_SELLER from Configuration database if exists
-    max_per_seller = 2
-    try:
-        config_obj = Configuration.objects.filter(name='feed_settings').first()
-        if config_obj and 'max_per_seller' in config_obj.data:
-            max_per_seller = int(config_obj.data['max_per_seller'])
-    except Exception:
-        pass
-
-    # 1. Fetch candidate pool using indexed sorts
-    pool_qs = queryset.order_by('seller_id', '-created_at')[:limit]
-    candidate_pool = list(pool_qs)
-
-    # 2. In-Memory Randomization (Fisher-Yates Shuffle)
-    n = len(candidate_pool)
-    for i in range(n - 1, 0, -1):
-        j = random.randint(0, i)
-        candidate_pool[i], candidate_pool[j] = candidate_pool[j], candidate_pool[i]
-
-    # 3. Interleaving & Fairness Filter (Diversity Layer)
-    final_feed = []
-    seller_counts = {}
-
-    for product in candidate_pool:
-        s_id = product.seller_id
-        count = seller_counts.get(s_id, 0)
-        if count < max_per_seller:
-            final_feed.append(product)
-            seller_counts[s_id] = count + 1
-
-    # 4. Sort in-stock products first (stable sort)
-    final_feed.sort(key=lambda p: getattr(p, 'has_stock', False), reverse=True)
-
-    return final_feed
+from .feed import (
+    get_ordered_product_ids, get_filtered_ordered_ids,
+    get_sorted_feed, compute_sorted_feed, SORTABLE_FIELDS,
+)
 
 User = get_user_model()
 
@@ -335,28 +265,76 @@ class ProductListView(generics.ListAPIView):
 
         return queryset
 
+    # Query params that narrow the product set and require ID filtering.
+    # 'category'      → filter by Category name  (custom, comma-separated)
+    # 'categories'    → filter by Category ID     (DjangoFilterBackend)
+    # 'sub_categories'→ filter by SubCategory ID  (DjangoFilterBackend)
+    # 'sub_category_id'→ filter by SubCategory ID (custom)
+    _FILTER_PARAMS = frozenset({
+        'category', 'categories', 'sub_categories', 'sub_category_id',
+        'care_level', 'in_stock', 'min_price', 'max_price', 'search', 'is_rare',
+    })
+
     def filter_queryset(self, queryset):
-        """Always put in-stock products first; apply fairness engine unless bypassed."""
+        """In-stock first; seller-fair cached feed for the public shop."""
         qs = super().filter_queryset(queryset)
         params = self.request.query_params
-        
-        # Bypass fairness engine if there's an explicit ordering, seller filter, or search query.
-        if (params.get('ordering') or 
-            params.get('seller') or 
-            params.get('seller_slug') or 
-            params.get('search')):
-            ordering_param = params.get('ordering')
-            if ordering_param:
-                secondary = [f.strip() for f in ordering_param.split(',')]
-                return qs.order_by('-has_stock', *secondary)
+
+        ordering_param = params.get('ordering', '').strip()
+
+        # 1. Seller-scoped pages (seller dashboard / storefront) — newest first
+        if params.get('seller') or params.get('seller_slug'):
             return qs.order_by('-has_stock', '-created_at')
 
-        # Otherwise, apply Multi-Vendor Fairness Engine
-        return apply_fairness_engine(qs)
+        # 2. Explicit sort requested by the user
+        if ordering_param:
+            if ordering_param in SORTABLE_FIELDS:
+                # Use pre-warmed sorted+fair feed (seller-fair tiebreaking within
+                # equal-value groups, e.g. 1521 products all rated 5.0)
+                ordered_ids = get_sorted_feed(ordering_param)
+                if ordered_ids is None:
+                    # Cache cold — compute on the fly and store
+                    master = get_ordered_product_ids()
+                    ordered_ids = compute_sorted_feed(ordering_param, master)
+                # Narrow to filtered subset if any filters are active
+                active_filters = {k: params[k] for k in self._FILTER_PARAMS if params.get(k)}
+                if active_filters:
+                    valid_ids = frozenset(qs.values_list('id', flat=True))
+                    ordered_ids = [i for i in ordered_ids if i in valid_ids]
+                self._preordered_ids = ordered_ids
+                return qs
+            else:
+                # Unknown sort field — fall back to DB ordering (seller dashboard edge cases)
+                secondary = [f.strip() for f in ordering_param.split(',')]
+                return qs.order_by('-has_stock', *secondary)
+
+        # 3. Default public shop browse — seller-fair feed
+        active_filters = {k: params[k] for k in self._FILTER_PARAMS if params.get(k)}
+        if active_filters:
+            ordered_ids = get_filtered_ordered_ids(active_filters, qs)
+        else:
+            ordered_ids = get_ordered_product_ids()
+
+        self._preordered_ids = ordered_ids
+        return qs
 
     def paginate_queryset(self, queryset):
         if self.request.query_params.get('no_pagination'):
             return None
+
+        if hasattr(self, '_preordered_ids'):
+            # Paginate the Python ID list — DRF uses len() for total count
+            page_ids = self.paginator.paginate_queryset(
+                self._preordered_ids, self.request, view=self
+            )
+            if page_ids is None:
+                return None
+            # Fetch only these page_size products by primary key (indexed, fast)
+            id_to_pos = {pid: idx for idx, pid in enumerate(page_ids)}
+            products = list(queryset.filter(id__in=page_ids))
+            products.sort(key=lambda p: id_to_pos[p.id])
+            return products
+
         return super().paginate_queryset(queryset)
 
 class ProductReviewListCreateView(generics.ListCreateAPIView):
@@ -394,9 +372,49 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (permissions.IsAuthenticatedOrReadOnly,)
     lookup_field = 'id'
 
-    def get(self, request, *args, **kwargs):
-        return super().get(request, *args, **kwargs)
+    # ------------------------------------------------------------------ cache
+    _DETAIL_TTL    = 60 * 60 * 12   # 12 h — signals invalidate on any change
 
+    @staticmethod
+    def _detail_key(product_id: str) -> str:
+        return f'product:detail:{product_id}'
+
+    @staticmethod
+    def _slug_key(slug: str) -> str:
+        return f'product:slug_to_id:{slug}'
+
+    # ------------------------------------------------------------------ GET
+    def get(self, request, *args, **kwargs):
+        # Authenticated users (sellers, admins) always get fresh data
+        if request.user.is_authenticated:
+            return super().get(request, *args, **kwargs)
+
+        product_id = str(kwargs.get('id', ''))
+        slug       = kwargs.get('slug', '')
+
+        # Resolve slug → id via a tiny cache entry so we reuse the same data key
+        if not product_id and slug:
+            product_id = cache.get(self._slug_key(slug), '')
+
+        # Try the data cache
+        if product_id:
+            cached = cache.get(self._detail_key(product_id))
+            if cached is not None:
+                return Response(cached)
+
+        # Cache miss — hit the DB
+        product    = self.get_object()
+        serializer = self.get_serializer(product)
+        data       = serializer.data
+
+        pid = str(product.id)
+        cache.set(self._detail_key(pid), data, self._DETAIL_TTL)
+        if product.slug:
+            cache.set(self._slug_key(product.slug), pid, self._DETAIL_TTL)
+
+        return Response(data)
+
+    # ------------------------------------------------------------------ write
     def get_queryset(self):
         return _product_queryset()
 
@@ -406,12 +424,10 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
         return [permissions.AllowAny()]
 
     def perform_update(self, serializer):
-        # Ensure only the seller or admin can update
         product = self.get_object()
         if self.request.user != product.seller and self.request.user.role != 'admin':
             raise permissions.PermissionDenied("You do not have permission to edit this specimen.")
         instance = serializer.save()
-        # When archiving: zero out all variant stocks (keep images & prices intact)
         if not instance.is_active:
             instance.variants.all().update(stock=0)
 
@@ -904,11 +920,13 @@ class HomeDataView(generics.GenericAPIView):
             is_active=True, is_featured=True
         ).order_by('sort_order', '-rating')
 
-        from django.db.models import Exists, OuterRef
-        _home_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
-            has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
+        home_ids = get_ordered_product_ids()[:8]
+        id_to_pos = {pid: idx for idx, pid in enumerate(home_ids)}
+        _home_products = list(
+            _product_list_queryset().filter(is_active=True, is_draft=False, id__in=home_ids)
         )
-        products_qs = apply_fairness_engine(_home_qs)[:8]
+        _home_products.sort(key=lambda p: id_to_pos.get(p.id, 999))
+        products_qs = _home_products
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),

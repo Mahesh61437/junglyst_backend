@@ -487,8 +487,9 @@ class ProductListSerializer(serializers.ModelSerializer):
     image = serializers.SerializerMethodField()
     seller = serializers.SerializerMethodField()
     category_name = serializers.SerializerMethodField()
+    category = serializers.SerializerMethodField()
     price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
-    
+
     # We include minimal variant info for cart compatibility
     variants = serializers.SerializerMethodField()
     base_price = serializers.SerializerMethodField()
@@ -497,9 +498,9 @@ class ProductListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = (
-            'id', 'name', 'slug', 'scientific_name', 'care_level', 
+            'id', 'name', 'slug', 'scientific_name', 'care_level',
             'growth_rate', 'origin', 'is_rare', 'is_active',
-            'price', 'image', 'seller', 'category_name', 'rating',
+            'price', 'image', 'seller', 'category_name', 'category', 'rating',
             'variants', 'base_price', 'stock'
         )
 
@@ -546,6 +547,17 @@ class ProductListSerializer(serializers.ModelSerializer):
             return subcategories[0].name
         categories = obj.categories.all()
         return categories[0].name if categories else None
+
+    def get_category(self, obj):
+        # Always return the top-level (parent) category name, so the client
+        # can branch on it (e.g. show care_level only for "Aquatic Plants").
+        categories = obj.categories.all()
+        if categories:
+            return categories[0].name
+        subcategories = obj.sub_categories.all()
+        if subcategories:
+            return subcategories[0].category.name
+        return None
 
     def get_variants(self, obj):
         # Return only what ProductCard needs: id, price, stock, compare_at_price
