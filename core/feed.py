@@ -154,6 +154,86 @@ def compute_ordered_ids() -> list:
 # Public cache interface
 # ---------------------------------------------------------------------------
 
+# Maps the URL ordering param to (model_field, descending)
+# Only fields that make sense as public sort options live here.
+SORTABLE_FIELDS: dict = {
+    'rating':      ('rating',     False),
+    '-rating':     ('rating',     True),
+    'created_at':  ('created_at', False),
+    '-created_at': ('created_at', True),
+}
+
+
+def _sorted_feed_key(ordering_param: str) -> str:
+    """Redis key for a pre-computed sorted+fair feed."""
+    safe = ordering_param.lstrip('-').replace('_', '')
+    direction = 'desc' if ordering_param.startswith('-') else 'asc'
+    return f'shop:feed:sorted:{_feed_version()}:{safe}_{direction}'
+
+
+def get_sorted_feed(ordering_param: str) -> list | None:
+    """
+    Return a pre-warmed feed sorted by *ordering_param* with seller-fair
+    tiebreaking.  Returns None if not cached (caller should fall back to DB).
+    """
+    return cache.get(_sorted_feed_key(ordering_param))
+
+
+def compute_sorted_feed(ordering_param: str, master_ids: list) -> list:
+    """
+    Build a seller-fair sorted feed for one ordering param.
+
+    Products are sorted by the requested field.  Within equal-value groups
+    (e.g., 1521 products all rated 5.0) the seller-fair feed position is used
+    as the tiebreaker, so no single seller dominates a rating/price tier.
+    """
+    from .models import Product
+
+    field_name, descending = SORTABLE_FIELDS[ordering_param]
+    master_set = frozenset(master_ids)
+
+    rows = (
+        Product.objects
+        .filter(id__in=master_set)
+        .values('id', field_name)
+    )
+    field_values: dict = {}
+    for row in rows:
+        val = row[field_name]
+        try:
+            val = float(val) if val is not None else None
+        except (TypeError, ValueError):
+            val = None
+        field_values[row['id']] = val
+
+    id_to_pos = {pid: i for i, pid in enumerate(master_ids)}
+
+    def sort_key(pid):
+        val = field_values.get(pid)
+        # Push None values to the end regardless of direction
+        if val is None:
+            primary = float('inf')
+        else:
+            primary = -val if descending else val
+        return (primary, id_to_pos.get(pid, len(master_ids)))
+
+    return sorted(master_ids, key=sort_key)
+
+
+def prewarm_sorted_feeds(master_ids: list) -> dict:
+    """
+    Pre-compute and cache a sorted+fair feed for every ordering the frontend
+    exposes to users.  Called once per feed rebuild so first requests are cache hits.
+    """
+    ttl     = _ttl_until_midnight()
+    summary = {}
+    for ordering_param in SORTABLE_FIELDS:
+        sorted_ids = compute_sorted_feed(ordering_param, master_ids)
+        cache.set(_sorted_feed_key(ordering_param), sorted_ids, ttl)
+        summary[ordering_param] = True
+    return summary
+
+
 def get_ordered_product_ids() -> list:
     """Return the master feed, computing it if the cache is cold."""
     ids = cache.get(FEED_CACHE_KEY)

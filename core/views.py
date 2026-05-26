@@ -23,7 +23,10 @@ from django.core.cache import cache
 import random
 from django.core.mail import send_mail
 from django.conf import settings
-from .feed import get_ordered_product_ids, get_filtered_ordered_ids
+from .feed import (
+    get_ordered_product_ids, get_filtered_ordered_ids,
+    get_sorted_feed, compute_sorted_feed, SORTABLE_FIELDS,
+)
 
 User = get_user_model()
 
@@ -277,25 +280,41 @@ class ProductListView(generics.ListAPIView):
         qs = super().filter_queryset(queryset)
         params = self.request.query_params
 
-        # 1. Explicit user-chosen sort (price, rating, etc.)
-        ordering_param = params.get('ordering')
-        if ordering_param:
-            secondary = [f.strip() for f in ordering_param.split(',')]
-            return qs.order_by('-has_stock', *secondary)
+        ordering_param = params.get('ordering', '').strip()
 
-        # 2. Seller-scoped pages (seller dashboard / storefront) — newest first
+        # 1. Seller-scoped pages (seller dashboard / storefront) — newest first
         if params.get('seller') or params.get('seller_slug'):
             return qs.order_by('-has_stock', '-created_at')
 
-        # 3. Public shop — serve from cached seller-fair feed
+        # 2. Explicit sort requested by the user
+        if ordering_param:
+            if ordering_param in SORTABLE_FIELDS:
+                # Use pre-warmed sorted+fair feed (seller-fair tiebreaking within
+                # equal-value groups, e.g. 1521 products all rated 5.0)
+                ordered_ids = get_sorted_feed(ordering_param)
+                if ordered_ids is None:
+                    # Cache cold — compute on the fly and store
+                    master = get_ordered_product_ids()
+                    ordered_ids = compute_sorted_feed(ordering_param, master)
+                # Narrow to filtered subset if any filters are active
+                active_filters = {k: params[k] for k in self._FILTER_PARAMS if params.get(k)}
+                if active_filters:
+                    valid_ids = frozenset(qs.values_list('id', flat=True))
+                    ordered_ids = [i for i in ordered_ids if i in valid_ids]
+                self._preordered_ids = ordered_ids
+                return qs
+            else:
+                # Unknown sort field — fall back to DB ordering (seller dashboard edge cases)
+                secondary = [f.strip() for f in ordering_param.split(',')]
+                return qs.order_by('-has_stock', *secondary)
+
+        # 3. Default public shop browse — seller-fair feed
         active_filters = {k: params[k] for k in self._FILTER_PARAMS if params.get(k)}
         if active_filters:
-            # Filter cache: keyed by filter combo + feed version → zero DB on repeat hits
             ordered_ids = get_filtered_ordered_ids(active_filters, qs)
         else:
             ordered_ids = get_ordered_product_ids()
 
-        # Store for paginate_queryset — it will use this list instead of DB ordering
         self._preordered_ids = ordered_ids
         return qs
 
