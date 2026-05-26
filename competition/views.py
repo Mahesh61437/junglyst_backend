@@ -8,7 +8,7 @@ from .serializers import CompetitionEntrySerializer
 from core.storage import upload_to_firebase
 from core.config_utils import get_config
 
-LAUNCH_DATE = datetime(2026, 5, 25, 0, 0, 0, tzinfo=dt_timezone.utc)
+LAUNCH_DATE = datetime(2026, 6, 1, 0, 0, 0, tzinfo=dt_timezone.utc)
 MAX_ENTRIES = 500
 
 
