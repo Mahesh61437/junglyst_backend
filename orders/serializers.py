@@ -44,17 +44,47 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 # ── Order list serializer ─────────────────────────────────────────────────────
 
+class SubOrderListSerializer(serializers.ModelSerializer):
+    """Lean sub-order serializer for the order list endpoint."""
+    items = OrderItemListSerializer(many=True, read_only=True)
+    seller_name = serializers.SerializerMethodField()
+    shipment = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SubOrder
+        fields = (
+            'id', 'sub_order_number', 'status', 'seller', 'seller_name',
+            'subtotal', 'shipping_fee', 'seller_total',
+            'awb_number', 'courier_name',
+            'created_at', 'items', 'shipment',
+        )
+
+    def get_seller_name(self, obj):
+        try:
+            return obj.seller.seller_profile.store_name
+        except Exception:
+            return obj.seller.get_full_name() or obj.seller.username
+
+    def get_shipment(self, obj):
+        shipment = obj.order.shipments.filter(seller=obj.seller).first()
+        if not shipment:
+            return None
+        from shipping.serializers import ShipmentSerializer
+        return ShipmentSerializer(shipment).data
+
+
 class OrderListSerializer(serializers.ModelSerializer):
     """Minimal serializer for GET /orders/ — only what the profile history tab needs."""
     items = OrderItemListSerializer(many=True, read_only=True)
+    sub_orders = SubOrderListSerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
         fields = (
             'id', 'order_number', 'status', 'payment_status',
             'subtotal', 'shipping_fee', 'total_amount',
-            'is_paid', 'created_at',
-            'items',
+            'is_paid', 'created_at', 'shipping_address',
+            'items', 'sub_orders',
         )
 
 
@@ -143,14 +173,20 @@ class SellerSubOrderSerializer(serializers.ModelSerializer):
             'confirmed_at', 'dispatch_deadline', 'dispatch_hours_remaining',
             'packaging_photos',
             'actual_weight_grams', 'actual_length_cm', 'actual_breadth_cm', 'actual_height_cm',
-            'awb_number', 'courier_name',
+            'awb_number', 'courier_name', 'booking_failure_reason',
             'created_at', 'updated_at',
             'items', 'shipment',
             'buyer_first_name', 'buyer_pincode',
         )
 
     def get_shipment(self, obj):
-        shipment = obj.order.shipments.filter(seller=obj.seller).first()
+        # Use prefetched shipments (to_attr='seller_shipments') when available
+        # to avoid N+1 queries on the fulfillment page.
+        prefetched = getattr(obj.order, 'seller_shipments', None)
+        if prefetched is not None:
+            shipment = prefetched[0] if prefetched else None
+        else:
+            shipment = obj.order.shipments.filter(seller=obj.seller).first()
         return ShipmentSerializer(shipment).data if shipment else None
 
     def get_dispatch_hours_remaining(self, obj):
@@ -256,13 +292,11 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
 
     def get_payment_status(self, obj):
         """Return payment status."""
-        # Try to get cached payment if available, otherwise query
         try:
-            payment = obj.payments.first()  # Related name from Payment model
-        except:
-            from payments.models import Payment
-            payment = Payment.objects.filter(order=obj).first()
-        
+            payment = obj.payment  # OneToOneField reverse accessor
+        except Exception:
+            payment = None
+
         return {
             'is_paid': obj.is_paid,
             'payment_method': payment.method if payment else None,

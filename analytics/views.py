@@ -1,6 +1,7 @@
 from rest_framework import generics, permissions as drf_permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from django.core.cache import cache
 from django.db.models import Sum, Count, F
 from django.utils import timezone
 from orders.models import Order, OrderItem
@@ -390,3 +391,11 @@ class SetGrowerView(APIView):
             return Response({'message': f'{user.email} grower access revoked', 'role': user.role})
 
         return Response({'error': 'Invalid action'}, status=400)
+
+
+class ClearCacheView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    def post(self, request):
+        cache.clear()
+        return Response({'message': 'Cache cleared successfully.'}, status=200)

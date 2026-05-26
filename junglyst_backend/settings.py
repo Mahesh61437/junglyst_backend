@@ -11,19 +11,34 @@ RAILWAY_ENV = config('RAILWAY_ENVIRONMENT_NAME', default='')
 IS_PRODUCTION = RAILWAY_ENV == 'production'
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config('SECRET_KEY', default='django-insecure-8e692pepdm++i+^8&ejp#ozjyb8%r6&+-e8x4239o=tw1lz0g^')
+# In production we REFUSE to boot with the insecure default — a misconfigured
+# deploy that falls back to a hardcoded key would let anyone forge JWTs and
+# session cookies. Better to crash loudly than to ship a broken-by-default key.
+_DEV_SECRET_KEY_FALLBACK = 'django-insecure-8e692pepdm++i+^8&ejp#ozjyb8%r6&+-e8x4239o=tw1lz0g^'
+SECRET_KEY = config('SECRET_KEY', default=_DEV_SECRET_KEY_FALLBACK)
+if IS_PRODUCTION and (SECRET_KEY == _DEV_SECRET_KEY_FALLBACK or SECRET_KEY.startswith('django-insecure-')):
+    raise RuntimeError(
+        "SECRET_KEY env var is not set (or still using the insecure dev default) in production. "
+        "Set a strong random value in Railway env vars before deploying."
+    )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-# Debug is False in production unless explicitly set to True in env
-DEBUG = config('DEBUG', default=not IS_PRODUCTION, cast=bool)
+# DEBUG is FORCED False in production — env override is ignored on purpose so a
+# stray DEBUG=True in Railway can never dump settings/secrets to error pages.
+DEBUG = False if IS_PRODUCTION else config('DEBUG', default=True, cast=bool)
 
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*', cast=lambda v: [s.strip() for s in v.split(',')])
+# ALLOWED_HOSTS — production has a strict allow-list; '*' is rejected.
+# Outside production, '*' is fine for local docker/dev.
 if IS_PRODUCTION:
-    ALLOWED_HOSTS += [
+    _hosts = config('ALLOWED_HOSTS', default='', cast=lambda v: [s.strip() for s in v.split(',') if s.strip()])
+    ALLOWED_HOSTS = list({h for h in _hosts if h != '*'}) + [
         '.railway.app',
         '.up.railway.app',
         '.junglyst.com',
+        'junglyst.com',
     ]
+else:
+    ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*', cast=lambda v: [s.strip() for s in v.split(',')])
 
 CSRF_TRUSTED_ORIGINS = [
     "https://*.railway.app",
@@ -38,14 +53,21 @@ CSRF_TRUSTED_ORIGINS += [f"https://{host}" for host in ALLOWED_HOSTS if host != 
 if IS_PRODUCTION:
     SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
     CSRF_COOKIE_SECURE = True
+    CSRF_COOKIE_HTTPONLY = False  # frontend reads csrftoken cookie for non-JWT POSTs
+    CSRF_COOKIE_SAMESITE = 'Lax'
     SECURE_BROWSER_XSS_FILTER = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     SECURE_HSTS_SECONDS = 31536000  # 1 year
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-    
+    SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+    SECURE_CROSS_ORIGIN_OPENER_POLICY = 'same-origin'
+    X_FRAME_OPTIONS = 'DENY'  # disallow iframing the site (clickjacking)
+
     # Handle SuspiciousOperation when behind a proxy
     USE_X_FORWARDED_HOST = True
     USE_X_FORWARDED_PORT = True
@@ -76,6 +98,7 @@ INSTALLED_APPS = [
     'notifications',
     'sellers',
     'analytics',
+    'competition',
     'django_celery_results',
     'django_celery_beat',
 ]
@@ -150,13 +173,20 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'junglyst_backend.wsgi.application'
 
-# Email — Resend via django-anymail (HTTPS, no SMTP port issues on Railway)
+# Email
 RESEND_API_KEY = config('RESEND_API_KEY', default='')
-EMAIL_BACKEND = (
+_default_email_backend = (
     'anymail.backends.resend.EmailBackend'
     if RESEND_API_KEY
     else 'django.core.mail.backends.console.EmailBackend'
 )
+# Allow override via env (e.g. SMTP for local mailpit)
+EMAIL_BACKEND = config('EMAIL_BACKEND', default=_default_email_backend)
+EMAIL_HOST = config('EMAIL_HOST', default='localhost')
+EMAIL_PORT = config('EMAIL_PORT', default=25, cast=int)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=False, cast=bool)
 ANYMAIL = {
     'RESEND_API_KEY': RESEND_API_KEY,
 }
@@ -221,6 +251,26 @@ AUTH_USER_MODEL = 'core.User'
 AUTHENTICATION_BACKENDS = [
     'core.backends.EmailOrUsernameModelBackend',
     'django.contrib.auth.backends.ModelBackend',
+]
+
+# Password policy — minimum 10 chars, blocks the most common passwords and
+# values too similar to username/email. Higher than Django's default 8.
+AUTH_PASSWORD_VALIDATORS = [
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {
+        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        'OPTIONS': {'min_length': 10},
+    },
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
+]
+
+# Default hasher remains PBKDF2 (Django default, FIPS-friendly).
+# Argon2 listed first if/when `argon2-cffi` ships in requirements.
+PASSWORD_HASHERS = [
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+    'django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher',
+    'django.contrib.auth.hashers.BCryptSHA256PasswordHasher',
 ]
 
 # REST Framework Configuration
@@ -346,6 +396,21 @@ LOGGING = {
             'level': 'DEBUG',
             'propagate': True,
         },
+        'shipping': {
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'sellers': {
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'orders': {
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
     },
 }
 
@@ -369,12 +434,33 @@ NIMBUSPOST_PASSWORD = config('NIMBUSPOST_PASSWORD', default='')
 NIMBUSPOST_WAREHOUSE_NAME = config('NIMBUSPOST_WAREHOUSE_NAME', default='Junglyst')
 SHIPROCKET_EMAIL = config('SHIPROCKET_EMAIL', default='')
 SHIPROCKET_PASSWORD = config('SHIPROCKET_PASSWORD', default='')
+# Must match exactly the pickup_location name registered in your Shiprocket account
+# (Shiprocket → Settings → Manage Pickup Addresses)
+SHIPROCKET_PICKUP_LOCATION = config('SHIPROCKET_PICKUP_LOCATION', default='Mahesh')
 
-FIREBASE_CONFIG = {
-    "apiKey": config('FIREBASE_API_KEY', default=''),
-    "authDomain": config('FIREBASE_AUTH_DOMAIN', default=''),
-    "projectId": config('FIREBASE_PROJECT_ID', default=''),
-    "storageBucket": config('FIREBASE_STORAGE_BUCKET', default=''),
-    "messagingSenderId": config('FIREBASE_MESSAGING_SENDER_ID', default=''),
-    "appId": config('FIREBASE_APP_ID', default='')
-}
+FIREBASE_STORAGE_BUCKET = config('FIREBASE_STORAGE_BUCKET', default='')
+FIREBASE_SERVICE_ACCOUNT_JSON = config('FIREBASE_SERVICE_ACCOUNT_JSON', default='')
+
+# Production readiness check — fail fast at boot if any required env var is
+# missing. Better to crash on deploy than to discover at checkout time.
+if IS_PRODUCTION:
+    _required = {
+        'SECRET_KEY': SECRET_KEY,
+        'DB_HOST': config('DB_HOST', default=''),
+        'DB_NAME': config('DB_NAME', default=''),
+        'DB_USER': config('DB_USER', default=''),
+        'DB_PASSWORD': config('DB_PASSWORD', default=''),
+    }
+    _missing = [k for k, v in _required.items() if not v]
+    if _missing:
+        raise RuntimeError(
+            f"Missing required production env vars: {', '.join(_missing)}. "
+            f"Set them in Railway before deploying."
+        )
+    # Soft-warn (don't crash) if payment/shipping creds are absent — the site
+    # can still serve catalog pages, but checkout will fail.
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    for _name in ('RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'CASHFREE_APP_ID', 'CASHFREE_SECRET_KEY'):
+        if not config(_name, default=''):
+            _log.warning("Production startup: %s is not set — checkout will fail for that gateway.", _name)

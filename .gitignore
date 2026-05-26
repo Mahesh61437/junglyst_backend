@@ -32,8 +32,11 @@ ENV/
 db.sqlite3
 *.db
 
-# Environment variables
+# Environment variables — catch every variant. The `.env.*` pattern catches
+# .env.local / .env.production / .env.staging which `*.env` does not match.
 .env
+.env.*
+!.env.example
 dev.env
 *.env
 
@@ -53,5 +56,8 @@ logs/
 staticfiles/
 media/
 
-# Firebase
+# Firebase / service account JSONs — never commit
 firebase_service_account.json
+*-service-account*.json
+*-credentials*.json
+google-credentials*.json

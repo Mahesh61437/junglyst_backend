@@ -1,9 +1,8 @@
-from django.utils.text import slugify
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from core.models import (
-    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview
+    Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, ProductReview, BugReport, Configuration
 )
 from cart.models import Cart, CartItem
 
@@ -12,7 +11,7 @@ User = get_user_model()
 class UserSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     seller_profile = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = User
         fields = ('id', 'email', 'username', 'phone', 'role', 'is_verified_seller', 'is_guest', 'full_name', 'avatar_url', 'location', 'seller_profile', 'is_staff', 'is_superuser')
@@ -26,6 +25,72 @@ class UserSerializer(serializers.ModelSerializer):
         try:
             return SellerProfileSerializer(obj.seller_profile).data
         except:
+            return None
+
+
+class PublicSellerProfileSerializer(serializers.Serializer):
+    """
+    Public-safe seller profile. Excludes PII (payout, GST, pickup address,
+    account holder name) and is used wherever a seller's profile is embedded
+    in a buyer-facing response (product detail, cart, etc.).
+    """
+    store_name = serializers.CharField()
+    slug = serializers.CharField()
+    logo_url = serializers.CharField(allow_null=True)
+    icon_url = serializers.CharField(allow_null=True)
+    banner_url = serializers.CharField(allow_null=True)
+    brand_color = serializers.CharField()
+    bio = serializers.CharField(allow_null=True)
+    tagline = serializers.CharField(allow_null=True)
+    location_city = serializers.CharField(allow_null=True)
+    location_state = serializers.CharField(allow_null=True)
+    expertise_tags = serializers.JSONField()
+    infrastructure_details = serializers.CharField(allow_null=True)
+    experience_years = serializers.IntegerField()
+    identity_verified = serializers.BooleanField()
+    is_featured = serializers.BooleanField()
+    rating = serializers.CharField()
+    shipping_days = serializers.JSONField()
+    daily_cutoff_time = serializers.SerializerMethodField()
+    blackout_dates = serializers.SerializerMethodField()
+    next_shipping_date = serializers.SerializerMethodField()
+
+    def get_daily_cutoff_time(self, obj):
+        t = getattr(obj, 'daily_cutoff_time', None)
+        return t.strftime('%H:%M') if t else '12:00'
+
+    def get_blackout_dates(self, obj):
+        try:
+            return [
+                {'start_date': b.start_date.isoformat(), 'end_date': b.end_date.isoformat()}
+                for b in obj.blackout_dates.all()
+            ]
+        except Exception:
+            return []
+
+    def get_next_shipping_date(self, obj):
+        try:
+            d = obj.get_next_shipping_date()
+            return d.isoformat() if d else None
+        except Exception:
+            return None
+
+
+class PublicSellerSerializer(serializers.ModelSerializer):
+    """
+    Public-safe seller embed for product/cart responses. Only exposes id and the
+    public seller profile — no email, phone, full_name, or staff flags.
+    """
+    seller_profile = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ('id', 'seller_profile')
+
+    def get_seller_profile(self, obj):
+        try:
+            return PublicSellerProfileSerializer(obj.seller_profile).data
+        except Exception:
             return None
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -97,6 +162,26 @@ class TagSerializer(serializers.ModelSerializer):
         model = Tag
         fields = '__all__'
 
+
+class ConfigurationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Configuration
+        fields = ('id', 'name', 'data', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'created_at', 'updated_at')
+
+    def validate_name(self, value):
+        value = (value or '').strip()
+        if not value:
+            raise serializers.ValidationError('Name is required.')
+        return value
+
+    def validate_data(self, value):
+        if value is None:
+            return {}
+        if not isinstance(value, (dict, list)):
+            raise serializers.ValidationError('Data must be a JSON object or array.')
+        return value
+
 class ProductVariantSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(required=False)
     chargeable_weight = serializers.SerializerMethodField()
@@ -163,11 +248,13 @@ class ProductReviewSerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     variants = ProductVariantSerializer(many=True, required=False)
     images = ProductImageSerializer(many=True, required=False)
-    seller = UserSerializer(read_only=True)
+    seller = PublicSellerSerializer(read_only=True)
     categories = CategorySerializer(many=True, read_only=True)
-    sub_category = SubCategorySerializer(read_only=True)
+    sub_categories = SubCategorySerializer(many=True, read_only=True)
+    sub_category = serializers.SerializerMethodField()
     category_id = serializers.IntegerField(write_only=True, required=False)
     sub_category_id = serializers.IntegerField(write_only=True, required=False)
+    sub_category_ids = serializers.ListField(child=serializers.IntegerField(), write_only=True, required=False)
     seller_id = serializers.UUIDField(write_only=True, required=False)
     image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
@@ -198,6 +285,12 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_category(self, obj):
         categories = obj.categories.all()
         return categories[0].name if categories else None
+
+    def get_sub_category(self, obj):
+        subcategories = obj.sub_categories.all()
+        if subcategories:
+            return SubCategorySerializer(subcategories[0], context=self.context).data
+        return None
 
     def _first_variant(self, obj):
         # Uses prefetch cache — avoids 9 separate DB hits per product
@@ -250,22 +343,13 @@ class ProductSerializer(serializers.ModelSerializer):
         images_data = validated_data.pop('images', [])
         category_id = validated_data.pop('category_id', None)
         sub_category_id = validated_data.pop('sub_category_id', None)
+        sub_category_ids = validated_data.pop('sub_category_ids', None)
         seller_id = validated_data.pop('seller_id', None)
         if seller_id and 'seller' not in validated_data:
             try:
                 validated_data['seller'] = User.objects.get(id=seller_id)
             except User.DoesNotExist:
                 raise serializers.ValidationError({'seller_id': 'User not found'})
-
-        name = validated_data.get('name')
-        if name:
-            slug = slugify(name)
-            base_slug = slug
-            counter = 1
-            while Product.objects.filter(slug=slug).exists():
-                slug = f"{base_slug}-{counter}"
-                counter += 1
-            validated_data['slug'] = slug
 
         product = Product.objects.create(**validated_data)
 
@@ -275,14 +359,17 @@ class ProductSerializer(serializers.ModelSerializer):
             except Category.DoesNotExist:
                 pass
 
-        if sub_category_id:
-            try:
-                sub_cat = SubCategory.objects.get(id=sub_category_id)
-                product.sub_category = sub_cat
-                product.categories.add(sub_cat.category)
-                product.save()
-            except SubCategory.DoesNotExist:
-                pass
+        sub_ids = []
+        if sub_category_ids:
+            sub_ids.extend(sub_category_ids)
+        if sub_category_id and sub_category_id not in sub_ids:
+            sub_ids.append(sub_category_id)
+
+        if sub_ids:
+            sub_cats = SubCategory.objects.filter(id__in=sub_ids)
+            product.sub_categories.set(sub_cats)
+            for sc in sub_cats:
+                product.categories.add(sc.category)
 
         created_variants = []
         for variant_data in variants_data:
@@ -310,7 +397,8 @@ class ProductSerializer(serializers.ModelSerializer):
         variants_data = validated_data.pop('variants', _missing)
         images_data = validated_data.pop('images', _missing)
         category_id = validated_data.pop('category_id', None)
-        sub_category_id = validated_data.pop('sub_category_id', None)
+        sub_category_id = validated_data.pop('sub_category_id', _missing)
+        sub_category_ids = validated_data.pop('sub_category_ids', _missing)
         seller_id = validated_data.pop('seller_id', None)
         if seller_id:
             try:
@@ -329,15 +417,23 @@ class ProductSerializer(serializers.ModelSerializer):
             except Category.DoesNotExist:
                 pass
 
-        if sub_category_id:
-            try:
-                sub_cat = SubCategory.objects.get(id=sub_category_id)
-                instance.sub_category = sub_cat
-                if sub_cat.category not in instance.categories.all():
-                    instance.categories.add(sub_cat.category)
-                instance.save()
-            except SubCategory.DoesNotExist:
-                pass
+        sub_ids = []
+        should_update = False
+        if sub_category_ids is not _missing:
+            should_update = True
+            if sub_category_ids:
+                sub_ids.extend(sub_category_ids)
+        if sub_category_id is not _missing:
+            should_update = True
+            if sub_category_id and sub_category_id not in sub_ids:
+                sub_ids.append(sub_category_id)
+
+        if should_update:
+            sub_cats = SubCategory.objects.filter(id__in=sub_ids)
+            instance.sub_categories.set(sub_cats)
+            for sc in sub_cats:
+                if sc.category not in instance.categories.all():
+                    instance.categories.add(sc.category)
 
         if variants_data is not _missing:
             existing_variants = {str(v.id): v for v in instance.variants.all()}
@@ -429,28 +525,37 @@ class ProductListSerializer(serializers.ModelSerializer):
         return v.stock if v else 0
 
     def get_seller(self, obj):
-        # Return minimal seller info
+        # Return minimal, public-safe seller info — store identity only, no PII
         try:
             profile = obj.seller.seller_profile
             return {
                 'id': str(obj.seller.id),
-                'full_name': obj.seller.get_full_name() or obj.seller.username,
                 'seller_profile': {
                     'store_name': profile.store_name,
                     'slug': profile.slug,
-                    'brand_color': profile.brand_color
+                    'brand_color': profile.brand_color,
+                    'icon_url': profile.icon_url,
                 }
             }
-        except:
-            return {'id': str(obj.seller.id), 'full_name': obj.seller.username}
+        except Exception:
+            return {'id': str(obj.seller.id), 'seller_profile': None}
 
     def get_category_name(self, obj):
-        return obj.sub_category.name if obj.sub_category else (obj.categories.all()[0].name if obj.categories.exists() else None)
+        subcategories = obj.sub_categories.all()
+        if subcategories:
+            return subcategories[0].name
+        categories = obj.categories.all()
+        return categories[0].name if categories else None
 
     def get_variants(self, obj):
-        # Return only what ProductCard needs: id, price, stock
+        # Return only what ProductCard needs: id, price, stock, compare_at_price
         return [
-            {'id': str(v.id), 'price': str(v.price), 'stock': v.stock}
+            {
+                'id': str(v.id),
+                'price': str(v.price),
+                'stock': v.stock,
+                'compare_at_price': str(v.compare_at_price) if v.compare_at_price else None,
+            }
             for v in obj.variants.all()
         ]
 
@@ -491,3 +596,9 @@ class CartSerializer(serializers.ModelSerializer):
             (item.variant.price if item.variant else item.product.price) * item.quantity 
             for item in obj.items.all()
         )
+
+class BugReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BugReport
+        fields = ('id', 'user', 'contact_info', 'description', 'images', 'status', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'created_at', 'updated_at', 'user', 'images')

@@ -1,4 +1,5 @@
 import uuid
+import datetime
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -6,13 +7,13 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem
+from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem, BugReport, Configuration
 from cart.models import Cart, CartItem
 from orders.models import Order
 from .serializers import (
     RegisterSerializer, CustomTokenObtainPairSerializer, UserSerializer,
     ProductSerializer, ProductListSerializer, ProductReviewSerializer, CategorySerializer, SubCategorySerializer,
-    CategoryShippingRateSerializer, CartSerializer
+    CategoryShippingRateSerializer, CartSerializer, BugReportSerializer, ConfigurationSerializer
 )
 from .storage import upload_to_firebase
 
@@ -23,6 +24,79 @@ from django.core.cache import cache
 import random
 from django.core.mail import send_mail
 from django.conf import settings
+from django.db import connection
+from django.db.models import Func, IntegerField
+from django.db.models.functions import Concat, Cast
+from django.db.models import Value, CharField
+
+
+class HashText(Func):
+    """PostgreSQL hashtext() — deterministic hash of any string to int."""
+    function = 'hashtext'
+    output_field = IntegerField()
+
+
+def _daily_seed_rand_order(queryset):
+    """
+    Returns queryset annotated with rand_order: a stable hash of (today's date + product id).
+    This produces the same scrambled order all day but changes nightly, so pagination is
+    consistent and sellers are naturally mixed across pages.
+    Falls back to random ordering on non-PostgreSQL (dev SQLite).
+    """
+    daily_seed = datetime.date.today().isoformat()
+    db_engine = connection.settings_dict.get('ENGINE', '')
+    if 'postgresql' in db_engine:
+        return queryset.annotate(
+            rand_order=HashText(
+                Concat(Value(daily_seed), Cast('id', output_field=CharField()))
+            )
+        ), 'rand_order'
+    # SQLite fallback for local dev — pagination is not stable but that's acceptable
+    return queryset, '?'
+
+
+def apply_fairness_engine(queryset, limit=500):
+    """
+    Applies the Multi-Vendor Fairness Engine to a queryset of products.
+    1. Fetches a candidate pool of up to `limit` products ordered by seller_id, -created_at.
+    2. Shuffles the candidate pool using Fisher-Yates.
+    3. Filters to ensure no seller dominates (MAX_PER_SELLER).
+    4. Stable-sorts in-stock products to the top.
+    """
+    # Fetch configured MAX_PER_SELLER from Configuration database if exists
+    max_per_seller = 2
+    try:
+        config_obj = Configuration.objects.filter(name='feed_settings').first()
+        if config_obj and 'max_per_seller' in config_obj.data:
+            max_per_seller = int(config_obj.data['max_per_seller'])
+    except Exception:
+        pass
+
+    # 1. Fetch candidate pool using indexed sorts
+    pool_qs = queryset.order_by('seller_id', '-created_at')[:limit]
+    candidate_pool = list(pool_qs)
+
+    # 2. In-Memory Randomization (Fisher-Yates Shuffle)
+    n = len(candidate_pool)
+    for i in range(n - 1, 0, -1):
+        j = random.randint(0, i)
+        candidate_pool[i], candidate_pool[j] = candidate_pool[j], candidate_pool[i]
+
+    # 3. Interleaving & Fairness Filter (Diversity Layer)
+    final_feed = []
+    seller_counts = {}
+
+    for product in candidate_pool:
+        s_id = product.seller_id
+        count = seller_counts.get(s_id, 0)
+        if count < max_per_seller:
+            final_feed.append(product)
+            seller_counts[s_id] = count + 1
+
+    # 4. Sort in-stock products first (stable sort)
+    final_feed.sort(key=lambda p: getattr(p, 'has_stock', False), reverse=True)
+
+    return final_feed
 
 User = get_user_model()
 
@@ -149,19 +223,18 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
 def _product_queryset():
     return Product.objects.select_related(
         'seller', 'seller__seller_profile',
-        'sub_category', 'sub_category__category',
     ).prefetch_related(
         'variants', 'images', 'categories',
-        'categories__subcategories', 'tags',
+        'categories__subcategories', 'tags', 'sub_categories', 'sub_categories__category'
     )
 
 
 def _product_list_queryset():
     """Lighter queryset for the shop list page"""
     return Product.objects.select_related(
-        'seller', 'seller__seller_profile', 'sub_category'
+        'seller', 'seller__seller_profile'
     ).prefetch_related(
-        'variants', 'images', 'categories'
+        'variants', 'images', 'categories', 'sub_categories'
     )
 
 
@@ -169,7 +242,7 @@ class ProductListView(generics.ListAPIView):
     serializer_class = ProductListSerializer
     permission_classes = (permissions.AllowAny,)
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
-    filterset_fields = ('categories', 'sub_category', 'seller', 'is_active', 'is_rare')
+    filterset_fields = ('categories', 'sub_categories', 'seller', 'is_active', 'is_rare')
     search_fields = ('name', 'tags__name', 'scientific_name')
     ordering_fields = ('created_at', 'rating')
     
@@ -240,7 +313,19 @@ class ProductListView(generics.ListAPIView):
         # Subcategory filter
         sub_cat_id = params.get('sub_category_id')
         if sub_cat_id:
-            queryset = queryset.filter(sub_category_id=sub_cat_id)
+            queryset = queryset.filter(sub_categories__id=sub_cat_id).distinct()
+
+        # Category filter by name (comma-separated for multi-select)
+        category_name = params.get('category')
+        if category_name:
+            names = [n.strip() for n in category_name.split(',') if n.strip()]
+            queryset = queryset.filter(categories__name__in=names).distinct()
+
+        # Care level filter (comma-separated, e.g. "Easy,Medium")
+        care_level = params.get('care_level')
+        if care_level:
+            levels = [l.strip() for l in care_level.split(',') if l.strip()]
+            queryset = queryset.filter(care_level__in=levels)
 
         # Annotate with has_stock so filter_queryset can use it for ordering
         from django.db.models import Exists, OuterRef
@@ -251,13 +336,23 @@ class ProductListView(generics.ListAPIView):
         return queryset
 
     def filter_queryset(self, queryset):
-        """Always put in-stock products first; user's chosen sort is the secondary key."""
+        """Always put in-stock products first; apply fairness engine unless bypassed."""
         qs = super().filter_queryset(queryset)
-        ordering_param = self.request.query_params.get('ordering')
-        if ordering_param:
-            secondary = [f.strip() for f in ordering_param.split(',')]
-            return qs.order_by('-has_stock', *secondary)
-        return qs.order_by('-has_stock', '-created_at')
+        params = self.request.query_params
+        
+        # Bypass fairness engine if there's an explicit ordering, seller filter, or search query.
+        if (params.get('ordering') or 
+            params.get('seller') or 
+            params.get('seller_slug') or 
+            params.get('search')):
+            ordering_param = params.get('ordering')
+            if ordering_param:
+                secondary = [f.strip() for f in ordering_param.split(',')]
+                return qs.order_by('-has_stock', *secondary)
+            return qs.order_by('-has_stock', '-created_at')
+
+        # Otherwise, apply Multi-Vendor Fairness Engine
+        return apply_fairness_engine(qs)
 
     def paginate_queryset(self, queryset):
         if self.request.query_params.get('no_pagination'):
@@ -390,7 +485,6 @@ class ProductCopyView(generics.GenericAPIView):
             tagline=original.tagline,
             description=original.description,
             seller=seller,
-            sub_category=original.sub_category,
             scientific_name=original.scientific_name,
             care_level=original.care_level,
             light_requirements=original.light_requirements,
@@ -403,6 +497,8 @@ class ProductCopyView(generics.GenericAPIView):
             co2_requirement=original.co2_requirement,
         )
         new_product.save()
+
+        new_product.sub_categories.set(original.sub_categories.all())
 
         for cat in original.categories.all():
             new_product.categories.add(cat)
@@ -437,13 +533,25 @@ class IsAdminOrSuperAdmin(permissions.BasePermission):
 # ── Public read ───────────────────────────────────────────────────────────────
 
 class CategoryListView(generics.ListAPIView):
-    queryset = Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
     serializer_class = CategorySerializer
     permission_classes = (permissions.AllowAny,)
     pagination_class = None  # always return all categories in one response
 
     _CACHE_KEY = 'categories_list_v2'
     _CACHE_TTL = 60 * 60 * 24  # 24 hours
+
+    def get_queryset(self):
+        # select_related('category') on subcategories eliminates N+1 queries caused by
+        # SubCategory.effective_gst and .effective_commission accessing the parent FK.
+        from django.db.models import Prefetch
+        from .models import SubCategory, CategoryShippingRate
+        return Category.objects.prefetch_related(
+            Prefetch(
+                'subcategories',
+                queryset=SubCategory.objects.select_related('category').prefetch_related('shipping_rates'),
+            ),
+            'shipping_rates',
+        ).all()
 
     def get(self, request, *args, **kwargs):
         # Explicit cache.get/set — cache_page is incompatible with DRF's
@@ -472,7 +580,15 @@ class CategoryAdminView(generics.ListCreateAPIView):
     permission_classes = (permissions.AllowAny,)
 
     def get_queryset(self):
-        return Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
+        from django.db.models import Prefetch
+        from .models import SubCategory
+        return Category.objects.prefetch_related(
+            Prefetch(
+                'subcategories',
+                queryset=SubCategory.objects.select_related('category').prefetch_related('shipping_rates'),
+            ),
+            'shipping_rates',
+        ).all()
 
     def post(self, request, *args, **kwargs):
         self.permission_classes = (IsAdminOrSuperAdmin,)
@@ -492,7 +608,15 @@ class CategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (IsAdminOrSuperAdmin,)
 
     def get_queryset(self):
-        return Category.objects.prefetch_related('subcategories', 'shipping_rates').all()
+        from django.db.models import Prefetch
+        from .models import SubCategory
+        return Category.objects.prefetch_related(
+            Prefetch(
+                'subcategories',
+                queryset=SubCategory.objects.select_related('category').prefetch_related('shipping_rates'),
+            ),
+            'shipping_rates',
+        ).all()
 
     def perform_update(self, serializer):
         data = self.request.data
@@ -500,9 +624,11 @@ class CategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
             serializer.save(slug=slugify(data['name']))
         else:
             serializer.save()
+        cache.delete(CategoryListView._CACHE_KEY)
 
     def perform_destroy(self, instance):
-        instance.delete()  # soft-delete via SoftDeleteModel
+        instance.delete()
+        cache.delete(CategoryListView._CACHE_KEY)
 
 
 # ── Admin CRUD — SubCategories ────────────────────────────────────────────────
@@ -533,6 +659,7 @@ class SubCategoryAdminView(generics.ListCreateAPIView):
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        cache.delete(CategoryListView._CACHE_KEY)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -549,9 +676,11 @@ class SubCategoryAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
             serializer.save(slug=slugify(data['name']))
         else:
             serializer.save()
+        cache.delete(CategoryListView._CACHE_KEY)
 
     def perform_destroy(self, instance):
         instance.delete()
+        cache.delete(CategoryListView._CACHE_KEY)
 
 
 # ── Admin CRUD — Shipping Rates ───────────────────────────────────────────────
@@ -571,6 +700,46 @@ class ShippingRateAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = (IsAdminOrSuperAdmin,)
     queryset = CategoryShippingRate.objects.all()
 
+
+# ── Configuration — generic key/value settings ────────────────────────────────
+
+# Names that are safe to read without authentication (frontend may need them
+# to render public-facing copy like the competition result-announcement date).
+PUBLIC_CONFIGURATION_NAMES = {
+    'competition_settings',
+}
+
+
+class PublicConfigurationView(generics.GenericAPIView):
+    """Public read of a whitelisted configuration entry by name."""
+    permission_classes = (permissions.AllowAny,)
+    serializer_class = ConfigurationSerializer
+
+    def get(self, request, name):
+        if name not in PUBLIC_CONFIGURATION_NAMES:
+            return Response({'error': 'Configuration not publicly accessible.'}, status=404)
+        try:
+            config = Configuration.objects.get(name=name)
+        except Configuration.DoesNotExist:
+            return Response({'name': name, 'data': {}}, status=200)
+        return Response(ConfigurationSerializer(config).data)
+
+
+class ConfigurationAdminView(generics.ListCreateAPIView):
+    """List or create configuration entries. Super-admin only."""
+    serializer_class = ConfigurationSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+    queryset = Configuration.objects.all().order_by('name')
+
+
+class ConfigurationAdminDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """Retrieve/update/delete a configuration by name. Super-admin only."""
+    serializer_class = ConfigurationSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)
+    queryset = Configuration.objects.all()
+    lookup_field = 'name'
+
+
 class ImageUploadView(generics.GenericAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
@@ -584,8 +753,12 @@ class ImageUploadView(generics.GenericAPIView):
         try:
             url = upload_to_firebase(file_obj, request.user.id, file_type)
             return Response({"url": url}, status=201)
-        except Exception as e:
-            return Response({"error": str(e)}, status=500)
+        except Exception:
+            # Firebase exceptions can include service-account paths or bucket
+            # internals — never echo them to the client.
+            import logging
+            logging.getLogger(__name__).exception("Firebase image upload failed for user %s", request.user.id)
+            return Response({"error": "Image upload failed. Please try again."}, status=500)
 
 class SyncCartView(generics.GenericAPIView):
     permission_classes = (permissions.IsAuthenticated,)
@@ -732,9 +905,10 @@ class HomeDataView(generics.GenericAPIView):
         ).order_by('sort_order', '-rating')
 
         from django.db.models import Exists, OuterRef
-        products_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
+        _home_qs = _product_list_queryset().filter(is_active=True, is_draft=False).annotate(
             has_stock=Exists(ProductVariant.objects.filter(product=OuterRef('pk'), stock__gt=0))
-        ).order_by('-has_stock', '-created_at')[:8]
+        )
+        products_qs = apply_fairness_engine(_home_qs)[:8]
 
         stats = {
             'total_sellers': SellerProfile.objects.filter(is_active=True).count(),
@@ -785,3 +959,51 @@ def sitemap_xml(request):
         
     xml.append('</urlset>')
     return HttpResponse("\n".join(xml), content_type="application/xml")
+
+class BugReportListCreateView(generics.ListCreateAPIView):
+    queryset = BugReport.objects.all()
+    serializer_class = BugReportSerializer
+    permission_classes = (permissions.AllowAny,)
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_authenticated and (user.is_staff or user.role == 'admin' or user.is_superuser):
+            return super().get_queryset()
+        return BugReport.objects.none()
+
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        
+        # Handle up to 5 images
+        images = []
+        user_id = request.user.id if request.user.is_authenticated else 'guest'
+        
+        for i in range(5):
+            file_obj = request.FILES.get(f'image_{i}')
+            if file_obj:
+                try:
+                    url = upload_to_firebase(file_obj, user_id, 'bug_report')
+                    images.append(url)
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).exception("BugReport image upload failed")
+        
+        # We need to parse description and contact_info from request.data
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Save images in serializer's validated_data or just save it directly
+        serializer.validated_data['images'] = images
+        
+        if request.user.is_authenticated:
+            serializer.save(user=request.user, images=images)
+        else:
+            serializer.save(images=images)
+            
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+class BugReportDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = BugReport.objects.all()
+    serializer_class = BugReportSerializer
+    permission_classes = (IsAdminOrSuperAdmin,)

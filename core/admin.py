@@ -1,5 +1,20 @@
 from django.contrib import admin
+from django import forms
 from .models import User, Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, Configuration
+
+
+# ── Custom Forms ────────────────────────────────────────────────────────────
+
+class ProductVariantForm(forms.ModelForm):
+    """Custom form to ensure all item category choices are visible."""
+    item_category = forms.ChoiceField(
+        choices=ProductVariant.ItemCategory.choices,
+        help_text='Light: plants/moss/isopods. Heavy: rocks/substrate/hardscape. Hybrid: mixed items.'
+    )
+    
+    class Meta:
+        model = ProductVariant
+        fields = '__all__'
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
@@ -52,16 +67,42 @@ class CategoryShippingRateAdmin(admin.ModelAdmin):
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ('name', 'seller', 'sub_category', 'care_level', 'is_rare', 'is_active', 'is_deleted')
-    list_filter = ('seller', 'sub_category', 'care_level', 'is_rare', 'is_active', 'is_deleted')
+    list_display = ('name', 'seller', 'get_sub_categories', 'care_level', 'is_rare', 'is_active', 'is_deleted')
+    list_filter = ('seller', 'care_level', 'is_rare', 'is_active', 'is_deleted')
     prepopulated_fields = {'slug': ('name',)}
     search_fields = ('name', 'scientific_name')
+
+    def get_sub_categories(self, obj):
+        return ", ".join(sub.name for sub in obj.sub_categories.all())
+    get_sub_categories.short_description = 'Subcategories'
 
 
 @admin.register(ProductVariant)
 class ProductVariantAdmin(admin.ModelAdmin):
-    list_display = ('product', 'name', 'price', 'stock', 'item_category', 'is_deleted')
-    list_filter = ('item_category',)
+    form = ProductVariantForm
+    list_display = ('product', 'name', 'price', 'stock', 'item_category', 'packed_weight_grams', 'is_deleted')
+    list_filter = ('item_category', 'is_active', 'variant_type')
+    search_fields = ('product__name', 'sku', 'name')
+    
+    fieldsets = (
+        ('Product & Variant', {
+            'fields': ('product', 'name', 'variant_type', 'sku')
+        }),
+        ('Pricing', {
+            'fields': ('base_price', 'gst_rate', 'commission_rate', 'price', 'compare_at_price')
+        }),
+        ('Shipping Classification', {
+            'fields': ('item_category', 'packed_weight_grams'),
+            'description': 'Select item_category: Light (plants/moss), Heavy (rocks/substrate), or Hybrid (mixed items). packed_weight_grams should be actual packed weight in grams.',
+        }),
+        ('Dimensions', {
+            'fields': ('length', 'width', 'height'),
+            'description': 'Box dimensions in cm for volumetric weight calculation'
+        }),
+        ('Stock', {
+            'fields': ('stock', 'is_active')
+        }),
+    )
 
 
 admin.site.register(Tag)

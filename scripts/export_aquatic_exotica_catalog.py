@@ -32,13 +32,13 @@ DEFAULT_VARIANT_NAME = "Standard"
 
 # Best-effort mapping from Aquatic Exotica category names → Junglyst seed_categories tree.
 CATEGORY_MAP = {
-    "Aquatic Plants": ("Aquascaping", "Starter Packs"),
-    "Rhizome plants": ("Aquascaping", "Starter Packs"),
-    "Moss": ("Aquascaping", "Starter Packs"),
-    "Terrarium Plants": ("Terrarium & Paludarium", "Terrarium Accessories"),
-    "Indoor Plants": ("Terrarium & Paludarium", "Terrarium Accessories"),
-    "Exotic Plants": ("Terrarium & Paludarium", "Terrarium Accessories"),
-    "Premium": ("Brand & Specialized", "DOOA System"),
+    "Aquatic Plants": ("Plants", "Aquatic Plants"),
+    "Rhizome plants": ("Plants", "Aquatic Plants"),
+    "Moss": ("Terrarium & Paludarium", "Terrarium Moss"),
+    "Terrarium Plants": ("Terrarium & Paludarium", "Terrarium Plants"),
+    "Indoor Plants": ("Terrarium & Paludarium", "Terrarium Plants"),
+    "Exotic Plants": ("Terrarium & Paludarium", "Terrarium Plants"),
+    "Premium": ("Plants", "Rare & Exotic"),
 }
 
 BULK_COLUMNS = [
@@ -173,14 +173,61 @@ def calc_base_price(retail_price, gst_rate: Decimal, commission_rate: Decimal) -
 
 def pick_category_names(product: dict) -> tuple[str, str, str]:
     names = [c.get("name", "") for c in (product.get("categories") or []) if c.get("name")]
+    names_set = set(names)
     source = " | ".join(names)
-    for name in names:
-        if name in CATEGORY_MAP:
-            cat, sub = CATEGORY_MAP[name]
-            return cat, sub, source
-    if names:
-        return "REVIEW_NEEDED", "", source
-    return "", "", source
+    
+    mapped_subs = []
+    
+    # 1. Aquatic Mosses (e.g. Christmas Moss)
+    # Aquatic Mosses (e.g. Christmas Moss) → Plants > Aquatic Moss + Terrarium moss + Aquatic plants +  Terrarium & Paludarium
+    if "Moss" in names_set and "Aquatic Plants" in names_set:
+        mapped_subs.append(("Plants", "Aquatic Moss"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+
+    # 2. Terrarium Mosses (e.g. Sheet/Mood Moss)
+    # Terrarium Mosses (e.g. Sheet/Mood Moss) → Terrarium & Paludarium > Terrarium moss + Plants
+    elif "Moss" in names_set:
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+        mapped_subs.append(("Plants", "Mosses"))
+
+    # 3. Rare/Exotic Rhizomes & Aquatic Plants (e.g. Bucephalandra)
+    # Rare/Exotic Rhizomes & Aquatic Plants (e.g. Bucephalandra) → Plants > Rare & Exotic + Aquatic plants + Terrarium & Paludarium
+    elif ("Rhizome plants" in names_set or "Aquatic Plants" in names_set) and ("Exotic Plants" in names_set or "Premium" in names_set):
+        mapped_subs.append(("Plants", "Rare & Exotic"))
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # 4. Standard Rhizomes & Aquatic Plants (e.g. Anubias)
+    # Standard Rhizomes & Aquatic Plants (e.g. Anubias) → Plants > Aquatic Plants + Terrarium & Paludarium
+    elif "Rhizome plants" in names_set or "Aquatic Plants" in names_set:
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # 5. Exotic/Indoor/Terrarium Plants (Non-Aquatic) (e.g. Peperomia, Fittonia, Ferns)
+    # Exotic/Indoor/Terrarium Plants (Non-Aquatic) (e.g. Peperomia, Fittonia, Ferns) → Terrarium & Paludarium > Terrarium Plants
+    elif "Exotic Plants" in names_set or "Indoor Plants" in names_set or "Terrarium Plants" in names_set:
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # Deduplicate mapped_subs
+    mapped_subs = list(dict.fromkeys(mapped_subs))
+
+    # Fallback to single category map
+    if not mapped_subs:
+        for name in names:
+            if name in CATEGORY_MAP:
+                mapped_subs.append(CATEGORY_MAP[name])
+                break
+
+    if not mapped_subs:
+        if names:
+            return "REVIEW_NEEDED", "", source
+        return "", "", source
+
+    cats = list(dict.fromkeys([c for c, _ in mapped_subs]))
+    subs = list(dict.fromkeys([s for _, s in mapped_subs]))
+
+    return "|".join(cats), "|".join(subs), source
 
 
 def pick_tags(product: dict) -> str:

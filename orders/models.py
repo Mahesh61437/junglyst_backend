@@ -4,11 +4,12 @@ from django.utils.translation import gettext_lazy as _
 import uuid
 
 class OrderStatus(models.TextChoices):
-    PENDING = 'pending', _('Pending')
-    PLACED = 'placed', _('Placed')
-    PROCESSING = 'processing', _('Processing')
-    SHIPPED = 'shipped', _('Shipped')
-    DELIVERED = 'delivered', _('Delivered')
+    PENDING = 'pending', _('Pending')           # order created, awaiting payment
+    CONFIRMED = 'confirmed', _('Confirmed')     # payment successful
+    FAILED = 'failed', _('Failed')             # payment failed
+    PROCESSING = 'processing', _('Processing') # seller(s) actively processing
+    SHIPPED = 'shipped', _('Shipped')          # at least one sub-order shipped
+    DELIVERED = 'delivered', _('Delivered')    # all sub-orders delivered
     CANCELLED = 'cancelled', _('Cancelled')
     RETURNED = 'returned', _('Returned')
 
@@ -53,7 +54,9 @@ class SubOrderStatus(models.TextChoices):
     PLACED = 'placed', _('Placed')
     CONFIRMED = 'confirmed', _('Confirmed')
     PACKING = 'packing', _('Packing')
-    SHIPPED = 'shipped', _('Shipped')
+    BOOKED = 'booked', _('Courier Booked')          # AWB assigned, awaiting courier pickup
+    BOOKING_FAILED = 'booking_failed', _('Booking Failed')  # Auto-booking exhausted retries
+    SHIPPED = 'shipped', _('Shipped')               # Courier picked up the package
     IN_TRANSIT = 'in_transit', _('In Transit')
     OUT_FOR_DELIVERY = 'out_for_delivery', _('Out for Delivery')
     DELIVERED = 'delivered', _('Delivered')
@@ -79,6 +82,11 @@ class SubOrder(SoftDeleteModel):
     confirmed_at = models.DateTimeField(null=True, blank=True)
     dispatch_deadline = models.DateTimeField(null=True, blank=True)  # confirmed_at + 48 h
 
+    # Snapshot of the shipping promise shown to the buyer at checkout
+    promised_ship_date = models.DateField(null=True, blank=True)
+    promised_delivery_min = models.DateField(null=True, blank=True)
+    promised_delivery_max = models.DateField(null=True, blank=True)
+
     # Packaging photos (stored as JSON list of URLs)
     packaging_photos = models.JSONField(default=list)
 
@@ -91,6 +99,7 @@ class SubOrder(SoftDeleteModel):
     # Shipment
     awb_number = models.CharField(max_length=100, null=True, blank=True)
     courier_name = models.CharField(max_length=100, null=True, blank=True)
+    booking_failure_reason = models.TextField(null=True, blank=True)  # set when status=booking_failed
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

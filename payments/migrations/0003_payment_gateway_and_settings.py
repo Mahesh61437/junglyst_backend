@@ -10,6 +10,12 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        # The _like index for the original razorpay_order_id was not renamed when
+        # 0002_rename_... ran, so it must be dropped before we add razorpay_order_id back.
+        migrations.RunSQL(
+            sql="DROP INDEX IF EXISTS payments_payment_razorpay_order_id_f38fef72_like;",
+            reverse_sql=migrations.RunSQL.noop,
+        ),
         migrations.AddField(
             model_name="payment",
             name="gateway",

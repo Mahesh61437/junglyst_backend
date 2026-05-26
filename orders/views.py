@@ -17,7 +17,8 @@ from cart.models import Cart
 from core.models import ProductVariant
 from shipping.models import ShippingAddress
 from shipping.serializers import ShippingAddressSerializer
-from shipping.pincode_zones import classify_pincode
+from shipping.pincode_zones import classify_pincode, transit_days_for_zone
+from shipping.services import check_pincode_deliverable
 from notifications.models import AppNotification
 from payments.models import Payment
 from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
@@ -46,15 +47,19 @@ def _sub_order_number(master: str, index: int) -> str:
     """JNG-2026-ABCDE-A, -B, -C"""
     return f"{master}-{_LETTER[index]}"
 
-def _shipping_fee_for_seller(subtotal: float, has_heavy: bool) -> int:
-    if has_heavy:
-        if subtotal < 999:   return 99
-        if subtotal < 2499:  return 49
+def _build_shipping_config_map(seller_ids):
+    """Fetch SellerShippingConfig rows for the given seller IDs in one query.
+    Returns dict keyed (seller_id_str, item_category) → config instance."""
+    from sellers.models import SellerShippingConfig
+    configs = SellerShippingConfig.objects.filter(seller_id__in=seller_ids)
+    return {(str(c.seller_id), c.item_category): c for c in configs}
+
+
+def _shipping_fee_for_seller(subtotal: float, config) -> int:
+    """Return shipping fee using DB config. Returns 0 (free) when no config set."""
+    if config is None:
         return 0
-    else:
-        if subtotal < 699:   return 99
-        if subtotal < 999:   return 49
-        return 0
+    return config.fee_for(subtotal)
 
 
 def _finalize_order(order, payment=None, payment_data=None):
@@ -66,7 +71,7 @@ def _finalize_order(order, payment=None, payment_data=None):
         payment.save()
 
     order.is_paid = True
-    order.status = 'placed'
+    order.status = 'confirmed'
     order.payment_status = 'captured'
     order.save()
 
@@ -147,12 +152,6 @@ class CheckoutView(generics.GenericAPIView):
         else:
             return Response({"error": "cart_id or items is required"}, status=400)
 
-        # Hard pincode zone check (SHIP-002)
-        if pincode:
-            zone_info = classify_pincode(str(pincode))
-            if not zone_info['deliverable']:
-                return Response({"error": "Sorry, we don't deliver to your pincode yet."}, status=400)
-
         # Address
         if request.user.is_authenticated and address_id:
             # Saved address flow
@@ -178,9 +177,16 @@ class CheckoutView(generics.GenericAPIView):
             email = guest_info.get('email') or (request.user.email if request.user.is_authenticated else None)
             phone = guest_info.get('phone') or (request.user.phone if request.user.is_authenticated else None)
 
+        # Pincode deliverability check — verified against the active logistics provider API
+        effective_pincode = str(pincode or (shipping_address or {}).get('pincode', '') or '')
+        if effective_pincode:
+            is_deliverable, delivery_msg = check_pincode_deliverable(effective_pincode)
+            if not is_deliverable:
+                return Response({"error": delivery_msg or "Sorry, we don't deliver to your pincode yet."}, status=400)
+
         # Stock check + group items by seller
 
-        seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy}
+        seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
         for item in cart_items:
             if item.quantity > item.variant.stock:
                 return Response({
@@ -194,18 +200,63 @@ class CheckoutView(generics.GenericAPIView):
                     'items': [],
                     'subtotal': 0,
                     'has_heavy': False,
+                    'has_light': False,
                 }
             price = float(item.variant.price) * item.quantity
             seller_buckets[sid]['items'].append(item)
             seller_buckets[sid]['subtotal'] += price
+            # Track both light and heavy items to detect hybrid carts
             if item.variant.item_category == 'heavy':
                 seller_buckets[sid]['has_heavy'] = True
+            elif item.variant.item_category == 'light':
+                seller_buckets[sid]['has_light'] = True
 
         # SHIP-003: max 3 sellers
         if len(seller_buckets) > 3:
             return Response({"error": "Cart supports up to 3 sellers. Please remove items."}, status=400)
 
+        # Shipping availability: snapshot each seller's next dispatch date.
+        # Empty shipping_days isn't blocking — model defaults to Mon/Wed/Fri at
+        # creation and existing rows are backfilled. We still guard the rare
+        # case where every upcoming day is blacked out, since that means the
+        # seller genuinely can't ship anything for the next 90 days.
+        from sellers.models import _default_shipping_days
+        for sid, bucket in seller_buckets.items():
+            seller_user = bucket['seller']
+            try:
+                seller_profile = seller_user.seller_profile
+            except Exception:
+                seller_profile = None
+            store = (seller_profile.store_name if seller_profile else 'A seller in your cart')
+            if seller_profile and not (seller_profile.shipping_days or []):
+                # Belt-and-braces — if somehow still empty in the DB, fall back to defaults
+                seller_profile.shipping_days = _default_shipping_days()
+                seller_profile.save(update_fields=['shipping_days'])
+            next_ship = seller_profile.get_next_shipping_date() if seller_profile else None
+            if not next_ship:
+                return Response({
+                    "error": f"{store} is on a break and not accepting orders right now. Please remove their items or try again later."
+                }, status=400)
+            bucket['next_shipping_date'] = next_ship
+
+        # Compute promised delivery range from the buyer's pincode zone
+        zone_for_eta = (classify_pincode(effective_pincode).get('zone') if effective_pincode else None)
+        min_transit, max_transit = transit_days_for_zone(zone_for_eta)
+
         # SHIP-003: min order check removed; accept all cart values
+
+        # Resolve per-seller shipping configs in one query
+        shipping_config_map = _build_shipping_config_map(seller_buckets.keys())
+        for sid, bucket in seller_buckets.items():
+            # Determine shipping category: hybrid if both light and heavy, else heavy or light
+            if bucket['has_light'] and bucket['has_heavy']:
+                cat = 'hybrid'
+            elif bucket['has_heavy']:
+                cat = 'heavy'
+            else:
+                cat = 'light'
+            bucket['shipping_category'] = cat
+            bucket['shipping_config'] = shipping_config_map.get((sid, cat))
 
         # Totals
         subtotal = sum(float(item.variant.price) * item.quantity for item in cart_items)
@@ -215,8 +266,11 @@ class CheckoutView(generics.GenericAPIView):
             if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
-        has_heavy = any(b['has_heavy'] for b in seller_buckets.values())
-        total_shipping = _shipping_fee_for_seller(subtotal, has_heavy)
+        # Master shipping = sum of per-seller fees (each seller has independent config)
+        total_shipping = sum(
+            _shipping_fee_for_seller(b['subtotal'], b['shipping_config'])
+            for b in seller_buckets.values()
+        )
         total_amount = subtotal + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
@@ -242,7 +296,10 @@ class CheckoutView(generics.GenericAPIView):
         dispatch_deadline = now + timedelta(hours=48)
 
         for idx, (sid, bucket) in enumerate(seller_buckets.items()):
-            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['has_heavy'])
+            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['shipping_config'])
+            promised_ship = bucket.get('next_shipping_date')
+            promised_min = (promised_ship + timedelta(days=min_transit)) if promised_ship else None
+            promised_max = (promised_ship + timedelta(days=max_transit)) if promised_ship else None
             sub_order = SubOrder.objects.create(
                 order=order,
                 sub_order_number=_sub_order_number(order_number, idx),
@@ -252,6 +309,9 @@ class CheckoutView(generics.GenericAPIView):
                 seller_total=bucket['subtotal'] + seller_shipping,
                 status='pending',
                 dispatch_deadline=dispatch_deadline,
+                promised_ship_date=promised_ship,
+                promised_delivery_min=promised_min,
+                promised_delivery_max=promised_max,
             )
 
             for item in bucket['items']:
@@ -305,10 +365,13 @@ class CheckoutView(generics.GenericAPIView):
                     "amount": total_amount,
                     "currency": "INR",
                 }, status=201)
-            except Exception as e:
-                print(f"DEBUG: Cashfree failed: {str(e)}")
+            except Exception:
+                # Log full traceback server-side; return a generic message to the
+                # client so we never echo exception text (which may contain URLs,
+                # request headers, or upstream API error bodies) into the browser.
+                logger.exception("Cashfree order initialization failed for order %s", order.order_number)
                 return Response({
-                    "error": f"Failed to initialize payment gateway: {str(e)}"
+                    "error": "Payment gateway is temporarily unavailable. Please try again in a moment."
                 }, status=400)
 
         # Razorpay
@@ -338,10 +401,10 @@ class CheckoutView(generics.GenericAPIView):
                 "amount": total_amount,
                 "currency": "INR",
             }, status=201)
-        except Exception as e:
-            print(f"DEBUG: Razorpay failed: {str(e)}")
+        except Exception:
+            logger.exception("Razorpay order initialization failed for order %s", order.order_number)
             return Response({
-                "error": f"Failed to initialize payment gateway: {str(e)}"
+                "error": "Payment gateway is temporarily unavailable. Please try again in a moment."
             }, status=400)
 
 class VerifyPaymentView(generics.GenericAPIView):
@@ -409,7 +472,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 
                 order.is_paid = True
                 order.payment_status = 'completed'
-                order.status = 'placed'
+                order.status = 'confirmed'
                 order.payment_gateway = PaymentGateway.RAZORPAY
                 order.save()
 
@@ -431,7 +494,8 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    clear_buyer_cart_task.delay(str(order.user_id))
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -490,7 +554,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 
                 order.is_paid = True
                 order.payment_status = 'completed'
-                order.status = 'placed'
+                order.status = 'confirmed'
                 order.payment_gateway = PaymentGateway.CASHFREE
                 order.save()
 
@@ -512,7 +576,8 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    clear_buyer_cart_task.delay(str(order.user_id))
+                    from cart.models import CartItem
+                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -655,7 +720,27 @@ class PaymentStatusView(APIView):
                 url = f"https://api.razorpay.com/v1/orders/{razorpay_order_id}/payments"
                 r = req.get(url, auth=(key_id, key_secret), timeout=10)
                 if r.status_code == 200:
-                    for p in r.json().get('items', []):
+                    items = r.json().get('items', [])
+                    # Zero payment attempts at Razorpay = user closed the modal
+                    # without entering payment details. Mark cancelled so the
+                    # frontend can stop polling immediately.
+                    if not items:
+                        if payment.status not in ('captured', 'failed', 'cancelled'):
+                            payment.status = 'cancelled'
+                            payment.gateway_status = 'cancelled'
+                            payment.save(update_fields=['status', 'gateway_status', 'updated_at'])
+                            order = payment.order
+                            if order.status == 'pending':
+                                order.status = 'failed'
+                                order.payment_status = 'failed'
+                                order.save(update_fields=['status', 'payment_status', 'updated_at'])
+                            try:
+                                from payments.tasks import cancel_payment_checks
+                                cancel_payment_checks(payment.id)
+                            except Exception:
+                                pass
+                        return Response({"status": "cancelled"})
+                    for p in items:
                         pstatus = p.get('status', '')
                         if pstatus == 'captured':
                             try:
@@ -701,55 +786,28 @@ class CancelOrderView(APIView):
         return Response({'message': 'Order cancelled successfully'})
 
 
-class PaymentStatusView(APIView):
-    permission_classes = (permissions.AllowAny,)
-
-    def get(self, request):
-        razorpay_order_id = request.query_params.get('razorpay_order_id')
-        cashfree_order_id = request.query_params.get('cashfree_order_id')
-
-        if razorpay_order_id:
-            payment = Payment.objects.filter(razorpay_order_id=razorpay_order_id).select_related('order').first()
-        elif cashfree_order_id:
-            if not hasattr(Payment, 'cashfree_order_id'):
-                return Response(
-                    {"error": "Cashfree payment lookup is not available on this backend."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            payment = Payment.objects.filter(cashfree_order_id=cashfree_order_id).select_related('order').first()
-        else:
-            return Response(
-                {"error": "Provide razorpay_order_id or cashfree_order_id."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if not payment:
-            return Response({"error": "Payment not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        order = payment.order
-        if payment.status in ('captured', 'completed') or order.payment_status in ('captured', 'completed') or order.is_paid:
-            return Response({"status": "success", "order": OrderSerializer(order).data})
-        if payment.status in ('failed', 'cancelled'):
-            return Response({"status": "failed"})
-        return Response({"status": "processing"})
-
 class OrderListView(generics.ListAPIView):
     serializer_class = OrderListSerializer
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'grower':
-            qs = Order.objects.filter(items__seller=user).distinct()
-        elif user.is_staff or user.role == 'admin':
+        if user.is_staff or user.role == 'admin':
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
 
         # Single query for items + their product images — eliminates all N+1
         items_qs = OrderItem.objects.select_related('product').prefetch_related('product__images')
+        sub_orders_qs = SubOrder.objects.select_related(
+            'seller', 'seller__seller_profile'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+        )
         return qs.prefetch_related(
             Prefetch('items', queryset=items_qs),
+            Prefetch('sub_orders', queryset=sub_orders_qs),
+            Prefetch('shipments', to_attr='shipments_prefetched'),
         ).order_by('-created_at')
 
 
@@ -759,9 +817,7 @@ class OrderDetailView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'grower':
-            qs = Order.objects.filter(items__seller=user).distinct()
-        elif user.is_staff or user.role == 'admin':
+        if user.is_staff or user.role == 'admin':
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
@@ -789,8 +845,8 @@ class OrderTrackView(APIView):
 
     def get(self, request):
         order_id = request.query_params.get('order_id')
-        order_number = request.query_params.get('order_number')
-        
+        order_number = (request.query_params.get('order_number') or '').strip().upper() or None
+
         if not order_id and not order_number:
             return Response({'error': 'order_id or order_number query parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -808,11 +864,10 @@ class OrderTrackView(APIView):
         ).prefetch_related(
             Prefetch('items', queryset=items_qs),
         )
-        qs = Order.objects.prefetch_related(
+        qs = Order.objects.select_related('payment').prefetch_related(
             Prefetch('items', queryset=items_qs),
             Prefetch('sub_orders', queryset=sub_orders_qs),
             'shipments',
-            'payments',
         )
 
         if order_uuid:
@@ -847,7 +902,24 @@ class SellerSubOrderListView(generics.ListAPIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_queryset(self):
-        qs = SubOrder.objects.filter(seller=self.request.user, order__is_paid=True).select_related('order').prefetch_related('items')
+        from shipping.models import Shipment
+        from core.models import ProductImage
+        seller = self.request.user
+        items_qs = OrderItem.objects.select_related('product').prefetch_related(
+            Prefetch('product__images', queryset=ProductImage.objects.all()),
+        )
+        qs = SubOrder.objects.filter(
+            seller=seller, order__is_paid=True
+        ).select_related(
+            'order', 'order__user'
+        ).prefetch_related(
+            Prefetch('items', queryset=items_qs),
+            Prefetch(
+                'order__shipments',
+                queryset=Shipment.objects.filter(seller=seller),
+                to_attr='seller_shipments',
+            ),
+        )
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -857,6 +929,18 @@ class SellerSubOrderListView(generics.ListAPIView):
         if self.request.query_params.get('no_pagination'):
             return None
         return super().paginate_queryset(queryset)
+
+
+class SellerSubOrderDetailView(APIView):
+    """GET /orders/seller/sub-orders/<pk>/ — fetch a single sub-order for the seller."""
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, pk):
+        try:
+            sub_order = SubOrder.objects.get(id=pk, seller=request.user)
+        except SubOrder.DoesNotExist:
+            return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
 
 
 class ConfirmSubOrderView(APIView):
@@ -970,7 +1054,7 @@ class SubOrderShipView(APIView):
         except SubOrder.DoesNotExist:
             return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        if sub_order.status not in ('confirmed', 'packing'):
+        if sub_order.status not in ('confirmed', 'packing', 'booking_failed'):
             return Response({'error': f'Cannot ship: current status is {sub_order.status}'}, status=status.HTTP_400_BAD_REQUEST)
 
         if not sub_order.packaging_photos:
@@ -988,23 +1072,43 @@ class SubOrderShipView(APIView):
         manual_awb = request.data.get('awb_number')
         manual_courier = request.data.get('courier_name')
 
+        # On rebook after failure, clear the stale failure reason and any pending
+        # Shipment record so the task's duplicate-guard doesn't block it.
+        if sub_order.status == 'booking_failed':
+            SubOrder.objects.filter(id=sub_order.id).update(booking_failure_reason=None)
+            from shipping.models import Shipment
+            Shipment.objects.filter(order=sub_order.order, seller=request.user, status='pending').delete()
+
         if manual_awb:
+            # Manual AWB entry — seller confirming with their own courier; mark as booked immediately
             sub_order.awb_number = manual_awb
             sub_order.courier_name = manual_courier or 'Manual'
-            sub_order.status = 'shipped'
-            sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'updated_at'])
+            sub_order.status = 'booked'
+            sub_order.booking_failure_reason = None
+            sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'booking_failure_reason', 'updated_at'])
         else:
-            sub_order.status = 'shipped'
+            # Celery will book courier async; mark as 'booked' right away so the
+            # order moves from "Pending" to "Booking Courier" tab immediately.
+            sub_order.status = 'booked'
             sub_order.save(update_fields=['status', 'updated_at'])
-            from shipping.tasks import create_nimbuspost_shipment
-            create_nimbuspost_shipment.delay(str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id))
+            from shipping.tasks import create_shipment_task
+            try:
+                create_shipment_task.delay(
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                )
+            except Exception as broker_err:
+                # Celery broker unavailable — run synchronously so the shipment still gets booked
+                logger.warning("Celery broker unavailable (%s); running create_shipment_task synchronously", broker_err)
+                create_shipment_task(
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                )
 
         buyer = sub_order.order.user
         if buyer:
             AppNotification.objects.create(
                 user=buyer,
-                title='Your order is on its way!',
-                message=f'Order {sub_order.sub_order_number} has been shipped. AWB: {sub_order.awb_number or "pending"}.',
+                title='Your order is being packed!',
+                message=f'Order {sub_order.sub_order_number} is being prepared for dispatch. Tracking details will be shared once shipped.',
             )
 
         return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
@@ -1047,8 +1151,8 @@ class ShipNowView(APIView):
             )
 
         # Trigger async NimbusPost shipment creation
-        from shipping.tasks import create_nimbuspost_shipment
-        create_nimbuspost_shipment.delay(str(order_id), str(request.user.id), courier_id)
+        from shipping.tasks import create_shipment_task
+        create_shipment_task.delay(str(order_id), str(request.user.id), courier_id)
 
         return Response(
             {'message': 'Shipment initiated', 'order_id': str(order_id)},
@@ -1075,7 +1179,9 @@ _SELLER_MSGS = {
 _VALID_TRANSITIONS = {
     'placed':           {'confirmed', 'cancelled'},
     'confirmed':        {'packing', 'cancelled'},
-    'packing':          {'shipped', 'cancelled'},
+    'packing':          {'booked', 'shipped', 'cancelled'},
+    'booked':           {'booking_failed', 'shipped', 'cancelled'},
+    'booking_failed':   {'packing', 'booked', 'cancelled'},       # seller retries or manual AWB
     'shipped':          {'in_transit', 'delivered', 'delivery_failed', 'cancelled'},
     'in_transit':       {'out_for_delivery', 'delivered', 'delivery_failed', 'cancelled'},
     'out_for_delivery': {'delivered', 'delivery_failed'},

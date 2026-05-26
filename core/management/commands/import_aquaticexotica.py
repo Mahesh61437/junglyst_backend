@@ -50,13 +50,13 @@ DEFAULT_HEIGHT_CM = Decimal("10.0")
 DEFAULT_PACKED_WEIGHT_GRAMS = 200
 
 CATEGORY_MAP: dict[str, tuple[str, str]] = {
-    "Aquatic Plants":   ("Aquascaping",              "Starter Packs"),
-    "Rhizome plants":   ("Aquascaping",              "Starter Packs"),
-    "Moss":             ("Aquascaping",              "Starter Packs"),
-    "Terrarium Plants": ("Terrarium & Paludarium",   "Terrarium Accessories"),
-    "Indoor Plants":    ("Terrarium & Paludarium",   "Terrarium Accessories"),
-    "Exotic Plants":    ("Terrarium & Paludarium",   "Terrarium Accessories"),
-    "Premium":          ("Brand & Specialized",      "DOOA System"),
+    "Aquatic Plants":   ("Plants",                   "Aquatic Plants"),
+    "Rhizome plants":   ("Plants",                   "Aquatic Plants"),
+    "Moss":             ("Terrarium & Paludarium",   "Terrarium Moss"),
+    "Terrarium Plants": ("Terrarium & Paludarium",   "Terrarium Plants"),
+    "Indoor Plants":    ("Terrarium & Paludarium",   "Terrarium Plants"),
+    "Exotic Plants":    ("Terrarium & Paludarium",   "Terrarium Plants"),
+    "Premium":          ("Plants",                   "Rare & Exotic"),
 }
 
 
@@ -184,23 +184,85 @@ def _infer_care(description_html: str) -> dict[str, str]:
 def _resolve_category(product: dict):
     from core.models import Category, SubCategory
     cat_names = [c.get("name", "") for c in (product.get("categories") or []) if c.get("name")]
-    for name in cat_names:
-        if name in CATEGORY_MAP:
-            cat_name, sub_name = CATEGORY_MAP[name]
+    names_set = set(cat_names)
+    
+    mapped_subs = []
+    
+    # 1. Aquatic Mosses (e.g. Christmas Moss)
+    # Aquatic Mosses (e.g. Christmas Moss) → Plants > Aquatic Moss + Terrarium moss + Aquatic plants +  Terrarium & Paludarium
+    if "Moss" in names_set and "Aquatic Plants" in names_set:
+        mapped_subs.append(("Plants", "Aquatic Moss"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+
+    # 2. Terrarium Mosses (e.g. Sheet/Mood Moss)
+    # Terrarium Mosses (e.g. Sheet/Mood Moss) → Terrarium & Paludarium > Terrarium moss + Plants
+    elif "Moss" in names_set:
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Moss"))
+        mapped_subs.append(("Plants", "Mosses"))
+
+    # 3. Rare/Exotic Rhizomes & Aquatic Plants (e.g. Bucephalandra)
+    # Rare/Exotic Rhizomes & Aquatic Plants (e.g. Bucephalandra) → Plants > Rare & Exotic + Aquatic plants + Terrarium & Paludarium
+    elif ("Rhizome plants" in names_set or "Aquatic Plants" in names_set) and ("Exotic Plants" in names_set or "Premium" in names_set):
+        mapped_subs.append(("Plants", "Rare & Exotic"))
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # 4. Standard Rhizomes & Aquatic Plants (e.g. Anubias)
+    # Standard Rhizomes & Aquatic Plants (e.g. Anubias) → Plants > Aquatic Plants + Terrarium & Paludarium
+    elif "Rhizome plants" in names_set or "Aquatic Plants" in names_set:
+        mapped_subs.append(("Plants", "Aquatic Plants"))
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # 5. Exotic/Indoor/Terrarium Plants (Non-Aquatic) (e.g. Peperomia, Fittonia, Ferns)
+    # Exotic/Indoor/Terrarium Plants (Non-Aquatic) (e.g. Peperomia, Fittonia, Ferns) → Terrarium & Paludarium > Terrarium Plants
+    elif "Exotic Plants" in names_set or "Indoor Plants" in names_set or "Terrarium Plants" in names_set:
+        mapped_subs.append(("Terrarium & Paludarium", "Terrarium Plants"))
+
+    # Deduplicate mapped_subs
+    mapped_subs = list(dict.fromkeys(mapped_subs))
+
+    # Fallback to single category map
+    if not mapped_subs:
+        for name in cat_names:
+            if name in CATEGORY_MAP:
+                mapped_subs.append(CATEGORY_MAP[name])
+                break
+
+    cats = []
+    subs = []
+    for cat_name, sub_name in mapped_subs:
+        try:
+            cat_obj = Category.objects.get(name=cat_name)
+            if cat_obj not in cats:
+                cats.append(cat_obj)
             try:
-                cat = Category.objects.get(name=cat_name)
-            except Category.DoesNotExist:
-                continue
-            try:
-                sub = SubCategory.objects.get(category=cat, name=sub_name)
+                sub_obj = SubCategory.objects.get(category=cat_obj, name=sub_name)
+                if sub_obj not in subs:
+                    subs.append(sub_obj)
             except SubCategory.DoesNotExist:
-                sub = None
-            return cat, sub, cat_names
-    return None, None, cat_names
+                pass
+        except Category.DoesNotExist:
+            pass
+
+    return cats, subs, cat_names
 
 
-def _ae_slug(ae_id: int) -> str:
+def _ae_key(ae_id: int) -> str:
+    """Internal idempotency key — used only for DB lookup, never stored as the slug."""
     return f"ae-{ae_id}"
+
+
+def _name_slug(name: str, ae_id: int, existing_slugs: set) -> str:
+    """Generate an SEO-friendly slug from the product name with collision handling."""
+    base = slugify(name) or f"ae-{ae_id}"
+    slug = base
+    counter = 1
+    while slug in existing_slugs:
+        slug = f"{base}-{counter}"
+        counter += 1
+    existing_slugs.add(slug)
+    return slug
 
 
 # ── Management command ────────────────────────────────────────────────────────
@@ -268,14 +330,20 @@ class Command(BaseCommand):
 
         created = updated = skipped = img_ok = img_fail = errors = 0
 
+        # Pre-build set of slugs already in the DB so _name_slug can avoid collisions
+        from core.models import Product as _Product
+        existing_slugs: set = set(_Product.all_objects.values_list("slug", flat=True))
+
         for idx, raw in enumerate(products, start=1):
             ae_id: int = raw["id"]
-            slug = _ae_slug(ae_id)
+            ae_key = _ae_key(ae_id)
+            slug = _name_slug(raw.get("name", ""), ae_id, existing_slugs)
 
             try:
                 result, n_img_ok, n_img_fail = self._import_product(
                     raw=raw,
                     slug=slug,
+                    ae_key=ae_key,
                     seller=seller,
                     do_update=do_update,
                     skip_images=skip_images,
@@ -303,7 +371,7 @@ class Command(BaseCommand):
             status_label = {"created": "CREATED", "updated": "UPDATED", "skipped": "SKIPPED"}[result]
             img_note = f"  [{n_img_ok} imgs]" if n_img_ok else ""
             self.stdout.write(
-                f"  [{idx}/{len(products)}] {status_label}  {slug}  "
+                f"  [{idx}/{len(products)}] {status_label}  {slug}  (ae_key={ae_key})  "
                 f"{raw['name'][:55]}{img_note}"
             )
 
@@ -364,6 +432,7 @@ class Command(BaseCommand):
         *,
         raw: dict,
         slug: str,
+        ae_key: str,
         seller,
         do_update: bool,
         skip_images: bool,
@@ -389,10 +458,14 @@ class Command(BaseCommand):
         rating = Decimal(str(raw.get("rating") or "5.0"))
 
         care = _infer_care(description_html)
-        cat, sub, _ = _resolve_category(raw)
+        cat, subs, _ = _resolve_category(raw)
         description = _strip_html(description_html, max_len=8000)
 
-        existing = Product.all_objects.filter(slug=slug).first()
+        # Look up by the old ae-{id} key first (backward compat), then by new name slug
+        existing = (
+            Product.all_objects.filter(slug=ae_key).first()
+            or Product.all_objects.filter(slug=slug).first()
+        )
         if existing and not do_update:
             return "skipped", 0, 0
 
@@ -405,7 +478,6 @@ class Command(BaseCommand):
             tagline="",
             description=description,
             seller=seller,
-            sub_category=sub,
             scientific_name="",
             care_level=care["care_level"],
             light_requirements=care["light_requirements"],
@@ -422,6 +494,9 @@ class Command(BaseCommand):
         if existing:
             for field, value in product_fields.items():
                 setattr(existing, field, value)
+            # Migrate old ae-{id} slug to SEO-friendly name slug
+            if existing.slug == ae_key:
+                existing.slug = slug
             existing.save()
             product = existing
             action = "updated"
@@ -431,7 +506,10 @@ class Command(BaseCommand):
             action = "created"
 
         if cat:
-            product.categories.set([cat])
+            product.categories.set(cat)
+
+        if subs:
+            product.sub_categories.set(subs)
 
         tag_names = [t.get("name") for t in (raw.get("tagDetails") or []) if t.get("name")]
         tags = []

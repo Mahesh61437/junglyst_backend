@@ -101,6 +101,8 @@ CATEGORIES_DATA = [
         'subcategories': [
             'Terrarium Tanks',
             'Terrarium Accessories',
+            'Terrarium Moss',
+            'Terrarium Plants',
         ],
     },
     {
@@ -146,6 +148,30 @@ CATEGORIES_DATA = [
             'Aquarium Stands',
         ],
     },
+    {
+        'name': 'Plants',
+        'gst_percentage': Decimal('5.00'),
+        'commission_rate': Decimal('20.00'),
+        'shipping_type': 'plant',
+        'subcategories': [
+            'Aquatic Plants',
+            'Aquatic Moss',
+            'Beginner Friendly',
+            'Carnivorous Plants',
+            'Carpet Plants',
+            'Epiphytes',
+            'Ferns',
+            'Floating Plants',
+            'Lily',
+            'Mosses',
+            'Orchids',
+            'Pot Plants',
+            'Rare & Exotic',
+            'Succulents & Cacti',
+            'Tissue Culture',
+            'Tropical Plants',
+        ],
+    },
 ]
 
 
@@ -187,10 +213,10 @@ class Command(BaseCommand):
             for sub_name in cat_data.get('subcategories', []):
                 sub_slug = slugify(f"{cat_data['name']}-{sub_name}")
                 sub, sub_created = SubCategory.objects.get_or_create(
-                    slug=sub_slug,
+                    category=cat,
+                    name=sub_name,
                     defaults={
-                        'category': cat,
-                        'name': sub_name,
+                        'slug': sub_slug,
                         # Inherits GST & commission from parent (null = inherit)
                         'gst_percentage': None,
                         'commission_rate': None,
@@ -199,6 +225,7 @@ class Command(BaseCommand):
                 if not sub_created:
                     sub.name = sub_name
                     sub.category = cat
+                    sub.slug = sub_slug
                     sub.is_deleted = False
                     sub.save()
 
