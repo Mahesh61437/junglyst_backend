@@ -36,38 +36,74 @@ class SellerDashboardTest(TestCase):
         }
         response = self.client.post('/api/sellers/dashboard/', data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        
+
         profile = SellerProfile.objects.get(user=self.user)
         self.assertEqual(profile.store_name, 'Green Sanctuary')
         self.assertEqual(profile.slug, 'green-sanctuary')
+        # Pickup fields, when explicitly provided, are still persisted.
+        self.assertEqual(profile.pickup_address, '123 Green Lane')
+        self.assertEqual(profile.location_city, 'Bangalore')
+        self.assertEqual(profile.location_pincode, '560001')
 
-    def test_update_profile_missing_mandatory_fields(self):
-        # Missing pickup_address
+    def test_update_profile_branding_only_succeeds(self):
+        # Studio Identity form sends only branding fields (no pickup info).
+        # Pickup-address fields are owned by /api/sellers/pickup-address/.
         data = {
             'store_name': 'Green Sanctuary',
-            'location_city': 'Bangalore',
-            'location_state': 'Karnataka',
-            'location_pincode': '560001',
-            'phone': '9876543210'
+            'bio': 'A beautiful bio',
+            'brand_color': '#0A3029',
         }
         response = self.client.post('/api/sellers/dashboard/', data, format='json')
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn('error', response.data)
-        self.assertEqual(response.data['error'], 'Pickup street address is required.')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        profile = SellerProfile.objects.get(user=self.user)
+        self.assertEqual(profile.store_name, 'Green Sanctuary')
+
+    def test_update_profile_ignores_null_pickup_fields(self):
+        # Frontend may include pickup fields as null in the Studio Identity payload
+        # because they share a state object. These must not wipe stored values
+        # and must not trigger validation errors.
+        profile = SellerProfile.objects.create(
+            user=self.user,
+            store_name='Existing Store',
+            slug='existing-store',
+            pickup_address='Old Address',
+            location_city='Bangalore',
+            location_state='Karnataka',
+            location_pincode='560001',
+        )
+        data = {
+            'store_name': 'Renamed Store',
+            'pickup_address': None,
+            'location_city': None,
+            'location_state': None,
+            'location_pincode': None,
+            'phone': None,
+        }
+        response = self.client.post('/api/sellers/dashboard/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        profile.refresh_from_db()
+        self.assertEqual(profile.store_name, 'Renamed Store')
+        self.assertEqual(profile.pickup_address, 'Old Address')
+        self.assertEqual(profile.location_city, 'Bangalore')
 
     def test_update_profile_invalid_phone(self):
         data = {
             'store_name': 'Green Sanctuary',
-            'location_city': 'Bangalore',
-            'location_state': 'Karnataka',
-            'location_pincode': '560001',
-            'pickup_address': '123 Green Lane',
-            'phone': '12345'
+            'phone': '12345',
         }
         response = self.client.post('/api/sellers/dashboard/', data, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('error', response.data)
         self.assertEqual(response.data['error'], 'Phone number must be a valid 10-digit Indian mobile number.')
+
+    def test_update_profile_invalid_pincode(self):
+        data = {
+            'store_name': 'Green Sanctuary',
+            'location_pincode': '12',
+        }
+        response = self.client.post('/api/sellers/dashboard/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data['error'], 'Pincode must be exactly 6 digits.')
 
     def test_collector_upgrade_on_save(self):
         # Create a collector
