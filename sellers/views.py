@@ -149,39 +149,34 @@ class GrowerDashboardView(generics.GenericAPIView):
             profile.store_name = store_name
             profile.slug = slugify(store_name)
 
-        # Validate mandatory pickup location fields
-        final_pickup_address = data.get('pickup_address', profile.pickup_address)
-        final_location_city = data.get('location_city', profile.location_city)
-        final_location_state = data.get('location_state', profile.location_state)
-        final_location_pincode = data.get('location_pincode', profile.location_pincode)
-        
-        phone_val = data.get('phone')
-        if phone_val is not None:
-            final_phone = phone_val.strip().replace('+91', '').replace(' ', '').replace('-', '')
-        else:
-            final_phone = (seller.phone or '').replace('+91', '').replace(' ', '').replace('-', '')
+        # Pickup-address fields (pickup_address / location_* / phone) are owned by
+        # the dedicated /api/sellers/pickup-address/ endpoint. Treat them as an
+        # optional partial update here: validate only what the caller explicitly
+        # provided as a non-empty string, and never overwrite stored values with
+        # null/empty payloads from the Studio Identity form.
+        def _provided(key):
+            val = data.get(key)
+            return isinstance(val, str) and val.strip() != ""
 
-        if not final_pickup_address or not final_pickup_address.strip():
-            return Response({"error": "Pickup street address is required."}, status=400)
-        if not final_location_city or not final_location_city.strip():
-            return Response({"error": "City is required."}, status=400)
-        if not final_location_state or not final_location_state.strip():
-            return Response({"error": "State is required."}, status=400)
-        if not final_location_pincode or not final_location_pincode.strip():
-            return Response({"error": "Pincode is required."}, status=400)
-            
-        pincode_clean = final_location_pincode.strip()
-        if not pincode_clean.isdigit() or len(pincode_clean) != 6:
-            return Response({"error": "Pincode must be exactly 6 digits."}, status=400)
+        if _provided('pickup_address'):
+            profile.pickup_address = data['pickup_address'].strip()
 
-        if not final_phone or not final_phone.strip():
-            return Response({"error": "Phone number is required for pickup coordination."}, status=400)
-        if not final_phone.isdigit() or len(final_phone) != 10:
-            return Response({"error": "Phone number must be a valid 10-digit Indian mobile number."}, status=400)
+        if _provided('location_city'):
+            profile.location_city = data['location_city'].strip()
 
-        # Update phone number if provided and changed
-        if phone_val is not None:
-            new_phone = phone_val.strip().replace('+91', '').replace(' ', '').replace('-', '')
+        if _provided('location_state'):
+            profile.location_state = data['location_state'].strip()
+
+        if _provided('location_pincode'):
+            pincode_clean = data['location_pincode'].strip()
+            if not pincode_clean.isdigit() or len(pincode_clean) != 6:
+                return Response({"error": "Pincode must be exactly 6 digits."}, status=400)
+            profile.location_pincode = pincode_clean
+
+        if _provided('phone'):
+            new_phone = data['phone'].strip().replace('+91', '').replace(' ', '').replace('-', '')
+            if not new_phone.isdigit() or len(new_phone) != 10:
+                return Response({"error": "Phone number must be a valid 10-digit Indian mobile number."}, status=400)
             current_phone = (seller.phone or '').replace('+91', '').replace(' ', '').replace('-', '')
             if current_phone != new_phone:
                 from django.contrib.auth import get_user_model
@@ -190,17 +185,13 @@ class GrowerDashboardView(generics.GenericAPIView):
                     return Response({"error": "This phone number is already linked to another account."}, status=400)
                 seller.phone = new_phone
                 seller.save(update_fields=['phone'])
-            
+
         profile.logo_url = data.get('logo_url', profile.logo_url)
         profile.icon_url = data.get('icon_url', profile.icon_url)
         profile.banner_url = data.get('banner_url', profile.banner_url)
         profile.brand_color = data.get('brand_color', profile.brand_color)
         profile.bio = data.get('bio', profile.bio)
         profile.tagline = data.get('expertise', profile.tagline)
-        profile.location_city = final_location_city
-        profile.location_state = final_location_state
-        profile.location_pincode = pincode_clean
-        profile.pickup_address = final_pickup_address
         profile.gst_number = data.get('tax_id', profile.gst_number)
         profile.payout_type = data.get('payout_type', profile.payout_type)
         profile.payout_account = data.get('payout_account', profile.payout_account)
