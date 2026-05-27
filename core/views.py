@@ -226,6 +226,14 @@ class ProductListView(generics.ListAPIView):
         if params.get('in_stock') in ('true', '1', 'True'):
             queryset = queryset.filter(variants__stock__gt=0).distinct()
 
+        # Low stock filter
+        stock_lt = params.get('stock_lt')
+        if stock_lt is not None:
+            try:
+                queryset = queryset.filter(variants__stock__lt=int(stock_lt)).distinct()
+            except ValueError:
+                pass
+
         # Price range filter (based on first variant price)
         min_price = params.get('min_price')
         max_price = params.get('max_price')
@@ -273,6 +281,7 @@ class ProductListView(generics.ListAPIView):
     _FILTER_PARAMS = frozenset({
         'category', 'categories', 'sub_categories', 'sub_category_id',
         'care_level', 'in_stock', 'min_price', 'max_price', 'search', 'is_rare',
+        'stock_lt',
     })
 
     def filter_queryset(self, queryset):

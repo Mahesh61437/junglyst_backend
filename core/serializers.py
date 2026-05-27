@@ -576,7 +576,10 @@ class ProductListSerializer(serializers.ModelSerializer):
         return [
             {
                 'id': str(v.id),
+                'name': v.name,
+                'variant_type': v.variant_type,
                 'price': str(v.price),
+                'base_price': str(v.base_price),
                 'stock': v.stock,
                 'compare_at_price': str(v.compare_at_price) if v.compare_at_price else None,
             }
