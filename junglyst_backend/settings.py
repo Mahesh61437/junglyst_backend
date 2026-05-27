@@ -426,6 +426,10 @@ ENABLE_PAYMENTS = config('ENABLE_PAYMENTS', default=False, cast=bool)
 
 RAZORPAY_KEY_ID = config('RAZORPAY_KEY_ID', default='')
 RAZORPAY_KEY_SECRET = config('RAZORPAY_KEY_SECRET', default='')
+# Webhook secret is configured in the Razorpay dashboard when you create the
+# webhook subscription — DISTINCT from RAZORPAY_KEY_SECRET. Used only to
+# verify the X-Razorpay-Signature header on incoming webhook POSTs.
+RAZORPAY_WEBHOOK_SECRET = config('RAZORPAY_WEBHOOK_SECRET', default='')
 
 FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
 
@@ -464,3 +468,6 @@ if IS_PRODUCTION:
     for _name in ('RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'CASHFREE_APP_ID', 'CASHFREE_SECRET_KEY'):
         if not config(_name, default=''):
             _log.warning("Production startup: %s is not set — checkout will fail for that gateway.", _name)
+    if not config('RAZORPAY_WEBHOOK_SECRET', default=''):
+        _log.warning("Production startup: RAZORPAY_WEBHOOK_SECRET is not set — "
+                     "Razorpay webhooks will be rejected as invalid signatures.")
