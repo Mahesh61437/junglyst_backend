@@ -42,6 +42,7 @@ _sys.path.insert(0, _os.path.normpath(
     _os.path.join(_os.path.dirname(__file__), "..", "..", "..", "..")
 ))
 from plant_defaults import apply_plant_defaults, extract_stock_count as _extract_stock_count
+from category_utils import infer_himadri_category, infer_item_category
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -57,16 +58,13 @@ DEFAULT_JSON = os.path.normpath(
 REQUEST_TIMEOUT = 30
 RETRY_DELAY = 2
 
-DEFAULT_GST_RATE = Decimal("12.00")        # Aquascaping GST
-DEFAULT_COMMISSION_RATE = Decimal("15.00") # Aquascaping commission
+DEFAULT_GST_RATE = Decimal("12.00")
+DEFAULT_COMMISSION_RATE = Decimal("14.00")
 DEFAULT_WEIGHT_KG = Decimal("0.3")
 DEFAULT_LENGTH_CM = Decimal("20.0")
 DEFAULT_WIDTH_CM = Decimal("15.0")
 DEFAULT_HEIGHT_CM = Decimal("10.0")
 DEFAULT_PACKED_WEIGHT_GRAMS = 200
-
-JUNGLYST_CATEGORY = "Aquascaping"
-JUNGLYST_SUBCATEGORY = "Starter Packs"
 
 # Himadri subcategory → variant type hint
 SUBCAT_VARIANT_MAP: dict[str, str] = {
@@ -206,6 +204,66 @@ def _normalize_growth(val: str) -> str:
     if any(p in v for p in ("slow", "sluggish")):
         return "Slow"
     return "Moderate"
+
+
+# First structured field label that marks the start of the Himadri data block
+_HIMADRI_FIRST_FIELD_RE = re.compile(
+    r"\b(?:Description|Quantity|Origin|Plant\s+positioning|"
+    r"Light\s+requirement|CO2\s+requirement|Plant\s+difficulty\s+level|"
+    r"Plant\s+propagation|Growth\s+rate)\s*:",
+    re.IGNORECASE,
+)
+_HIMADRI_INDIA_BOILERPLATE_RE = re.compile(
+    r"\s*In\s+India,\s*we\s+can\s+sell\s+this\b.*",
+    re.IGNORECASE | re.DOTALL,
+)
+_SCIENTIFIC_NAME_FROM_TITLE_RE = re.compile(
+    r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)"
+)
+
+
+def _clean_himadri_description(raw_desc: str, short_desc: str) -> str:
+    """
+    Return the cleanest available description for a Himadri product.
+
+    Priority:
+      1. short_desc — the botanical paragraph shown above the tabs (preferred)
+      2. Any free text that appears BEFORE the first structured field label
+      3. Empty string — apply_plant_defaults / product name fills the gap
+    """
+    if short_desc and short_desc.strip():
+        return short_desc.strip()
+
+    text = _HIMADRI_INDIA_BOILERPLATE_RE.sub("", raw_desc or "").strip()
+
+    m = _HIMADRI_FIRST_FIELD_RE.search(text)
+    if m:
+        free_text = text[: m.start()].strip()
+        if free_text.lower() in ("description", ""):
+            return ""
+        return free_text
+
+    return text.strip()
+
+
+def _infer_scientific_name(product_name: str, existing: str) -> str:
+    """
+    Return the best scientific name available.
+
+    Priority:
+      1. existing — set by scraper's SCIENTIFIC_NAMES lookup
+      2. Parse "Genus Species" from the start of the product title
+      3. Empty string — plant_defaults will attempt a fill later
+    """
+    if existing:
+        return existing
+    clean = re.split(r"[/(]", product_name)[0].strip()
+    m = _SCIENTIFIC_NAME_FROM_TITLE_RE.match(clean)
+    if m:
+        words = m.group(1).split()
+        if len(words) >= 2 and len(words[0]) >= 5:
+            return m.group(1)
+    return ""
 
 
 def _parse_himadri_fields(raw_description: str) -> dict:
@@ -387,23 +445,11 @@ class Command(BaseCommand):
         seller = self._resolve_seller(User, options["seller_id"], options["seller_email"])
         self.stdout.write(f"Seller  : {seller.email}  (id={seller.id})")
 
-        # ── Category lookup ───────────────────────────────────────────────────
-        try:
-            cat = Category.objects.get(name=JUNGLYST_CATEGORY)
-        except Category.DoesNotExist:
-            raise CommandError(
-                f"Category '{JUNGLYST_CATEGORY}' not found in the database. "
-                "Run: python manage.py seed_categories"
-            )
-        try:
-            sub = SubCategory.objects.get(category=cat, name=JUNGLYST_SUBCATEGORY)
-        except SubCategory.DoesNotExist:
-            sub = None
-            self.stdout.write(
-                self.style.WARNING(f"  SubCategory '{JUNGLYST_SUBCATEGORY}' not found — sub_category will be null.")
-            )
+        # ── Category cache (auto-create subcategories like petkadai) ─────────
+        category_cache: dict[str, Category] = {}
+        subcat_cache: dict[tuple[str, str], SubCategory] = {}
 
-        self.stdout.write(f"Category: {cat.name} / {sub.name if sub else '(none)'}\n")
+        self.stdout.write("Category: resolved per-product from scraped Himadri categories\n")
 
         # ── Pre-build slug set for collision avoidance ─────────────────────────
         from core.models import Product as _Product
@@ -413,11 +459,49 @@ class Command(BaseCommand):
 
         for idx, raw in enumerate(raw_products, start=1):
             him_key = _himadri_key(raw.get("url", ""))
-            # base_lookup_slug: plain name slug without collision suffix — used to
-            # find existing products from a previous import run.
             base_lookup_slug = (slugify(raw.get("name", "")) or him_key)[:110]
-            # collision-safe slug: only needed when actually creating a new product
             slug = _name_slug(raw.get("name", ""), him_key, existing_slugs)
+
+            # ── Resolve Category/SubCategory for this product ──────────────
+            scraped_cats: list[str] = raw.get("categories") or []
+            jl_cat_name, jl_sub_name = infer_himadri_category(scraped_cats)
+
+            if jl_cat_name not in category_cache:
+                try:
+                    category_cache[jl_cat_name] = Category.objects.get(name=jl_cat_name)
+                except Category.DoesNotExist:
+                    base_slug = slugify(jl_cat_name) or "category"
+                    cat_slug = base_slug
+                    n = 1
+                    while Category.all_objects.filter(slug=cat_slug).exists():
+                        cat_slug = f"{base_slug}-{n}"
+                        n += 1
+                    category_cache[jl_cat_name] = Category.objects.create(
+                        name=jl_cat_name, slug=cat_slug
+                    )
+                    self.stdout.write(self.style.WARNING(f"  Auto-created Category: {jl_cat_name}"))
+
+            cat = category_cache[jl_cat_name]
+
+            cache_key = (jl_cat_name, jl_sub_name)
+            if cache_key not in subcat_cache:
+                sub_slug = slugify(f"{jl_cat_name}-{jl_sub_name}")
+                sub, created_sub = SubCategory.objects.get_or_create(
+                    slug=sub_slug,
+                    defaults={
+                        "category": cat,
+                        "name": jl_sub_name,
+                        "gst_percentage": None,
+                        "commission_rate": None,
+                    },
+                )
+                if created_sub:
+                    self.stdout.write(self.style.WARNING(
+                        f"  Auto-created SubCategory: {jl_cat_name} > {jl_sub_name}"
+                    ))
+                subcat_cache[cache_key] = sub
+
+            sub = subcat_cache[cache_key]
 
             try:
                 action, n_ok, n_fail = self._import_product(
@@ -437,6 +521,7 @@ class Command(BaseCommand):
                         "ProductVariant": ProductVariant,
                         "ProductImage": ProductImage,
                         "Tag": Tag,
+                        "SubCategory": SubCategory,
                     },
                 )
             except Exception as exc:
@@ -460,7 +545,8 @@ class Command(BaseCommand):
             label = {"created": "CREATED", "updated": "UPDATED", "skipped": "SKIPPED"}[action]
             img_note = f"  [{n_ok} imgs]" if n_ok else ""
             self.stdout.write(
-                f"  [{idx}/{len(raw_products)}] {label}  {raw.get('name', '')[:55]}{img_note}"
+                f"  [{idx}/{len(raw_products)}] {label}  "
+                f"[{jl_cat_name[:14]:<14}]  {raw.get('name', '')[:50]}{img_note}"
             )
 
         self.stdout.write("")
@@ -535,7 +621,7 @@ class Command(BaseCommand):
         # short_desc = clean botanical description ("Anubias nana is a dwarf variety...")
         raw_desc: str = (raw.get("description") or "").strip()
         short_desc: str = (raw.get("short_description") or "").strip()
-        scientific_name: str = raw.get("scientific_name") or ""
+        scientific_name: str = _infer_scientific_name(name, raw.get("scientific_name") or "")
         sku: str = raw.get("sku") or ""
         sale_price = raw.get("sale_price")
         regular_price = raw.get("regular_price")
@@ -547,8 +633,7 @@ class Command(BaseCommand):
         parsed = _parse_himadri_fields(raw_desc)
         origin = _extract_origin(raw_desc, short_desc)
 
-        # ── FIX 4: Use short_desc as clean description; fall back to raw_desc ─
-        clean_description = short_desc or raw_desc
+        clean_description = _clean_himadri_description(raw_desc, short_desc)
 
         # pH and temperature from either source
         ph = _extract_ph(raw_desc + " " + short_desc)
@@ -573,7 +658,7 @@ class Command(BaseCommand):
 
         variant_type = _infer_variant_type(name, categories)
         variant_name = _infer_variant_name(name)
-        tagline = short_desc[:499] if short_desc else ""
+        tagline = (short_desc or clean_description)[:499]
 
         # Idempotency: him_key (if ever stored) → base name slug (most common)
         # → collision-suffixed slug (edge case). Also match by name for robustness.
@@ -658,7 +743,7 @@ class Command(BaseCommand):
             variant.length = DEFAULT_LENGTH_CM
             variant.width = DEFAULT_WIDTH_CM
             variant.height = DEFAULT_HEIGHT_CM
-            variant.item_category = "light"
+            variant.item_category = infer_item_category(cat.name, name)
             variant.packed_weight_grams = DEFAULT_PACKED_WEIGHT_GRAMS
             variant.is_active = True
             variant.save()
