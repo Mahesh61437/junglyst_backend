@@ -52,3 +52,40 @@ def verify_razorpay_signature(razorpay_order_id: str, razorpay_payment_id: str, 
     expected = hmac.new(key_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, razorpay_signature or "")
 
+
+def verify_razorpay_webhook_signature(raw_body: bytes, received_signature: str):
+    """
+    Verify Razorpay webhook X-Razorpay-Signature header.
+
+    Per https://razorpay.com/docs/webhooks/validate-test/:
+      expected = HMAC_SHA256(raw_request_body, webhook_secret) (hex digest)
+
+    The webhook secret is configured in the Razorpay dashboard when registering
+    the webhook URL — it is DISTINCT from RAZORPAY_KEY_SECRET (which is used
+    for API auth and client-side payment signature verification).
+
+    `raw_body` must be the unparsed bytes of the request body. Re-serializing
+    parsed JSON will mismatch (different key order / whitespace).
+
+    Returns (ok: bool, reason: str, computed_prefix: str). `reason` is one of:
+      - 'ok'                — signature matched
+      - 'secret_unset'      — RAZORPAY_WEBHOOK_SECRET not configured (fail-closed)
+      - 'signature_missing' — no signature in request header
+      - 'mismatch'          — HMAC computed but doesn't match received
+    `computed_prefix` is the first 8 hex chars of the expected digest, useful
+    for diagnostic logging (never enough to reverse the secret).
+    """
+    secret = getattr(settings, "RAZORPAY_WEBHOOK_SECRET", None)
+    if not secret:
+        return False, 'secret_unset', ''
+    if not received_signature:
+        return False, 'signature_missing', ''
+    expected = hmac.new(
+        secret.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if hmac.compare_digest(expected, received_signature):
+        return True, 'ok', expected[:8]
+    return False, 'mismatch', expected[:8]
+
