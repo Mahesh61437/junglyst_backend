@@ -3,34 +3,64 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime, parse_date
-from datetime import datetime, time, timezone as dt_timezone
+from datetime import datetime, date, time, timedelta, timezone as dt_timezone
 from .models import CompetitionEntry
 from .serializers import CompetitionEntrySerializer
 from core.storage import upload_to_firebase
 from core.config_utils import get_config
 
-DEFAULT_LAUNCH_DATE = datetime(2026, 6, 1, 0, 0, 0, tzinfo=dt_timezone.utc)
+IST = dt_timezone(timedelta(hours=5, minutes=30))
+DEFAULT_LAUNCH_DATE = datetime(2026, 6, 1, 0, 0, 0, tzinfo=IST)
 MAX_ENTRIES = 500
 
 
-def _resolve_launch_date(settings_data):
-    """Parse launch_date from competition_settings; fall back to default.
+def _parse_dd_mm_yyyy(raw):
+    """Parse a 'DD-MM-YYYY' string to a date, or return None."""
+    if not isinstance(raw, str):
+        return None
+    parts = raw.strip().split('-')
+    if len(parts) != 3:
+        return None
+    try:
+        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        return date(y, m, d)
+    except (ValueError, TypeError):
+        return None
 
-    Accepts ISO datetime ("2026-06-01T00:00:00+05:30") or plain date
-    ("2026-06-01", interpreted as midnight in the current Django timezone).
+
+def _coerce_date(raw):
+    """Accept 'DD-MM-YYYY' (preferred), ISO date, or ISO datetime. Return a date or None."""
+    d = _parse_dd_mm_yyyy(raw)
+    if d:
+        return d
+    if isinstance(raw, str):
+        iso_date = parse_date(raw)
+        if iso_date:
+            return iso_date
+        dt = parse_datetime(raw)
+        if dt:
+            return dt.date()
+    return None
+
+
+def _resolve_launch_date(settings_data):
+    """Resolve launch_date from competition_settings as an IST-anchored datetime
+    at midnight. Falls back to the default launch date when missing/invalid.
     """
     raw = (settings_data or {}).get('launch_date')
-    if not raw:
+    d = _coerce_date(raw)
+    if d is None:
         return DEFAULT_LAUNCH_DATE
-    dt = parse_datetime(raw)
-    if dt is not None:
-        if timezone.is_naive(dt):
-            dt = timezone.make_aware(dt, timezone.get_current_timezone())
-        return dt
-    d = parse_date(raw)
-    if d is not None:
-        return timezone.make_aware(datetime.combine(d, time.min), timezone.get_current_timezone())
-    return DEFAULT_LAUNCH_DATE
+    return datetime.combine(d, time.min, tzinfo=IST)
+
+
+def _resolve_announcement_date_iso(settings_data):
+    """Return result_announcement_date as 'YYYY-MM-DD' (ISO date) for the frontend."""
+    raw = (settings_data or {}).get('result_announcement_date')
+    d = _coerce_date(raw)
+    if d is None:
+        return None
+    return d.isoformat()
 
 
 class CompetitionStatusView(APIView):
@@ -38,7 +68,7 @@ class CompetitionStatusView(APIView):
         now = timezone.now()
         settings_data = get_config('competition_settings') or {}
         launch_date = _resolve_launch_date(settings_data)
-        result_announcement_date = settings_data.get('result_announcement_date')
+        result_announcement_date = _resolve_announcement_date_iso(settings_data)
 
         total_entries = CompetitionEntry.objects.count()
         slots_remaining = max(0, MAX_ENTRIES - total_entries)
