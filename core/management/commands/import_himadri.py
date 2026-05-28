@@ -58,7 +58,7 @@ DEFAULT_JSON = os.path.normpath(
 REQUEST_TIMEOUT = 30
 RETRY_DELAY = 2
 
-DEFAULT_GST_RATE = Decimal("12.00")
+DEFAULT_GST_RATE = Decimal("0.00")
 DEFAULT_COMMISSION_RATE = Decimal("14.00")
 DEFAULT_WEIGHT_KG = Decimal("0.3")
 DEFAULT_LENGTH_CM = Decimal("20.0")
@@ -102,20 +102,7 @@ def _download_image(url: str, retries: int = 3) -> Optional[tuple[bytes, str]]:
     return None
 
 
-class _ImageFile:
-    def __init__(self, data: bytes, filename: str, content_type: str):
-        self._buf = io.BytesIO(data)
-        self.name = filename
-        self.content_type = content_type
 
-    def read(self, *args):
-        return self._buf.read(*args)
-
-    def seek(self, *args):
-        return self._buf.seek(*args)
-
-    def tell(self):
-        return self._buf.tell()
 
 
 def _ext_from_url(url: str, content_type: str) -> str:
@@ -464,44 +451,69 @@ class Command(BaseCommand):
 
             # ── Resolve Category/SubCategory for this product ──────────────
             scraped_cats: list[str] = raw.get("categories") or []
-            jl_cat_name, jl_sub_name = infer_himadri_category(scraped_cats)
+            cat_sub_pairs = infer_himadri_category(scraped_cats)  # list[tuple[str, str]]
 
-            if jl_cat_name not in category_cache:
-                try:
-                    category_cache[jl_cat_name] = Category.objects.get(name=jl_cat_name)
-                except Category.DoesNotExist:
-                    base_slug = slugify(jl_cat_name) or "category"
-                    cat_slug = base_slug
-                    n = 1
-                    while Category.all_objects.filter(slug=cat_slug).exists():
-                        cat_slug = f"{base_slug}-{n}"
-                        n += 1
-                    category_cache[jl_cat_name] = Category.objects.create(
-                        name=jl_cat_name, slug=cat_slug
-                    )
-                    self.stdout.write(self.style.WARNING(f"  Auto-created Category: {jl_cat_name}"))
+            all_cats: list = []
+            all_subs: list = []
+            seen_cat_names: set[str] = set()
+            seen_sub_keys: set[tuple[str, str]] = set()
 
-            cat = category_cache[jl_cat_name]
+            for jl_cat_name, jl_sub_name in cat_sub_pairs:
+                # Resolve / auto-create Category
+                if jl_cat_name not in category_cache:
+                    try:
+                        category_cache[jl_cat_name] = Category.objects.get(name=jl_cat_name)
+                    except Category.DoesNotExist:
+                        base_slug = slugify(jl_cat_name) or "category"
+                        cat_slug = base_slug
+                        n = 1
+                        while Category.all_objects.filter(slug=cat_slug).exists():
+                            cat_slug = f"{base_slug}-{n}"
+                            n += 1
+                        category_cache[jl_cat_name] = Category.objects.create(
+                            name=jl_cat_name, slug=cat_slug
+                        )
+                        self.stdout.write(self.style.WARNING(f"  Auto-created Category: {jl_cat_name}"))
 
-            cache_key = (jl_cat_name, jl_sub_name)
-            if cache_key not in subcat_cache:
-                sub_slug = slugify(f"{jl_cat_name}-{jl_sub_name}")
-                sub, created_sub = SubCategory.objects.get_or_create(
-                    slug=sub_slug,
-                    defaults={
-                        "category": cat,
-                        "name": jl_sub_name,
-                        "gst_percentage": None,
-                        "commission_rate": None,
-                    },
-                )
-                if created_sub:
-                    self.stdout.write(self.style.WARNING(
-                        f"  Auto-created SubCategory: {jl_cat_name} > {jl_sub_name}"
-                    ))
-                subcat_cache[cache_key] = sub
+                cat_obj = category_cache[jl_cat_name]
+                if jl_cat_name not in seen_cat_names:
+                    seen_cat_names.add(jl_cat_name)
+                    all_cats.append(cat_obj)
 
-            sub = subcat_cache[cache_key]
+                # Resolve / auto-create SubCategory
+                cache_key = (jl_cat_name, jl_sub_name)
+                if cache_key not in subcat_cache:
+                    try:
+                        sub_obj = SubCategory.objects.get(category=cat_obj, name=jl_sub_name)
+                        created_sub = False
+                    except SubCategory.DoesNotExist:
+                        sub_slug = slugify(f"{jl_cat_name}-{jl_sub_name}")
+                        base_slug = sub_slug
+                        n = 1
+                        while SubCategory.all_objects.filter(slug=sub_slug).exists():
+                            sub_slug = f"{base_slug}-{n}"
+                            n += 1
+                        sub_obj = SubCategory.objects.create(
+                            category=cat_obj,
+                            name=jl_sub_name,
+                            slug=sub_slug,
+                            gst_percentage=None,
+                            commission_rate=None,
+                        )
+                        created_sub = True
+                        
+                    if created_sub:
+                        self.stdout.write(self.style.WARNING(
+                            f"  Auto-created SubCategory: {jl_cat_name} > {jl_sub_name}"
+                        ))
+                    subcat_cache[cache_key] = sub_obj
+
+                if cache_key not in seen_sub_keys:
+                    seen_sub_keys.add(cache_key)
+                    all_subs.append(subcat_cache[cache_key])
+
+            # Primary category (first pair) used for logging and item_category inference
+            primary_cat = all_cats[0] if all_cats else None
 
             try:
                 action, n_ok, n_fail = self._import_product(
@@ -510,8 +522,8 @@ class Command(BaseCommand):
                     him_key=him_key,
                     base_lookup_slug=base_lookup_slug,
                     seller=seller,
-                    cat=cat,
-                    sub=sub,
+                    cats=all_cats,
+                    subs=all_subs,
                     do_update=do_update,
                     skip_images=skip_images,
                     dry_run=dry_run,
@@ -544,9 +556,10 @@ class Command(BaseCommand):
 
             label = {"created": "CREATED", "updated": "UPDATED", "skipped": "SKIPPED"}[action]
             img_note = f"  [{n_ok} imgs]" if n_ok else ""
+            cat_label = (primary_cat.name[:14] if primary_cat else "Unknown")
             self.stdout.write(
                 f"  [{idx}/{len(raw_products)}] {label}  "
-                f"[{jl_cat_name[:14]:<14}]  {raw.get('name', '')[:50]}{img_note}"
+                f"[{cat_label:<14}]  {raw.get('name', '')[:50]}{img_note}"
             )
 
         self.stdout.write("")
@@ -589,7 +602,10 @@ class Command(BaseCommand):
             return None
         data, content_type = result
         ext = _ext_from_url(url, content_type)
-        img_file = _ImageFile(data, f"product.{ext}", content_type)
+        import io
+        img_file = io.BytesIO(data)
+        img_file.name = f"product.{ext}"
+        img_file.content_type = content_type
         try:
             return upload_fn(img_file, str(seller_id), "product")
         except Exception:
@@ -604,8 +620,8 @@ class Command(BaseCommand):
         him_key: str,
         base_lookup_slug: str,
         seller,
-        cat,
-        sub,
+        cats: list,   # list of Category objects (all mapped categories)
+        subs: list,   # list of SubCategory objects (all mapped subcategories)
         do_update: bool,
         skip_images: bool,
         dry_run: bool,
@@ -670,6 +686,9 @@ class Command(BaseCommand):
         )
         if existing and not do_update:
             return "skipped", 0, 0
+            
+        if not existing and stock <= 0:
+            return "skipped", 0, 0
 
         if dry_run:
             return ("created" if not existing else "updated"), 0, 0
@@ -689,18 +708,18 @@ class Command(BaseCommand):
 
         # Last-resort generic fallbacks (only if still None after plant_defaults)
         product_fields = dict(
-            name=name,
+            name=str(name)[:255],
             tagline=tagline,
             description=_p["description"] or name,
             seller=seller,
-            scientific_name=_p["scientific_name"] or None,
-            care_level=_p["care_level"]                 or "Easy",
-            light_requirements=_p["light_requirements"] or "Medium",
-            growth_rate=_p["growth_rate"]               or "Moderate",
-            co2_requirement=_p["co2_requirement"]       or "Low",
-            water_temperature=temp,
-            ph_range=ph,
-            origin=_p["origin"] or None,
+            scientific_name=str(_p["scientific_name"])[:255] if _p.get("scientific_name") else None,
+            care_level=str(_p["care_level"] or "Easy")[:50],
+            light_requirements=str(_p["light_requirements"] or "Medium")[:50],
+            growth_rate=str(_p["growth_rate"] or "Moderate")[:50],
+            co2_requirement=str(_p["co2_requirement"] or "Low")[:50],
+            water_temperature=str(temp)[:50] if temp else None,
+            ph_range=str(ph)[:50] if ph else None,
+            origin=str(_p["origin"])[:100] if _p.get("origin") else None,
             is_rare=False,
             is_active=True,
             is_draft=False,
@@ -719,9 +738,10 @@ class Command(BaseCommand):
             product.save()
             action = "created"
 
-        product.categories.set([cat])
-        if sub:
-            product.sub_categories.set([sub])
+        if cats:
+            product.categories.set(cats)
+        if subs:
+            product.sub_categories.set(subs)
 
         # ── Variant ───────────────────────────────────────────────────────────
         # base_price = website price as-is
@@ -743,7 +763,7 @@ class Command(BaseCommand):
             variant.length = DEFAULT_LENGTH_CM
             variant.width = DEFAULT_WIDTH_CM
             variant.height = DEFAULT_HEIGHT_CM
-            variant.item_category = infer_item_category(cat.name, name)
+            variant.item_category = infer_item_category(cats[0].name if cats else "", name)
             variant.packed_weight_grams = DEFAULT_PACKED_WEIGHT_GRAMS
             variant.is_active = True
             variant.save()
@@ -763,7 +783,7 @@ class Command(BaseCommand):
                 length=DEFAULT_LENGTH_CM,
                 width=DEFAULT_WIDTH_CM,
                 height=DEFAULT_HEIGHT_CM,
-                item_category="light",
+                item_category=infer_item_category(cats[0].name if cats else "", name),
                 packed_weight_grams=DEFAULT_PACKED_WEIGHT_GRAMS,
                 is_active=True,
             )
