@@ -2,31 +2,53 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.utils import timezone
-from datetime import datetime, timezone as dt_timezone
+from django.utils.dateparse import parse_datetime, parse_date
+from datetime import datetime, time, timezone as dt_timezone
 from .models import CompetitionEntry
 from .serializers import CompetitionEntrySerializer
 from core.storage import upload_to_firebase
 from core.config_utils import get_config
 
-LAUNCH_DATE = datetime(2026, 6, 1, 0, 0, 0, tzinfo=dt_timezone.utc)
+DEFAULT_LAUNCH_DATE = datetime(2026, 6, 1, 0, 0, 0, tzinfo=dt_timezone.utc)
 MAX_ENTRIES = 500
+
+
+def _resolve_launch_date(settings_data):
+    """Parse launch_date from competition_settings; fall back to default.
+
+    Accepts ISO datetime ("2026-06-01T00:00:00+05:30") or plain date
+    ("2026-06-01", interpreted as midnight in the current Django timezone).
+    """
+    raw = (settings_data or {}).get('launch_date')
+    if not raw:
+        return DEFAULT_LAUNCH_DATE
+    dt = parse_datetime(raw)
+    if dt is not None:
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        return dt
+    d = parse_date(raw)
+    if d is not None:
+        return timezone.make_aware(datetime.combine(d, time.min), timezone.get_current_timezone())
+    return DEFAULT_LAUNCH_DATE
 
 
 class CompetitionStatusView(APIView):
     def get(self, request):
         now = timezone.now()
+        settings_data = get_config('competition_settings') or {}
+        launch_date = _resolve_launch_date(settings_data)
+        result_announcement_date = settings_data.get('result_announcement_date')
+
         total_entries = CompetitionEntry.objects.count()
         slots_remaining = max(0, MAX_ENTRIES - total_entries)
-        is_open = now < LAUNCH_DATE and slots_remaining > 0
-        seconds_until_launch = max(0, int((LAUNCH_DATE - now).total_seconds()))
+        is_open = now < launch_date and slots_remaining > 0
+        seconds_until_launch = max(0, int((launch_date - now).total_seconds()))
 
         winner = CompetitionEntry.objects.filter(is_winner=True).first()
 
-        settings_data = get_config('competition_settings') or {}
-        result_announcement_date = settings_data.get('result_announcement_date')
-
         return Response({
-            'launch_date': LAUNCH_DATE.isoformat(),
+            'launch_date': launch_date.isoformat(),
             'is_open': is_open,
             'total_entries': total_entries,
             'slots_remaining': slots_remaining,
@@ -43,8 +65,9 @@ class CompetitionStatusView(APIView):
 class CompetitionEntryView(APIView):
     def post(self, request):
         now = timezone.now()
+        launch_date = _resolve_launch_date(get_config('competition_settings'))
 
-        if now >= LAUNCH_DATE:
+        if now >= launch_date:
             return Response(
                 {'error': 'Competition is closed. The winner will be announced soon.'},
                 status=status.HTTP_400_BAD_REQUEST,
