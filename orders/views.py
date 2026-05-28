@@ -792,10 +792,7 @@ class OrderListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_staff or user.role == 'admin':
-            qs = Order.objects.all()
-        else:
-            qs = Order.objects.filter(user=user)
+        qs = Order.objects.filter(user=user)
 
         # Single query for items + their product images — eliminates all N+1
         items_qs = OrderItem.objects.select_related('product').prefetch_related('product__images')

@@ -284,7 +284,7 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Order
-        fields = ('id', 'order_number', 'total_quantity', 'status', 'payment_status', 'items', 'sub_orders', 'created_at')
+        fields = ('id', 'order_number', 'total_quantity', 'status', 'payment_status', 'shipping_address', 'items', 'sub_orders', 'created_at')
 
     def get_total_quantity(self, obj):
         """Calculate total items ordered from pre-fetched items."""
