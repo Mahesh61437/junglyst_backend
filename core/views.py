@@ -164,7 +164,8 @@ def _product_list_queryset():
     return Product.objects.select_related(
         'seller', 'seller__seller_profile'
     ).prefetch_related(
-        'variants', 'images', 'categories', 'sub_categories'
+        'variants', 'images', 'categories',
+        'sub_categories', 'sub_categories__category',
     )
 
 

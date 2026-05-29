@@ -58,6 +58,13 @@ class GrowerDashboardView(generics.GenericAPIView):
             .annotate(total_qty=Sum('quantity'), total_rev=Sum('unit_price'))\
             .order_by('-total_qty')[:5]
 
+        # Product status counts — single query, drives tab badges on the seller dashboard
+        product_counts = Product.objects.filter(seller=seller).aggregate(
+            published=Count('id', filter=Q(is_active=True, is_draft=False)),
+            drafts=Count('id', filter=Q(is_draft=True)),
+            archived=Count('id', filter=Q(is_active=False, is_draft=False)),
+        )
+
         # Inventory Distribution — single query with conditional aggregation
         inv = ProductVariant.objects.filter(product__seller=seller).aggregate(
             out_of_stock=Count('id', filter=Q(stock=0)),
@@ -69,6 +76,7 @@ class GrowerDashboardView(generics.GenericAPIView):
         healthy_stock = inv['healthy_stock']
 
         metrics = {
+            "product_counts": product_counts,
             "total_revenue": total_revenue,
             "total_orders": order_items.values('order').distinct().count(),
             "total_items_sold": total_items_sold,
