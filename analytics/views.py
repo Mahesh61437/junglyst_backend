@@ -2,7 +2,8 @@ from rest_framework import generics, permissions as drf_permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.core.cache import cache
-from django.db.models import Sum, Count, F
+from django.db.models import Sum, Count, F, Value, DecimalField
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from orders.models import Order, OrderItem
 from core.models import User, Product
@@ -51,52 +52,42 @@ class SuperAdminDashboardView(generics.GenericAPIView):
         total_sellers = User.objects.filter(role__in=['grower', 'admin'], is_verified_seller=True).count()
         total_users = User.objects.exclude(role='admin').count()
 
-        # Seller Wise Analytics
-        sellers = User.objects.filter(role__in=['grower', 'admin'])
+        # Seller Wise Analytics — single query with annotations instead of N+1 loop
+        sellers = User.objects.filter(role__in=['grower', 'admin']).select_related('seller_profile').annotate(
+            seller_orders_count=Count('order_items__order', distinct=True),
+            seller_revenue=Coalesce(Sum(F('order_items__unit_price') * F('order_items__quantity')), Value(0, output_field=DecimalField())),
+        )
         sellers_data = []
         for seller in sellers:
-            # Orders containing items from this seller
-            seller_items = OrderItem.objects.filter(seller=seller)
-            seller_orders_count = seller_items.values('order').distinct().count()
-            # seller revenue = sum of (unit_price * quantity) + gst? Let's just sum unit_price * quantity
-            seller_revenue = seller_items.aggregate(
-                total=Sum(F('unit_price') * F('quantity'))
-            )['total'] or 0
-
-            try:
-                store_name = seller.seller_profile.store_name
-            except Exception:
-                store_name = seller.get_full_name() or seller.username
-
+            profile = getattr(seller, 'seller_profile', None)
+            store_name = profile.store_name if profile else (seller.get_full_name() or seller.username)
             sellers_data.append({
                 'id': seller.id,
                 'name': seller.get_full_name() or seller.username,
                 'store_name': store_name,
                 'email': seller.email,
                 'phone': seller.phone,
-                'total_orders': seller_orders_count,
-                'total_revenue': seller_revenue,
+                'total_orders': seller.seller_orders_count,
+                'total_revenue': seller.seller_revenue or 0,
                 'is_verified': seller.is_verified_seller,
             })
 
-        # Categorized Orders (grouped by seller via SubOrders)
+        # Categorized Orders — prefetch payment and seller_profile to avoid N+1
         from orders.models import SubOrder
-        all_sub_orders_qs = SubOrder.objects.select_related('order', 'order__user', 'seller').all().order_by('-created_at')
-        
+        all_sub_orders_qs = SubOrder.objects.select_related(
+            'order', 'order__user', 'order__payment', 'seller', 'seller__seller_profile'
+        ).all().order_by('-created_at')
+
         all_orders = []
         for so in all_sub_orders_qs:
             user = so.order.user
-            try:
-                pg = so.order.payment.gateway
-            except Exception:
-                pg = None
-            try:
-                seller_store = so.seller.seller_profile.store_name
-            except Exception:
-                seller_store = so.seller.get_full_name() or so.seller.username
+            payment = getattr(so.order, 'payment', None)
+            pg = payment.gateway if payment else None
+            profile = getattr(so.seller, 'seller_profile', None)
+            seller_store = profile.store_name if profile else (so.seller.get_full_name() or so.seller.username)
 
             all_orders.append({
-                'id': so.id,
+                'id': so.order.id,
                 'order_number': so.sub_order_number,  # Use sub-order number
                 'total_amount': so.seller_total,
                 'status': so.status,

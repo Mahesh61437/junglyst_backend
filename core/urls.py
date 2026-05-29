@@ -7,7 +7,7 @@ from .views import (
     SubCategoryAdminView, SubCategoryAdminDetailView,
     ShippingRateAdminView, ShippingRateAdminDetailView,
     ImageUploadView, GrowerProductCreateView, AdminProductCreateView,
-    ProductCopyView, ProductBulkActionView, SyncCartView, WishlistView, HomeDataView,
+    ProductCopyView, ProductBulkActionView, BulkStockUpdateView, SyncCartView, WishlistView, HomeDataView,
     ForgotPasswordView, ResetPasswordView,
     BugReportListCreateView, BugReportDetailView,
     PublicConfigurationView, ConfigurationAdminView, ConfigurationAdminDetailView
@@ -28,6 +28,7 @@ urlpatterns = [
     path('products/create/', GrowerProductCreateView.as_view(), name='grower_product_create'),
     path('products/admin-create/', AdminProductCreateView.as_view(), name='admin_product_create'),
     path('products/bulk-action/', ProductBulkActionView.as_view(), name='product_bulk_action'),
+    path('products/bulk-stock-update/', BulkStockUpdateView.as_view(), name='product_bulk_stock_update'),
     path('products/id/<uuid:id>/copy/', ProductCopyView.as_view(), name='product_copy'),
     path('products/id/<uuid:id>/', ProductDetailView.as_view(), name='product_detail_id'),
     path('products/<slug:slug>/', ProductDetailView.as_view(lookup_field='slug'), name='product_detail_slug'),

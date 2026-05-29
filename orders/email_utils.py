@@ -1,7 +1,7 @@
 import logging
-from django.core.mail import send_mail, send_mass_mail
 from django.conf import settings
 from django.template.loader import render_to_string
+from core.email import paced_send_mail
 from core.models import User
 
 logger = logging.getLogger(__name__)
@@ -108,13 +108,11 @@ def send_customer_email(order):
         """
         
         recipient_email = order.user.email if order.user else order.guest_email
-        send_mail(
-            subject,
-            message,
-            settings.DEFAULT_FROM_EMAIL,
-            [recipient_email],
+        paced_send_mail(
+            subject=subject,
+            message=message,
+            recipient_list=[recipient_email],
             html_message=message,
-            fail_silently=False,
         )
     except Exception as e:
         logger.error("Error sending customer email: %s", e)
@@ -166,13 +164,11 @@ def send_admin_email(order, admin_emails):
         </html>
         """
         
-        send_mail(
-            subject,
-            message,
-            settings.DEFAULT_FROM_EMAIL,
-            admin_emails,
+        paced_send_mail(
+            subject=subject,
+            message=message,
+            recipient_list=admin_emails,
             html_message=message,
-            fail_silently=False,
         )
     except Exception as e:
         logger.error("Error sending admin email: %s", e)
@@ -253,13 +249,11 @@ def send_seller_emails(order):
                 </html>
                 """
                 
-                send_mail(
-                    subject,
-                    message,
-                    settings.DEFAULT_FROM_EMAIL,
-                    [seller.email],
+                paced_send_mail(
+                    subject=subject,
+                    message=message,
+                    recipient_list=[seller.email],
                     html_message=message,
-                    fail_silently=False,
                 )
             except Exception as e:
                 logger.error("Error sending seller email to %s: %s", sub_order.seller.email, e)
