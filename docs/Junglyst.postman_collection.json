@@ -1,0 +1,872 @@
+{
+  "info": {
+    "name": "Junglyst API",
+    "description": "User-facing REST API for the Junglyst botanical marketplace. Covers buyer flows (auth, browsing, cart, checkout, orders) and seller flows (onboarding, product management, fulfilment). Set the `base_url` and run `Auth / Login` first — it auto-populates the `access_token` and `refresh_token` variables.",
+    "_postman_id": "junglyst-api-v1",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{access_token}}", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8000", "type": "string" },
+    { "key": "access_token", "value": "", "type": "string" },
+    { "key": "refresh_token", "value": "", "type": "string" },
+    { "key": "session_id", "value": "guest-session-uuid", "type": "string" },
+    { "key": "product_id", "value": "", "type": "string" },
+    { "key": "variant_id", "value": "", "type": "string" },
+    { "key": "cart_id", "value": "", "type": "string" },
+    { "key": "cart_item_id", "value": "", "type": "string" },
+    { "key": "order_id", "value": "", "type": "string" },
+    { "key": "order_number", "value": "", "type": "string" },
+    { "key": "sub_order_id", "value": "", "type": "string" },
+    { "key": "address_id", "value": "", "type": "string" },
+    { "key": "category_id", "value": "1", "type": "string" },
+    { "key": "subcategory_id", "value": "1", "type": "string" },
+    { "key": "seller_slug", "value": "lush-aquatics", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/register/", "host": ["{{base_url}}"], "path": ["api", "core", "register", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"asha@example.com\",\n  \"username\": \"asha\",\n  \"password\": \"a-strong-passphrase\",\n  \"phone\": \"+91-9000000000\",\n  \"role\": \"collector\",\n  \"first_name\": \"Asha\",\n  \"last_name\": \"Rao\"\n}" }
+          }
+        },
+        {
+          "name": "Login (saves tokens to env)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.access) pm.collectionVariables.set('access_token', res.access);",
+                  "if (res.refresh) pm.collectionVariables.set('refresh_token', res.refresh);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/login/", "host": ["{{base_url}}"], "path": ["api", "core", "login", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"asha@example.com\",\n  \"password\": \"a-strong-passphrase\"\n}" }
+          }
+        },
+        {
+          "name": "Refresh token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.access) pm.collectionVariables.set('access_token', res.access);",
+                  "if (res.refresh) pm.collectionVariables.set('refresh_token', res.refresh);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/refresh/", "host": ["{{base_url}}"], "path": ["api", "core", "refresh", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}" }
+          }
+        },
+        {
+          "name": "Forgot password",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/forgot-password/", "host": ["{{base_url}}"], "path": ["api", "core", "forgot-password", ""] },
+            "body": { "mode": "raw", "raw": "{ \"email\": \"asha@example.com\" }" }
+          }
+        },
+        {
+          "name": "Reset password",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/reset-password/", "host": ["{{base_url}}"], "path": ["api", "core", "reset-password", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"asha@example.com\",\n  \"otp\": \"493817\",\n  \"new_password\": \"a-new-strong-passphrase\"\n}" }
+          }
+        },
+        {
+          "name": "Get current user",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/core/me/", "host": ["{{base_url}}"], "path": ["api", "core", "me", ""] }
+          }
+        },
+        {
+          "name": "Update current user",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/me/", "host": ["{{base_url}}"], "path": ["api", "core", "me", ""] },
+            "body": { "mode": "raw", "raw": "{ \"first_name\": \"Asha\", \"location\": \"Bengaluru\" }" }
+          }
+        },
+        {
+          "name": "Sync guest cart on login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/sync-cart/", "host": ["{{base_url}}"], "path": ["api", "core", "sync-cart", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"items\": [\n    { \"product_id\": \"{{product_id}}\", \"variant_id\": \"{{variant_id}}\", \"quantity\": 2 }\n  ]\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Products",
+      "item": [
+        {
+          "name": "List products",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/core/products/?page=1&page_size=20",
+              "host": ["{{base_url}}"],
+              "path": ["api", "core", "products", ""],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "page_size", "value": "20" },
+                { "key": "categories", "value": "", "disabled": true },
+                { "key": "sub_categories", "value": "", "disabled": true },
+                { "key": "seller_slug", "value": "", "disabled": true },
+                { "key": "is_rare", "value": "true", "disabled": true },
+                { "key": "in_stock", "value": "true", "disabled": true },
+                { "key": "min_price", "value": "", "disabled": true },
+                { "key": "max_price", "value": "", "disabled": true },
+                { "key": "care_level", "value": "easy", "disabled": true },
+                { "key": "search", "value": "", "disabled": true },
+                { "key": "ordering", "value": "-created_at", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get product by ID",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/core/products/id/{{product_id}}/", "host": ["{{base_url}}"], "path": ["api", "core", "products", "id", "{{product_id}}", ""] }
+          }
+        },
+        {
+          "name": "Get product by slug",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/core/products/anubias-nana-petite/", "host": ["{{base_url}}"], "path": ["api", "core", "products", "anubias-nana-petite", ""] }
+          }
+        },
+        {
+          "name": "Create product (seller)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/products/create/", "host": ["{{base_url}}"], "path": ["api", "core", "products", "create", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Bucephalandra Brownie Ghost\",\n  \"description\": \"Slow-growing rhizome\",\n  \"category_id\": {{category_id}},\n  \"sub_category_ids\": [{{subcategory_id}}],\n  \"variants\": [\n    { \"name\": \"Cup\", \"base_price\": \"400.00\", \"stock\": 5 }\n  ],\n  \"images\": [ { \"url\": \"https://example.com/img.jpg\" } ]\n}" }
+          }
+        },
+        {
+          "name": "Update product",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/products/id/{{product_id}}/", "host": ["{{base_url}}"], "path": ["api", "core", "products", "id", "{{product_id}}", ""] },
+            "body": { "mode": "raw", "raw": "{ \"is_draft\": false }" }
+          }
+        },
+        {
+          "name": "Archive product",
+          "request": {
+            "method": "DELETE",
+            "url": { "raw": "{{base_url}}/api/core/products/id/{{product_id}}/", "host": ["{{base_url}}"], "path": ["api", "core", "products", "id", "{{product_id}}", ""] }
+          }
+        },
+        {
+          "name": "Bulk action (publish/archive/delete)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/products/bulk-action/", "host": ["{{base_url}}"], "path": ["api", "core", "products", "bulk-action", ""] },
+            "body": { "mode": "raw", "raw": "{ \"action\": \"publish\", \"ids\": [\"{{product_id}}\"] }" }
+          }
+        },
+        {
+          "name": "Bulk stock update",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/products/bulk-stock-update/", "host": ["{{base_url}}"], "path": ["api", "core", "products", "bulk-stock-update", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"updates\": [\n    { \"variant_id\": \"{{variant_id}}\", \"stock\": 12 }\n  ]\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Reviews",
+      "item": [
+        {
+          "name": "List reviews for product",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/core/reviews/?productId={{product_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "core", "reviews", ""],
+              "query": [{ "key": "productId", "value": "{{product_id}}" }]
+            }
+          }
+        },
+        {
+          "name": "Create review",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/reviews/", "host": ["{{base_url}}"], "path": ["api", "core", "reviews", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"product_id\": \"{{product_id}}\",\n  \"author\": \"Asha R.\",\n  \"comment\": \"Arrived healthy, well packed.\",\n  \"plants\": 5,\n  \"packaging\": 5,\n  \"responsiveness\": 4\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Categories",
+      "item": [
+        {
+          "name": "List categories",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/core/categories/", "host": ["{{base_url}}"], "path": ["api", "core", "categories", ""] }
+          }
+        },
+        {
+          "name": "List subcategories (filter by category)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/core/subcategories/?category={{category_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "core", "subcategories", ""],
+              "query": [{ "key": "category", "value": "{{category_id}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Wishlist",
+      "item": [
+        {
+          "name": "List wishlist",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/core/wishlist/", "host": ["{{base_url}}"], "path": ["api", "core", "wishlist", ""] } }
+        },
+        {
+          "name": "Toggle add/remove",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/wishlist/", "host": ["{{base_url}}"], "path": ["api", "core", "wishlist", ""] },
+            "body": { "mode": "raw", "raw": "{ \"product_id\": \"{{product_id}}\" }" }
+          }
+        },
+        {
+          "name": "Remove from wishlist",
+          "request": {
+            "method": "DELETE",
+            "url": { "raw": "{{base_url}}/api/core/wishlist/{{product_id}}/", "host": ["{{base_url}}"], "path": ["api", "core", "wishlist", "{{product_id}}", ""] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Cart",
+      "item": [
+        {
+          "name": "Get cart (guest or auth)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/cart/?session_id={{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "cart", ""],
+              "query": [{ "key": "session_id", "value": "{{session_id}}" }]
+            }
+          }
+        },
+        {
+          "name": "Add item",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/cart/add_item/", "host": ["{{base_url}}"], "path": ["api", "cart", "add_item", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"variant_id\": \"{{variant_id}}\",\n  \"quantity\": 1,\n  \"session_id\": \"{{session_id}}\"\n}" }
+          }
+        },
+        {
+          "name": "Remove item",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/cart/remove_item/", "host": ["{{base_url}}"], "path": ["api", "cart", "remove_item", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"cart_item_id\": \"{{cart_item_id}}\",\n  \"session_id\": \"{{session_id}}\"\n}" }
+          }
+        },
+        {
+          "name": "Update item quantity",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/cart/{{cart_id}}/update_item/", "host": ["{{base_url}}"], "path": ["api", "cart", "{{cart_id}}", "update_item", ""] },
+            "body": { "mode": "raw", "raw": "{ \"cart_item_id\": \"{{cart_item_id}}\", \"quantity\": 3 }" }
+          }
+        },
+        {
+          "name": "Clear cart",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/api/cart/clear/?session_id={{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "cart", "clear", ""],
+              "query": [{ "key": "session_id", "value": "{{session_id}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Checkout & payments",
+      "item": [
+        {
+          "name": "Get gateway settings",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/payments/gateway-settings/", "host": ["{{base_url}}"], "path": ["api", "payments", "gateway-settings", ""] }
+          }
+        },
+        {
+          "name": "Checkout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.order_id) pm.collectionVariables.set('order_id', res.order_id);",
+                  "if (res.order_number) pm.collectionVariables.set('order_number', res.order_number);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/orders/checkout/", "host": ["{{base_url}}"], "path": ["api", "orders", "checkout", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"cart_id\": \"{{cart_id}}\",\n  \"address_id\": {{address_id}},\n  \"pincode\": \"560038\"\n}" }
+          }
+        },
+        {
+          "name": "Verify payment (Razorpay)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/orders/checkout/verify/", "host": ["{{base_url}}"], "path": ["api", "orders", "checkout", "verify", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"gateway\": \"razorpay\",\n  \"razorpay_order_id\": \"order_xxx\",\n  \"razorpay_payment_id\": \"pay_xxx\",\n  \"razorpay_signature\": \"...\"\n}" }
+          }
+        },
+        {
+          "name": "Verify payment (Cashfree)",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/orders/checkout/verify/", "host": ["{{base_url}}"], "path": ["api", "orders", "checkout", "verify", ""] },
+            "body": { "mode": "raw", "raw": "{ \"gateway\": \"cashfree\", \"cashfree_order_id\": \"order_xxx\" }" }
+          }
+        },
+        {
+          "name": "Payment status",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/orders/payment-status/?razorpay_order_id=order_xxx",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "payment-status", ""],
+              "query": [
+                { "key": "razorpay_order_id", "value": "order_xxx" },
+                { "key": "cashfree_order_id", "value": "", "disabled": true }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Orders (buyer)",
+      "item": [
+        {
+          "name": "List my orders",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/orders/", "host": ["{{base_url}}"], "path": ["api", "orders", ""] } }
+        },
+        {
+          "name": "Order detail",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/orders/{{order_id}}/", "host": ["{{base_url}}"], "path": ["api", "orders", "{{order_id}}", ""] } }
+        },
+        {
+          "name": "Track by order number",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/orders/track/?order_number={{order_number}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "track", ""],
+              "query": [{ "key": "order_number", "value": "{{order_number}}" }]
+            }
+          }
+        },
+        {
+          "name": "Cancel order",
+          "request": { "method": "POST", "url": { "raw": "{{base_url}}/api/orders/{{order_id}}/cancel/", "host": ["{{base_url}}"], "path": ["api", "orders", "{{order_id}}", "cancel", ""] } }
+        }
+      ]
+    },
+    {
+      "name": "Orders (seller)",
+      "item": [
+        {
+          "name": "List my sub-orders",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/orders/seller/", "host": ["{{base_url}}"], "path": ["api", "orders", "seller", ""] } }
+        },
+        {
+          "name": "List sub-orders (filter)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/orders/seller/sub-orders/?status=pending",
+              "host": ["{{base_url}}"],
+              "path": ["api", "orders", "seller", "sub-orders", ""],
+              "query": [
+                { "key": "status", "value": "pending" },
+                { "key": "order_number", "value": "", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Sub-order detail",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/orders/seller/sub-orders/{{sub_order_id}}/", "host": ["{{base_url}}"], "path": ["api", "orders", "seller", "sub-orders", "{{sub_order_id}}", ""] } }
+        },
+        {
+          "name": "Confirm sub-order",
+          "request": { "method": "POST", "url": { "raw": "{{base_url}}/api/orders/seller/sub-orders/{{sub_order_id}}/confirm/", "host": ["{{base_url}}"], "path": ["api", "orders", "seller", "sub-orders", "{{sub_order_id}}", "confirm", ""] } }
+        },
+        {
+          "name": "Upload packaging photo",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base_url}}/api/orders/seller/sub-orders/{{sub_order_id}}/upload-photo/", "host": ["{{base_url}}"], "path": ["api", "orders", "seller", "sub-orders", "{{sub_order_id}}", "upload-photo", ""] },
+            "body": { "mode": "formdata", "formdata": [{ "key": "image", "type": "file", "src": [] }] }
+          }
+        },
+        {
+          "name": "Update shipment details (AWB)",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/orders/seller/sub-orders/{{sub_order_id}}/shipment-details/", "host": ["{{base_url}}"], "path": ["api", "orders", "seller", "sub-orders", "{{sub_order_id}}", "shipment-details", ""] },
+            "body": { "mode": "raw", "raw": "{ \"awb_number\": \"AWB123456\", \"courier_name\": \"Bluedart\" }" }
+          }
+        },
+        {
+          "name": "Mark shipped",
+          "request": { "method": "POST", "url": { "raw": "{{base_url}}/api/orders/seller/sub-orders/{{sub_order_id}}/ship/", "host": ["{{base_url}}"], "path": ["api", "orders", "seller", "sub-orders", "{{sub_order_id}}", "ship", ""] } }
+        },
+        {
+          "name": "Update sub-order status",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/orders/seller/sub-orders/{{sub_order_id}}/status/", "host": ["{{base_url}}"], "path": ["api", "orders", "seller", "sub-orders", "{{sub_order_id}}", "status", ""] },
+            "body": { "mode": "raw", "raw": "{ \"status\": \"delivered\" }" }
+          }
+        },
+        {
+          "name": "Bulk ship",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/orders/ship-now/", "host": ["{{base_url}}"], "path": ["api", "orders", "ship-now", ""] },
+            "body": { "mode": "raw", "raw": "{ \"sub_order_ids\": [\"{{sub_order_id}}\"] }" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Shipping addresses",
+      "item": [
+        {
+          "name": "List addresses",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/shipping/addresses/", "host": ["{{base_url}}"], "path": ["api", "shipping", "addresses", ""] } }
+        },
+        {
+          "name": "Create address",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/shipping/addresses/", "host": ["{{base_url}}"], "path": ["api", "shipping", "addresses", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"full_name\": \"Asha Rao\",\n  \"phone\": \"+91-9000000000\",\n  \"address_line_1\": \"12 Indiranagar 1st Cross\",\n  \"address_line_2\": \"Apt 4B\",\n  \"city\": \"Bengaluru\",\n  \"state\": \"Karnataka\",\n  \"pincode\": \"560038\",\n  \"is_default\": true\n}" }
+          }
+        },
+        {
+          "name": "Get address",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/shipping/addresses/{{address_id}}/", "host": ["{{base_url}}"], "path": ["api", "shipping", "addresses", "{{address_id}}", ""] } }
+        },
+        {
+          "name": "Update address",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/shipping/addresses/{{address_id}}/", "host": ["{{base_url}}"], "path": ["api", "shipping", "addresses", "{{address_id}}", ""] },
+            "body": { "mode": "raw", "raw": "{ \"is_default\": true }" }
+          }
+        },
+        {
+          "name": "Delete address",
+          "request": { "method": "DELETE", "url": { "raw": "{{base_url}}/api/shipping/addresses/{{address_id}}/", "host": ["{{base_url}}"], "path": ["api", "shipping", "addresses", "{{address_id}}", ""] } }
+        }
+      ]
+    },
+    {
+      "name": "Shipping rates & serviceability",
+      "item": [
+        {
+          "name": "Rate quote",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/shipping/logistics/", "host": ["{{base_url}}"], "path": ["api", "shipping", "logistics", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"origin_pincode\": \"560001\",\n  \"destination_pincode\": \"110001\",\n  \"weight\": 0.6,\n  \"length\": 20,\n  \"breadth\": 15,\n  \"height\": 10,\n  \"order_value\": 1000\n}" }
+          }
+        },
+        {
+          "name": "List providers",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/shipping/logistics/", "host": ["{{base_url}}"], "path": ["api", "shipping", "logistics", ""] }
+          }
+        },
+        {
+          "name": "Pincode check",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/shipping/pincode-check/", "host": ["{{base_url}}"], "path": ["api", "shipping", "pincode-check", ""] },
+            "body": { "mode": "raw", "raw": "{ \"pincode\": \"682001\" }" }
+          }
+        },
+        {
+          "name": "Upload package image",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base_url}}/api/shipping/package-image/", "host": ["{{base_url}}"], "path": ["api", "shipping", "package-image", ""] },
+            "body": { "mode": "formdata", "formdata": [{ "key": "image", "type": "file", "src": [] }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sellers (public)",
+      "item": [
+        {
+          "name": "List sellers",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/sellers/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "sellers", ""],
+              "query": [{ "key": "featured", "value": "true", "disabled": true }]
+            }
+          }
+        },
+        {
+          "name": "Public storefront",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/sellers/store/{{seller_slug}}/", "host": ["{{base_url}}"], "path": ["api", "sellers", "store", "{{seller_slug}}", ""] }
+          }
+        },
+        {
+          "name": "Platform stats",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/sellers/platform-stats/", "host": ["{{base_url}}"], "path": ["api", "sellers", "platform-stats", ""] }
+          }
+        },
+        {
+          "name": "Featured curator",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/sellers/featured-curator/", "host": ["{{base_url}}"], "path": ["api", "sellers", "featured-curator", ""] }
+          }
+        },
+        {
+          "name": "Check email allowlist",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/sellers/check-email/", "host": ["{{base_url}}"], "path": ["api", "sellers", "check-email", ""] },
+            "body": { "mode": "raw", "raw": "{ \"email\": \"newseller@example.com\" }" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sellers (dashboard)",
+      "item": [
+        {
+          "name": "Dashboard",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/sellers/dashboard/", "host": ["{{base_url}}"], "path": ["api", "sellers", "dashboard", ""] } }
+        },
+        {
+          "name": "Initialize seller profile",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/sellers/dashboard/", "host": ["{{base_url}}"], "path": ["api", "sellers", "dashboard", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"store_name\": \"Lush Aquatics\",\n  \"bio\": \"Tissue-cultured rhizomes\",\n  \"location_city\": \"Cochin\",\n  \"location_state\": \"Kerala\"\n}" }
+          }
+        },
+        {
+          "name": "Check approval",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/sellers/check-approval/", "host": ["{{base_url}}"], "path": ["api", "sellers", "check-approval", ""] } }
+        },
+        {
+          "name": "Get bank details",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/sellers/bank-details/", "host": ["{{base_url}}"], "path": ["api", "sellers", "bank-details", ""] } }
+        },
+        {
+          "name": "Save bank details",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/sellers/bank-details/", "host": ["{{base_url}}"], "path": ["api", "sellers", "bank-details", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"payout_type\": \"bank\",\n  \"payout_account\": \"1234567890\",\n  \"ifsc_code\": \"HDFC0001234\",\n  \"gst_number\": \"29ABCDE1234F1Z5\"\n}" }
+          }
+        },
+        {
+          "name": "Get pickup address",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/sellers/pickup-address/", "host": ["{{base_url}}"], "path": ["api", "sellers", "pickup-address", ""] } }
+        },
+        {
+          "name": "Update pickup address",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/sellers/pickup-address/", "host": ["{{base_url}}"], "path": ["api", "sellers", "pickup-address", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"phone\": \"+91-9000000000\",\n  \"pickup_address\": \"...\",\n  \"location_city\": \"Cochin\",\n  \"location_state\": \"Kerala\",\n  \"location_pincode\": \"682001\"\n}" }
+          }
+        },
+        {
+          "name": "Retry Shiprocket registration",
+          "request": { "method": "POST", "url": { "raw": "{{base_url}}/api/sellers/pickup-address/register/", "host": ["{{base_url}}"], "path": ["api", "sellers", "pickup-address", "register", ""] } }
+        },
+        {
+          "name": "Verify pickup OTP",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/sellers/pickup-address/otp/", "host": ["{{base_url}}"], "path": ["api", "sellers", "pickup-address", "otp", ""] },
+            "body": { "mode": "raw", "raw": "{ \"otp\": \"493817\" }" }
+          }
+        },
+        {
+          "name": "List blackouts",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/sellers/blackouts/", "host": ["{{base_url}}"], "path": ["api", "sellers", "blackouts", ""] } }
+        },
+        {
+          "name": "Create blackout",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/sellers/blackouts/", "host": ["{{base_url}}"], "path": ["api", "sellers", "blackouts", ""] },
+            "body": { "mode": "raw", "raw": "{ \"start_date\": \"2026-06-10\", \"end_date\": \"2026-06-14\", \"reason\": \"Travel\" }" }
+          }
+        },
+        {
+          "name": "Delete blackout",
+          "request": { "method": "DELETE", "url": { "raw": "{{base_url}}/api/sellers/blackouts/1/", "host": ["{{base_url}}"], "path": ["api", "sellers", "blackouts", "1", ""] } }
+        },
+        {
+          "name": "Seller GST invoice",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/analytics/seller/gst-invoice/?start_date=2026-04-01&end_date=2026-04-30",
+              "host": ["{{base_url}}"],
+              "path": ["api", "analytics", "seller", "gst-invoice", ""],
+              "query": [
+                { "key": "start_date", "value": "2026-04-01" },
+                { "key": "end_date", "value": "2026-04-30" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Notifications",
+      "item": [
+        {
+          "name": "List",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/notifications/", "host": ["{{base_url}}"], "path": ["api", "notifications", ""] } }
+        },
+        {
+          "name": "Mark read (single or all)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/notifications/mark-read/", "host": ["{{base_url}}"], "path": ["api", "notifications", "mark-read", ""] },
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        },
+        {
+          "name": "Unread count",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/notifications/unread-count/", "host": ["{{base_url}}"], "path": ["api", "notifications", "unread-count", ""] } }
+        },
+        {
+          "name": "Newsletter subscribe",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/notifications/newsletter/subscribe/", "host": ["{{base_url}}"], "path": ["api", "notifications", "newsletter", "subscribe", ""] },
+            "body": { "mode": "raw", "raw": "{ \"email\": \"newsletter@example.com\" }" }
+          }
+        },
+        {
+          "name": "Contact form",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/notifications/contact/", "host": ["{{base_url}}"], "path": ["api", "notifications", "contact", ""] },
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"Asha Rao\",\n  \"email\": \"asha@example.com\",\n  \"phone\": \"+91-9000000000\",\n  \"topic\": \"Order issue\",\n  \"message\": \"Hello...\"\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Misc",
+      "item": [
+        {
+          "name": "Home aggregate",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/core/home/", "host": ["{{base_url}}"], "path": ["api", "core", "home", ""] }
+          }
+        },
+        {
+          "name": "Public config",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/core/config/public/competition_settings/", "host": ["{{base_url}}"], "path": ["api", "core", "config", "public", "competition_settings", ""] }
+          }
+        },
+        {
+          "name": "Upload image",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base_url}}/api/core/upload/", "host": ["{{base_url}}"], "path": ["api", "core", "upload", ""] },
+            "body": { "mode": "formdata", "formdata": [{ "key": "image", "type": "file", "src": [] }] }
+          }
+        },
+        {
+          "name": "Bug reports — list",
+          "request": { "method": "GET", "url": { "raw": "{{base_url}}/api/core/bug-reports/", "host": ["{{base_url}}"], "path": ["api", "core", "bug-reports", ""] } }
+        },
+        {
+          "name": "Bug reports — create",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{base_url}}/api/core/bug-reports/", "host": ["{{base_url}}"], "path": ["api", "core", "bug-reports", ""] },
+            "body": { "mode": "raw", "raw": "{ \"contact_info\": \"+91-9000000000\", \"description\": \"Checkout button greyed out on Safari\" }" }
+          }
+        },
+        {
+          "name": "Competition status",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/competition/status/", "host": ["{{base_url}}"], "path": ["api", "competition", "status", ""] }
+          }
+        },
+        {
+          "name": "Competition enter",
+          "request": {
+            "auth": { "type": "noauth" },
+            "method": "POST",
+            "url": { "raw": "{{base_url}}/api/competition/enter/", "host": ["{{base_url}}"], "path": ["api", "competition", "enter", ""] },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "name", "value": "Asha Rao", "type": "text" },
+                { "key": "email", "value": "asha@example.com", "type": "text" },
+                { "key": "mobile", "value": "+91-9000000000", "type": "text" },
+                { "key": "about_aquarium", "value": "Iwagumi-style 60p tank with anubias", "type": "text" },
+                { "key": "images", "type": "file", "src": [] }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

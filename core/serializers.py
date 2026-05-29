@@ -600,7 +600,7 @@ class CartItemSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CartItem
-        fields = ('id', 'product', 'variant', 'quantity', 'added_at', 'subtotal')
+        fields = ('id', 'product', 'variant', 'quantity', 'created_at', 'subtotal')
 
     def get_subtotal(self, obj):
         price = obj.variant.price if obj.variant else obj.product.price

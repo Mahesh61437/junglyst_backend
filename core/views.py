@@ -905,6 +905,61 @@ class ProductBulkActionView(generics.GenericAPIView):
         return Response({'success': True, 'affected': count, 'action': action})
 
 
+class BulkStockUpdateView(generics.GenericAPIView):
+    """
+    POST /core/products/bulk-stock-update/
+    Body: { "updates": [{ "variant_id": "<uuid>", "stock": <int> }, ...] }
+    Updates stock for many variants (across many products) in a single request.
+    Sellers can only update variants on their own products. Admins can update any.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request):
+        updates = request.data.get('updates', [])
+        if not isinstance(updates, list) or not updates:
+            return Response({'error': 'updates must be a non-empty list'}, status=400)
+
+        # Normalise + validate payload
+        normalised = {}  # variant_id -> stock
+        for entry in updates:
+            vid = entry.get('variant_id') or entry.get('id')
+            stock = entry.get('stock')
+            if not vid:
+                return Response({'error': 'Each update needs variant_id'}, status=400)
+            try:
+                stock_int = int(stock)
+            except (TypeError, ValueError):
+                return Response({'error': f'Invalid stock for variant {vid}'}, status=400)
+            if stock_int < 0:
+                return Response({'error': f'Stock must be >= 0 for variant {vid}'}, status=400)
+            normalised[str(vid)] = stock_int
+
+        user = request.user
+        is_admin = user.is_staff or user.is_superuser or getattr(user, 'role', None) == 'admin'
+
+        qs = ProductVariant.objects.filter(id__in=list(normalised.keys()))
+        if not is_admin:
+            qs = qs.filter(product__seller=user)
+
+        # Detect ownership / not-found mismatches
+        found_ids = set(str(v_id) for v_id in qs.values_list('id', flat=True))
+        missing = [vid for vid in normalised.keys() if vid not in found_ids]
+        if missing:
+            return Response(
+                {'error': 'Some variants were not found or not owned by you', 'missing': missing},
+                status=404,
+            )
+
+        # Persist
+        updated = 0
+        for variant in qs:
+            variant.stock = normalised[str(variant.id)]
+            variant.save(update_fields=['stock'])
+            updated += 1
+
+        return Response({'success': True, 'updated': updated})
+
+
 class HomeDataView(generics.GenericAPIView):
     """
     Single aggregate endpoint for the home page.
