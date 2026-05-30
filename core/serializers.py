@@ -188,8 +188,18 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductVariant
-        fields = '__all__'
-        read_only_fields = ['product']
+        # Explicit list — commission_rate and gst_rate are intentionally omitted
+        # so the seller dashboard and storefront never see per-seller commission
+        # config. base_price is the seller's input; price is the buyer-facing
+        # value computed in ProductVariant.save() from the resolved rates.
+        fields = (
+            'id', 'product', 'name', 'variant_type', 'sku',
+            'base_price', 'price', 'compare_at_price',
+            'weight', 'length', 'width', 'height',
+            'item_category', 'packed_weight_grams', 'chargeable_weight',
+            'stock', 'is_active', 'created_at',
+        )
+        read_only_fields = ['product', 'price', 'created_at']
 
     def get_chargeable_weight(self, obj):
         return obj.chargeable_weight
@@ -260,11 +270,11 @@ class ProductSerializer(serializers.ModelSerializer):
     image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
     
-    # Helper fields for the first variant (read-only for compatibility)
+    # Helper fields for the first variant (read-only for compatibility).
+    # commission_rate and gst_rate are intentionally NOT exposed — those are
+    # admin-only and resolved server-side in ProductVariant.save().
     price = serializers.SerializerMethodField()
     base_price = serializers.SerializerMethodField()
-    gst_rate = serializers.SerializerMethodField()
-    commission_rate = serializers.SerializerMethodField()
     stock = serializers.SerializerMethodField()
     weight = serializers.SerializerMethodField()
     length = serializers.SerializerMethodField()
@@ -310,14 +320,6 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_base_price(self, obj):
         v = self._first_variant(obj)
         return v.base_price if v else 0
-
-    def get_gst_rate(self, obj):
-        v = self._first_variant(obj)
-        return v.gst_rate if v else 0
-
-    def get_commission_rate(self, obj):
-        v = self._first_variant(obj)
-        return v.commission_rate if v else 0
 
     def get_stock(self, obj):
         v = self._first_variant(obj)

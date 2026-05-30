@@ -41,6 +41,24 @@ class User(AbstractUser, SoftDeleteModel):
     avatar_url = models.URLField(max_length=1000, null=True, blank=True)
     location = models.CharField(max_length=255, null=True, blank=True, default='Kerala, India')
 
+    # Per-seller commission config — admin-only. Sellers and buyers never see these.
+    # Semantics depend on price_is_buyer_final (see ProductVariant.save for the math).
+    seller_commission_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, default=10.00,
+        help_text="Markup % added on top of seller's listed price (toggle OFF) "
+                  "or part of total deduction from listed price (toggle ON).",
+    )
+    buyer_commission_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, default=10.00,
+        help_text="Deduction % from seller payout (toggle OFF) "
+                  "or part of total deduction from listed price (toggle ON).",
+    )
+    price_is_buyer_final = models.BooleanField(
+        default=False,
+        help_text="OFF: listed price is the seller's reference; buyer pays L*(1+seller_rate). "
+                  "ON: listed price IS what buyer pays; seller payout = L*(1-(seller_rate+buyer_rate)).",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -53,6 +71,15 @@ class User(AbstractUser, SoftDeleteModel):
 
     def __str__(self):
         return f"{self.email} ({self.get_role_display()})"
+
+    def clean(self):
+        super().clean()
+        from django.core.exceptions import ValidationError
+        if self.price_is_buyer_final and (self.seller_commission_rate + self.buyer_commission_rate) >= 100:
+            raise ValidationError(
+                "When price_is_buyer_final is ON, seller_commission_rate + buyer_commission_rate "
+                "must be less than 100% — otherwise seller payout goes to zero or negative."
+            )
 
 class ShippingType(models.TextChoices):
     PLANT = 'plant', _('Plant / Live Specimen')
@@ -310,18 +337,67 @@ class ProductVariant(SoftDeleteModel):
     is_active = models.BooleanField(default=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def save(self, *args, **kwargs):
-        # Auto-calculate final price if not manually overridden or during creation
-        # Final Price = Base Price + GST (on base) + Commission (on base)
+    def _resolve_commission(self):
+        """Return (seller_rate, buyer_rate, price_is_buyer_final) for this variant.
+
+        Resolution chain (most specific wins):
+          1. Per-seller override (User.seller_commission_rate / buyer_commission_rate / price_is_buyer_final)
+          2. Category default (Category.commission_rate, used as seller_rate; buyer_rate defaults to 10)
+          3. Platform default (10 / 10 / False)
+        """
         from decimal import Decimal
-        base = Decimal(str(self.base_price))
-        gst = Decimal(str(self.gst_rate))
-        comm = Decimal(str(self.commission_rate))
-        
-        gst_amount = base * (gst / Decimal('100'))
-        commission_amount = base * (comm / Decimal('100'))
-        self.price = base + gst_amount + commission_amount
+        seller = getattr(self.product, 'seller', None)
+        if seller is not None:
+            return (
+                Decimal(str(seller.seller_commission_rate)),
+                Decimal(str(seller.buyer_commission_rate)),
+                bool(seller.price_is_buyer_final),
+            )
+        category = self.product.categories.first()
+        if category is not None:
+            return (
+                Decimal(str(category.commission_rate)),
+                Decimal('10'),
+                False,
+            )
+        return (Decimal('10'), Decimal('10'), False)
+
+    def save(self, *args, **kwargs):
+        # Compute buyer-facing price from the seller-configured commission model.
+        # See User.seller_commission_rate / buyer_commission_rate / price_is_buyer_final.
+        #
+        # Toggle OFF (default): L is the seller's reference price.
+        #   buyer pays = L * (1 + seller_rate/100)
+        #   seller payout (informational) = L * (1 - buyer_rate/100)
+        #
+        # Toggle ON: L IS what the buyer pays (admin-set per seller).
+        #   buyer pays = L
+        #   seller payout = L * (1 - (seller_rate + buyer_rate)/100)
+        #
+        # GST is no longer added on top — it's absorbed into the same listed price.
+        from decimal import Decimal
+        L = Decimal(str(self.base_price))
+        s, b, buyer_final = self._resolve_commission()
+
+        if buyer_final:
+            self.price = L
+        else:
+            self.price = L * (Decimal('1') + s / Decimal('100'))
+
+        # commission_rate column retained for backward compatibility; store the
+        # effective seller-side rate so legacy readers don't break.
+        self.commission_rate = s
         super().save(*args, **kwargs)
+
+    @property
+    def seller_payout(self):
+        """What the seller receives for one unit sale (Decimal). Computed, not stored."""
+        from decimal import Decimal
+        L = Decimal(str(self.base_price))
+        s, b, buyer_final = self._resolve_commission()
+        if buyer_final:
+            return L * (Decimal('1') - (s + b) / Decimal('100'))
+        return L * (Decimal('1') - b / Decimal('100'))
 
     def __str__(self):
         return f"{self.product.name} - {self.name}"

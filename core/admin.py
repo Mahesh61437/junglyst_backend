@@ -18,8 +18,27 @@ class ProductVariantForm(forms.ModelForm):
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
-    list_display = ('email', 'role', 'is_verified_seller', 'is_deleted')
-    list_filter = ('role', 'is_deleted')
+    list_display = (
+        'email', 'role', 'is_verified_seller',
+        'seller_commission_rate', 'buyer_commission_rate', 'price_is_buyer_final',
+        'is_deleted',
+    )
+    list_filter = ('role', 'is_deleted', 'price_is_buyer_final')
+    search_fields = ('email', 'username', 'phone')
+    fieldsets = (
+        (None, {'fields': ('email', 'username', 'phone', 'password')}),
+        ('Profile', {'fields': ('role', 'is_verified_seller', 'is_guest', 'avatar_url', 'location')}),
+        ('Commission & Pricing (admin-only — never shown to seller or buyer)', {
+            'fields': ('seller_commission_rate', 'buyer_commission_rate', 'price_is_buyer_final'),
+            'description': (
+                'Toggle OFF: buyer pays L × (1 + seller_rate/100); seller payout = L × (1 − buyer_rate/100). '
+                'Toggle ON: buyer pays L exactly; seller payout = L × (1 − (seller_rate + buyer_rate)/100).'
+            ),
+        }),
+        ('Permissions', {'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
+        ('Timestamps', {'fields': ('last_login', 'date_joined')}),
+    )
+    readonly_fields = ('last_login', 'date_joined')
 
 
 class ShippingRateInline(admin.TabularInline):

@@ -41,3 +41,29 @@ class SellerProfileSerializer(serializers.ModelSerializer):
     def get_next_shipping_date(self, obj):
         d = obj.get_next_shipping_date()
         return d.isoformat() if d else None
+
+
+class AdminSellerProfileSerializer(SellerProfileSerializer):
+    """Admin-only variant — surfaces the seller's commission config from the
+    linked User. NEVER use this in seller-facing or buyer-facing responses.
+    """
+    seller_commission_rate = serializers.DecimalField(
+        source='user.seller_commission_rate', max_digits=5, decimal_places=2, required=False,
+    )
+    buyer_commission_rate = serializers.DecimalField(
+        source='user.buyer_commission_rate', max_digits=5, decimal_places=2, required=False,
+    )
+    price_is_buyer_final = serializers.BooleanField(
+        source='user.price_is_buyer_final', required=False,
+    )
+
+    def update(self, instance, validated_data):
+        user_data = validated_data.pop('user', {})
+        if user_data:
+            user = instance.user
+            for attr, value in user_data.items():
+                setattr(user, attr, value)
+            # Run model-level validation (e.g., s+b<100 when toggle ON).
+            user.full_clean(exclude=[f.name for f in user._meta.fields if f.name not in user_data])
+            user.save(update_fields=list(user_data.keys()))
+        return super().update(instance, validated_data)
