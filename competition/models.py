@@ -9,6 +9,8 @@ class CompetitionEntry(models.Model):
     mobile = models.CharField(max_length=15)
     about_aquarium = models.TextField()
     image_urls = models.JSONField(default=list, blank=True)
+    instagram_handle = models.CharField(max_length=100, blank=True, default='')
+    follows_instagram = models.BooleanField(default=False)
     submitted_at = models.DateTimeField(auto_now_add=True)
     is_winner = models.BooleanField(default=False)
     is_disqualified = models.BooleanField(default=False)

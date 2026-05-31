@@ -6,18 +6,18 @@ from .models import CompetitionEntry
 @admin.register(CompetitionEntry)
 class CompetitionEntryAdmin(admin.ModelAdmin):
     list_display = [
-        'name', 'email', 'mobile', 'submitted_at',
-        'image_count', 'is_winner', 'is_disqualified',
+        'name', 'email', 'mobile', 'instagram_handle', 'follows_instagram',
+        'submitted_at', 'image_count', 'is_winner', 'is_disqualified',
     ]
-    list_filter = ['is_winner', 'is_disqualified', 'submitted_at']
-    search_fields = ['name', 'email', 'mobile']
+    list_filter = ['is_winner', 'is_disqualified', 'follows_instagram', 'submitted_at']
+    search_fields = ['name', 'email', 'mobile', 'instagram_handle']
     readonly_fields = ['id', 'submitted_at', 'image_preview']
     ordering = ['submitted_at']
     list_per_page = 50
 
     fieldsets = (
         ('Contestant', {
-            'fields': ('id', 'name', 'email', 'mobile', 'submitted_at'),
+            'fields': ('id', 'name', 'email', 'mobile', 'instagram_handle', 'follows_instagram', 'submitted_at'),
         }),
         ('Entry', {
             'fields': ('about_aquarium', 'image_preview'),
