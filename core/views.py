@@ -178,13 +178,6 @@ class ProductListView(generics.ListAPIView):
     ordering_fields = ('created_at', 'rating')
     
     def get(self, request, *args, **kwargs):
-        if request.query_params.get('clear_cache') == 'secret123':
-            from core.feed import invalidate_feed_cache
-            invalidate_feed_cache()
-            from django.core.cache import cache
-            cache.clear()
-            return Response({"message": "Cache cleared successfully"})
-
         # We only cache the main list. If there are seller queries, we do not cache.
         if request.query_params.get('seller') or request.query_params.get('seller_slug'):
             return super().get(request, *args, **kwargs)
