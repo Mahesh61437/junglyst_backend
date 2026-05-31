@@ -88,6 +88,7 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'corsheaders',
     'django_filters',
+    'drf_spectacular',
     
     # Local Apps
     'core',
@@ -296,7 +297,44 @@ REST_FRAMEWORK = {
         'anon': '200/minute',   # stops scrapers/bots; casual browsing is ~5-15 req/page
         'user': '600/minute',   # authenticated users won't hit this under normal use
         'auth': '10/minute',    # keep tight for brute-force protection
-    }
+    },
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Junglyst API',
+    'DESCRIPTION': (
+        'REST API for the Junglyst botanical marketplace — plants, aquatic specimens, '
+        'and accessories. Covers buyer flows (auth, browsing, cart, checkout, orders) '
+        'and seller flows (onboarding, product management, fulfilment).'
+    ),
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SERVERS': [
+        {'url': 'http://127.0.0.1:8000', 'description': 'Local development'},
+        {'url': 'https://api.junglyst.com', 'description': 'Production'},
+    ],
+    'TAGS': [
+        {'name': 'Auth', 'description': 'Registration, login, JWT refresh, password reset, current user.'},
+        {'name': 'Products', 'description': 'Public product catalog, detail, search, reviews.'},
+        {'name': 'Categories', 'description': 'Category and subcategory listings.'},
+        {'name': 'Cart', 'description': 'Guest + authenticated cart management.'},
+        {'name': 'Wishlist', 'description': 'Saved products per user.'},
+        {'name': 'Checkout', 'description': 'Checkout, payment initiation, payment verification.'},
+        {'name': 'Orders', 'description': 'Buyer order list, detail, tracking, cancellation.'},
+        {'name': 'Shipping', 'description': 'Saved addresses, pincode serviceability, rate quotes.'},
+        {'name': 'Sellers (public)', 'description': 'Public seller storefronts and listings.'},
+        {'name': 'Sellers (dashboard)', 'description': 'Authenticated seller management endpoints.'},
+        {'name': 'Seller Orders', 'description': 'Sub-order fulfilment workflow for sellers.'},
+        {'name': 'Notifications', 'description': 'In-app notifications, newsletter, contact form.'},
+        {'name': 'Misc', 'description': 'Home aggregate, config, bug reports, competition.'},
+    ],
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SORT_OPERATIONS': False,
+    'SWAGGER_UI_SETTINGS': {
+        'persistAuthorization': True,
+        'displayRequestDuration': True,
+    },
 }
 
 # JWT Configuration

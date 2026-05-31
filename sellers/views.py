@@ -10,7 +10,7 @@ from .models import (
     SellerProfile, AllowedSeller, SellerShippingConfig,
     ShippingDefaultConfig, SellerBlackoutDate,
 )
-from .serializers import SellerProfileSerializer, SellerBlackoutDateSerializer
+from .serializers import SellerProfileSerializer, SellerBlackoutDateSerializer, AdminSellerProfileSerializer
 from .encryption import encrypt_field, decrypt_field, mask_account
 from django.utils.text import slugify
 
@@ -375,12 +375,14 @@ class FeaturedCuratorView(generics.GenericAPIView):
 
 class AdminSellerProfileEditView(generics.RetrieveUpdateAPIView):
     """
-    Admin-only: view and edit any seller's profile fields.
+    Admin-only: view and edit any seller's profile fields plus the linked
+    User's commission config (seller_commission_rate, buyer_commission_rate,
+    price_is_buyer_final).
     GET/PATCH /api/sellers/profiles/<id>/admin-edit/
     """
     permission_classes = (permissions.IsAdminUser,)
-    serializer_class = SellerProfileSerializer
-    queryset = SellerProfile.objects.all()
+    serializer_class = AdminSellerProfileSerializer
+    queryset = SellerProfile.objects.select_related('user').all()
 
     def patch(self, request, *args, **kwargs):
         kwargs['partial'] = True
