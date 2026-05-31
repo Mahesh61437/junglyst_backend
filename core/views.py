@@ -316,6 +316,9 @@ class ProductListView(generics.ListAPIView):
             else:
                 # Unknown sort field — fall back to DB ordering (seller dashboard edge cases)
                 secondary = [f.strip() for f in ordering_param.split(',')]
+                if any(f.lstrip('-') == 'price' for f in secondary):
+                    from django.db.models import Min
+                    qs = qs.annotate(price=Min('variants__price'))
                 return qs.order_by('-has_stock', *secondary)
 
         # 3. Default public shop browse — seller-fair feed
@@ -333,6 +336,18 @@ class ProductListView(generics.ListAPIView):
             return None
 
         if hasattr(self, '_preordered_ids'):
+            # Drop cached IDs that no longer match the live queryset (e.g. products
+            # deactivated/deleted since the Redis master feed was built). Without
+            # this, DRF reports count=N but the page-1 slice can return [] when the
+            # first page_size IDs all happen to be stale.
+            import uuid
+            self._preordered_ids = [
+                uuid.UUID(pid) if isinstance(pid, str) else pid
+                for pid in self._preordered_ids
+            ]
+            valid_ids = frozenset(queryset.values_list('id', flat=True))
+            self._preordered_ids = [pid for pid in self._preordered_ids if pid in valid_ids]
+
             # Paginate the Python ID list — DRF uses len() for total count
             page_ids = self.paginator.paginate_queryset(
                 self._preordered_ids, self.request, view=self
