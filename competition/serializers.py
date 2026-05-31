@@ -5,7 +5,7 @@ from .models import CompetitionEntry
 class CompetitionEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = CompetitionEntry
-        fields = ['id', 'name', 'email', 'mobile', 'about_aquarium', 'image_urls', 'submitted_at']
+        fields = ['id', 'name', 'email', 'mobile', 'about_aquarium', 'image_urls', 'instagram_handle', 'follows_instagram', 'submitted_at']
         read_only_fields = ['id', 'image_urls', 'submitted_at']
 
     def validate_name(self, value):

@@ -129,11 +129,16 @@ class CompetitionEntryView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        follows_raw = request.data.get('follows_instagram', 'false')
+        follows_instagram = follows_raw in (True, 'true', 'True', '1')
+
         serializer = CompetitionEntrySerializer(data={
             'name': request.data.get('name', '').strip(),
             'email': email,
             'mobile': request.data.get('mobile', '').strip(),
             'about_aquarium': request.data.get('about_aquarium', '').strip(),
+            'instagram_handle': request.data.get('instagram_handle', '').strip().lstrip('@'),
+            'follows_instagram': follows_instagram,
         })
 
         if not serializer.is_valid():
