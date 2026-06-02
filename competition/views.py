@@ -1,6 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import AllowAny
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime, parse_date
 from datetime import datetime, date, time, timedelta, timezone as dt_timezone
@@ -93,6 +94,8 @@ class CompetitionStatusView(APIView):
 
 
 class CompetitionEntryView(APIView):
+    permission_classes = [AllowAny]
+
     def post(self, request):
         now = timezone.now()
         launch_date = _resolve_launch_date(get_config('competition_settings'))
