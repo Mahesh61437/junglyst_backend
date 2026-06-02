@@ -4,6 +4,7 @@ from .views import (
     OrderTrackView, SellerOrderListView, ShipNowView,
     SellerSubOrderListView, SellerSubOrderDetailView, ConfirmSubOrderView, UploadPackagingPhotoView,
     UpdateShipmentDetailsView, SubOrderShipView, UpdateSubOrderStatusView,
+    RefreshShippingLabelView,
     CancelOrderView,
 )
 
@@ -22,6 +23,7 @@ urlpatterns = [
     path('seller/sub-orders/<uuid:pk>/upload-photo/', UploadPackagingPhotoView.as_view(), name='suborder_upload_photo'),
     path('seller/sub-orders/<uuid:pk>/shipment-details/', UpdateShipmentDetailsView.as_view(), name='suborder_shipment_details'),
     path('seller/sub-orders/<uuid:pk>/ship/', SubOrderShipView.as_view(), name='suborder_ship'),
+    path('seller/sub-orders/<uuid:pk>/refresh-label/', RefreshShippingLabelView.as_view(), name='suborder_refresh_label'),
     path('seller/sub-orders/<uuid:pk>/status/', UpdateSubOrderStatusView.as_view(), name='suborder_update_status'),
     path('ship-now/', ShipNowView.as_view(), name='ship_now'),
 ]

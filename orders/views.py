@@ -944,7 +944,16 @@ class SellerSubOrderDetailView(APIView):
 
 
 class ConfirmSubOrderView(APIView):
-    """Seller confirms a sub-order → status 'confirmed', starts 48h dispatch clock."""
+    """
+    Seller confirms a sub-order — collects approximate package weight + dimensions
+    and immediately queues courier booking so the label is generated up-front.
+
+    Flow:
+        placed → confirmed (this view) → booked (Celery sets after AWB returns)
+
+    Packaging photos are NOT required here — the seller updates the actuals and
+    uploads photos later from the Booking Courier tab before pickup is scheduled.
+    """
     permission_classes = (permissions.IsAuthenticated,)
 
     def post(self, request, pk):
@@ -956,11 +965,49 @@ class ConfirmSubOrderView(APIView):
         if sub_order.status != 'placed':
             return Response({'error': f'Cannot confirm: current status is {sub_order.status}'}, status=status.HTTP_400_BAD_REQUEST)
 
+        weight = request.data.get('actual_weight_grams') or request.data.get('weight_grams')
+        length = request.data.get('actual_length_cm') or request.data.get('length_cm')
+        breadth = request.data.get('actual_breadth_cm') or request.data.get('breadth_cm')
+        height = request.data.get('actual_height_cm') or request.data.get('height_cm')
+
+        errors = {}
+        try:
+            w = int(weight)
+            if not (1 <= w <= 30000):
+                errors['actual_weight_grams'] = 'Must be between 1 and 30,000 grams.'
+        except (TypeError, ValueError):
+            errors['actual_weight_grams'] = 'Approximate weight in grams is required.'
+
+        parsed_dims = {}
+        for field, raw in (
+            ('actual_length_cm', length),
+            ('actual_breadth_cm', breadth),
+            ('actual_height_cm', height),
+        ):
+            try:
+                v = int(raw)
+                if v <= 0:
+                    errors[field] = 'Must be a positive integer.'
+                else:
+                    parsed_dims[field] = v
+            except (TypeError, ValueError):
+                errors[field] = 'Approximate dimension (cm) is required.'
+
+        if errors:
+            return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+
         now = timezone.now()
         sub_order.status = 'confirmed'
         sub_order.confirmed_at = now
         sub_order.dispatch_deadline = now + timedelta(hours=48)
-        sub_order.save(update_fields=['status', 'confirmed_at', 'dispatch_deadline', 'updated_at'])
+        sub_order.actual_weight_grams = w
+        for field, value in parsed_dims.items():
+            setattr(sub_order, field, value)
+        sub_order.save(update_fields=[
+            'status', 'confirmed_at', 'dispatch_deadline',
+            'actual_weight_grams', 'actual_length_cm', 'actual_breadth_cm', 'actual_height_cm',
+            'updated_at',
+        ])
 
         buyer = sub_order.order.user
         if buyer:
@@ -970,6 +1017,26 @@ class ConfirmSubOrderView(APIView):
                 message=f'Your order {sub_order.sub_order_number} has been confirmed by the seller and is being prepared.',
             )
 
+        # Queue courier booking right away so the seller can download the label.
+        # Pickup is NOT scheduled here — that happens at Ship Now once the seller
+        # has uploaded a packaging photo and confirmed actual measurements.
+        from shipping.tasks import create_shipment_task
+        try:
+            create_shipment_task.delay(
+                str(sub_order.order_id), str(request.user.id), None, str(sub_order.id),
+                schedule_pickup=False,
+            )
+        except Exception as broker_err:
+            logger.warning(
+                "Celery broker unavailable (%s); running create_shipment_task synchronously",
+                broker_err,
+            )
+            create_shipment_task(
+                str(sub_order.order_id), str(request.user.id), None, str(sub_order.id),
+                schedule_pickup=False,
+            )
+
+        sub_order.refresh_from_db()
         return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
 
 
@@ -1045,7 +1112,18 @@ class UpdateShipmentDetailsView(APIView):
 
 
 class SubOrderShipView(APIView):
-    """Seller marks sub-order as shipped (triggers NimbusPost or manual AWB)."""
+    """
+    Seller marks a booked sub-order as ready for pickup.
+
+    Pre-conditions:
+        - Status is 'booked' (label already generated at Confirm step) OR
+          'booking_failed' (retry path).
+        - At least one packaging photo uploaded.
+        - Actual weight + L×B×H persisted.
+
+    On success: requests pickup from the logistics provider.
+    Manual-AWB sellers skip the pickup call and are simply marked as ready.
+    """
     permission_classes = (permissions.IsAuthenticated,)
 
     def post(self, request, pk):
@@ -1054,63 +1132,144 @@ class SubOrderShipView(APIView):
         except SubOrder.DoesNotExist:
             return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        if sub_order.status not in ('confirmed', 'packing', 'booking_failed'):
-            return Response({'error': f'Cannot ship: current status is {sub_order.status}'}, status=status.HTTP_400_BAD_REQUEST)
+        manual_awb = (request.data.get('awb_number') or '').strip()
+        manual_courier = (request.data.get('courier_name') or '').strip()
+        courier_id = request.data.get('courier_id')
+
+        # Allow Ship Now from booked (most common), booking_failed (retry), or
+        # legacy confirmed/packing for backward compatibility with older orders
+        # that were confirmed before the new flow shipped.
+        allowed = ('booked', 'booking_failed', 'confirmed', 'packing')
+        if sub_order.status not in allowed:
+            return Response(
+                {'error': f'Cannot ship: current status is {sub_order.status}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if not sub_order.packaging_photos:
-            return Response({'error': 'Upload at least one packaging photo before shipping.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Upload at least one packaging photo before scheduling pickup.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         missing = []
         if not sub_order.actual_weight_grams:
             missing.append('actual weight (grams)')
-        if not sub_order.actual_length_cm or not sub_order.actual_breadth_cm or not sub_order.actual_height_cm:
+        if not (sub_order.actual_length_cm and sub_order.actual_breadth_cm and sub_order.actual_height_cm):
             missing.append('box dimensions (L × B × H)')
         if missing:
-            return Response({'error': f'Please fill in {" and ".join(missing)} before shipping.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': f'Please fill in {" and ".join(missing)} before shipping.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        courier_id = request.data.get('courier_id')
-        manual_awb = request.data.get('awb_number')
-        manual_courier = request.data.get('courier_name')
-
-        # On rebook after failure, clear the stale failure reason and any pending
-        # Shipment record so the task's duplicate-guard doesn't block it.
-        if sub_order.status == 'booking_failed':
-            SubOrder.objects.filter(id=sub_order.id).update(booking_failure_reason=None)
-            from shipping.models import Shipment
-            Shipment.objects.filter(order=sub_order.order, seller=request.user, status='pending').delete()
-
+        # Manual AWB path — seller booked their own courier outside Shiprocket.
         if manual_awb:
-            # Manual AWB entry — seller confirming with their own courier; mark as booked immediately
             sub_order.awb_number = manual_awb
             sub_order.courier_name = manual_courier or 'Manual'
             sub_order.status = 'booked'
             sub_order.booking_failure_reason = None
             sub_order.save(update_fields=['awb_number', 'courier_name', 'status', 'booking_failure_reason', 'updated_at'])
-        else:
-            # Celery will book courier async; mark as 'booked' right away so the
-            # order moves from "Pending" to "Booking Courier" tab immediately.
+            buyer = sub_order.order.user
+            if buyer:
+                AppNotification.objects.create(
+                    user=buyer,
+                    title='Your order is being packed!',
+                    message=f'Order {sub_order.sub_order_number} is being prepared for dispatch.',
+                )
+            return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
+
+        # Retry path after booking failure: clear the stale failure record and
+        # re-run the full booking task (so a new AWB + label is generated).
+        if sub_order.status == 'booking_failed' or not sub_order.awb_number:
+            if sub_order.status == 'booking_failed':
+                SubOrder.objects.filter(id=sub_order.id).update(booking_failure_reason=None)
+                from shipping.models import Shipment
+                Shipment.objects.filter(
+                    order=sub_order.order, seller=request.user, status='pending',
+                ).delete()
             sub_order.status = 'booked'
             sub_order.save(update_fields=['status', 'updated_at'])
             from shipping.tasks import create_shipment_task
             try:
                 create_shipment_task.delay(
-                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id),
+                    schedule_pickup=True,
                 )
             except Exception as broker_err:
-                # Celery broker unavailable — run synchronously so the shipment still gets booked
-                logger.warning("Celery broker unavailable (%s); running create_shipment_task synchronously", broker_err)
-                create_shipment_task(
-                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id)
+                logger.warning(
+                    "Celery broker unavailable (%s); running create_shipment_task synchronously",
+                    broker_err,
                 )
+                create_shipment_task(
+                    str(sub_order.order_id), str(request.user.id), courier_id, str(sub_order.id),
+                    schedule_pickup=True,
+                )
+        else:
+            # Standard path: AWB already exists from the Confirm step — only the
+            # pickup needs to be requested from Shiprocket / NimbusPost.
+            from shipping.tasks import schedule_pickup_task
+            try:
+                schedule_pickup_task.delay(str(sub_order.id))
+            except Exception as broker_err:
+                logger.warning(
+                    "Celery broker unavailable (%s); running schedule_pickup_task synchronously",
+                    broker_err,
+                )
+                schedule_pickup_task(str(sub_order.id))
 
         buyer = sub_order.order.user
         if buyer:
             AppNotification.objects.create(
                 user=buyer,
                 title='Your order is being packed!',
-                message=f'Order {sub_order.sub_order_number} is being prepared for dispatch. Tracking details will be shared once shipped.',
+                message=f'Order {sub_order.sub_order_number} is being prepared for dispatch.',
             )
 
+        sub_order.refresh_from_db()
+        return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
+
+
+class RefreshShippingLabelView(APIView):
+    """
+    POST /orders/seller/sub-orders/<pk>/refresh-label/
+
+    Shiprocket sometimes returns an empty label_url at the time the AWB is
+    assigned because the PDF is still being generated. This endpoint lets the
+    seller re-fetch the label by AWB without re-creating the shipment.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request, pk):
+        try:
+            sub_order = SubOrder.objects.select_related('order').get(id=pk, seller=request.user)
+        except SubOrder.DoesNotExist:
+            return Response({'error': 'Sub-order not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not sub_order.awb_number:
+            return Response({'error': 'Courier has not been booked yet — no AWB to fetch a label for.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from shipping.models import Shipment
+        from shipping.services import get_logistics_service
+        shipment = Shipment.objects.filter(order=sub_order.order, seller=request.user).first()
+
+        try:
+            result = get_logistics_service().generate_label([sub_order.awb_number])
+        except Exception as exc:
+            logger.error("RefreshShippingLabelView: provider raised %s", exc)
+            return Response({'error': 'Could not reach the courier API. Try again in a moment.'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        label_url = (result or {}).get('data') if (result or {}).get('status') else None
+        if not label_url:
+            return Response(
+                {'error': 'Label not ready yet — please retry in a minute. Shiprocket usually needs 30–60 seconds after AWB assignment.'},
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        if shipment:
+            Shipment.objects.filter(pk=shipment.pk).update(label_url=label_url)
+
+        sub_order.refresh_from_db()
         return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
 
 
