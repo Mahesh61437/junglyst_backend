@@ -37,6 +37,11 @@ def _generate_unique_handle(user) -> str:
 
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)
 def create_community_profile(sender, instance, created, **kwargs):
+    # Gated by FEATURE_COMMUNITY_ENABLED — when the community module is hidden
+    # from prod, signup should NOT silently create community profile rows that
+    # the user can't see or manage. They'll be created lazily once the flag flips.
+    if not getattr(settings, 'FEATURE_COMMUNITY_ENABLED', False):
+        return
     if not created:
         return
     from .models import CommunityProfile

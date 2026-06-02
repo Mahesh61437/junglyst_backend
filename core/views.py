@@ -751,6 +751,22 @@ class PublicConfigurationView(generics.GenericAPIView):
         return Response(ConfigurationSerializer(config).data)
 
 
+class FeatureFlagsView(generics.GenericAPIView):
+    """
+    GET /api/core/features/
+
+    Public, unauthenticated read of the current feature-flag values so the
+    frontend can hide UI for half-built modules without a rebuild. Add a key
+    here for each FEATURE_* setting that the frontend cares about.
+    """
+    permission_classes = (permissions.AllowAny,)
+
+    def get(self, request):
+        return Response({
+            'community': bool(getattr(settings, 'FEATURE_COMMUNITY_ENABLED', False)),
+        })
+
+
 class ConfigurationAdminView(generics.ListCreateAPIView):
     """List or create configuration entries. Super-admin only."""
     serializer_class = ConfigurationSerializer

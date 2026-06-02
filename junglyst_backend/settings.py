@@ -373,6 +373,20 @@ TIME_ZONE = 'Asia/Kolkata'
 USE_I18N = True
 USE_TZ = True
 
+# ── Feature Flags ─────────────────────────────────────────────────────────────
+# Off-switches for half-built modules so they can be hidden from prod traffic
+# without ripping out the code. Default OFF — explicitly opt in per environment.
+#
+# FEATURE_COMMUNITY_ENABLED
+#   When False (default):
+#     - /api/community/* URLs are not registered (returns 404).
+#     - The post_save signal that auto-creates CommunityProfile rows is skipped.
+#     - Models still live in INSTALLED_APPS so existing data and admin pages keep
+#       working — the gate is on the *user-facing* surface, not on the schema.
+#   Flip to True via env var FEATURE_COMMUNITY_ENABLED=true once the launch is ready.
+FEATURE_COMMUNITY_ENABLED = config('FEATURE_COMMUNITY_ENABLED', default=False, cast=bool)
+
+
 # Celery Configuration
 CELERY_BROKER_URL = REDIS_URL if REDIS_URL else 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'django-db'

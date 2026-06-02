@@ -20,13 +20,17 @@ urlpatterns = [
     path('api/notifications/', include('notifications.urls')),
     path('api/payments/', include('payments.urls')),
     path('api/competition/', include('competition.urls')),
-    path('api/community/', include('community.urls')),
 
     # API documentation
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
     path('api/redoc/', SpectacularRedocView.as_view(url_name='schema'), name='redoc'),
 ]
+
+# Community is feature-flagged off until launch — see settings.FEATURE_COMMUNITY_ENABLED.
+# When the flag is False, /api/community/* is not routed and returns 404 to clients.
+if getattr(settings, 'FEATURE_COMMUNITY_ENABLED', False):
+    urlpatterns.insert(-3, path('api/community/', include('community.urls')))
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
