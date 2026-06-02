@@ -161,6 +161,8 @@ SORTABLE_FIELDS: dict = {
     '-rating':     ('rating',     True),
     'created_at':  ('created_at', False),
     '-created_at': ('created_at', True),
+    'price':       ('price',      False),
+    '-price':      ('price',      True),
 }
 
 
@@ -176,7 +178,11 @@ def get_sorted_feed(ordering_param: str) -> list | None:
     Return a pre-warmed feed sorted by *ordering_param* with seller-fair
     tiebreaking.  Returns None if not cached (caller should fall back to DB).
     """
-    return cache.get(_sorted_feed_key(ordering_param))
+    res = cache.get(_sorted_feed_key(ordering_param))
+    if res is not None:
+        import uuid
+        return [uuid.UUID(pid) if isinstance(pid, str) else pid for pid in res]
+    return None
 
 
 def compute_sorted_feed(ordering_param: str, master_ids: list) -> list:
@@ -187,16 +193,25 @@ def compute_sorted_feed(ordering_param: str, master_ids: list) -> list:
     (e.g., 1521 products all rated 5.0) the seller-fair feed position is used
     as the tiebreaker, so no single seller dominates a rating/price tier.
     """
+    from django.db.models import Min
     from .models import Product
 
     field_name, descending = SORTABLE_FIELDS[ordering_param]
     master_set = frozenset(master_ids)
 
-    rows = (
-        Product.objects
-        .filter(id__in=master_set)
-        .values('id', field_name)
-    )
+    if field_name == 'price':
+        rows = (
+            Product.objects
+            .filter(id__in=master_set)
+            .annotate(price=Min('variants__price'))
+            .values('id', 'price')
+        )
+    else:
+        rows = (
+            Product.objects
+            .filter(id__in=master_set)
+            .values('id', field_name)
+        )
     field_values: dict = {}
     for row in rows:
         val = row[field_name]
@@ -240,6 +255,9 @@ def get_ordered_product_ids() -> list:
     if ids is None:
         ids = compute_ordered_ids()
         cache.set(FEED_CACHE_KEY, ids, _ttl_until_midnight())
+    else:
+        import uuid
+        ids = [uuid.UUID(pid) if isinstance(pid, str) else pid for pid in ids]
     return ids
 
 
@@ -261,6 +279,9 @@ def get_filtered_ordered_ids(filter_params: dict, qs) -> list:
         valid    = frozenset(qs.values_list('id', flat=True))   # SELECT id only
         ids      = [i for i in master if i in valid]
         cache.set(cache_key, ids, _ttl_until_midnight())
+    else:
+        import uuid
+        ids = [uuid.UUID(pid) if isinstance(pid, str) else pid for pid in ids]
     return ids
 
 
