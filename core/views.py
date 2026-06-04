@@ -991,6 +991,7 @@ class HomeDataView(generics.GenericAPIView):
         from sellers.serializers import SellerProfileSerializer
         from django.contrib.auth import get_user_model
         User = get_user_model()
+        print(f"debug: {User}")
 
         cached = cache.get(self._CACHE_KEY)
         if cached is not None:

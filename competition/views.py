@@ -5,18 +5,40 @@ from rest_framework.permissions import AllowAny
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime, parse_date
 from datetime import datetime, date, time, timedelta, timezone as dt_timezone
+from io import BytesIO
+from PIL import Image, ImageOps
 from .models import CompetitionEntry
 from .serializers import CompetitionEntrySerializer
 from core.storage import upload_to_firebase
 from core.config_utils import get_config
 
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
 IST = dt_timezone(timedelta(hours=5, minutes=30))
 DEFAULT_LAUNCH_DATE = datetime(2026, 6, 1, 0, 0, 0, tzinfo=IST)
 MAX_ENTRIES = 500
+MAX_IMAGES = 5
+MAX_IMAGE_SIZE_MB = 10
+MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024
+MAX_DIMENSION = 2048  # px on longest side after resize
+JPEG_QUALITY = 85
+SUPPORT_INSTAGRAM = '@the.junglyst'
+
+ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif'}
+ALLOWED_MIME_TYPES = {
+    'image/jpeg', 'image/png', 'image/webp',
+    'image/heic', 'image/heif',
+}
+
+def _support_msg():
+    return f'If this keeps happening, DM us on Instagram at {SUPPORT_INSTAGRAM} and we\'ll help you submit manually.'
 
 
 def _parse_dd_mm_yyyy(raw):
-    """Parse a 'DD-MM-YYYY' string to a date, or return None."""
     if not isinstance(raw, str):
         return None
     parts = raw.strip().split('-')
@@ -30,7 +52,6 @@ def _parse_dd_mm_yyyy(raw):
 
 
 def _coerce_date(raw):
-    """Accept 'DD-MM-YYYY' (preferred), ISO date, or ISO datetime. Return a date or None."""
     d = _parse_dd_mm_yyyy(raw)
     if d:
         return d
@@ -45,9 +66,6 @@ def _coerce_date(raw):
 
 
 def _resolve_launch_date(settings_data):
-    """Resolve launch_date from competition_settings as an IST-anchored datetime
-    at midnight. Falls back to the default launch date when missing/invalid.
-    """
     raw = (settings_data or {}).get('launch_date')
     d = _coerce_date(raw)
     if d is None:
@@ -56,12 +74,51 @@ def _resolve_launch_date(settings_data):
 
 
 def _resolve_announcement_date_iso(settings_data):
-    """Return result_announcement_date as 'YYYY-MM-DD' (ISO date) for the frontend."""
     raw = (settings_data or {}).get('result_announcement_date')
     d = _coerce_date(raw)
     if d is None:
         return None
     return d.isoformat()
+
+
+def _is_allowed_file(file_obj):
+    """Check by both MIME type and extension — phones often send wrong MIME for HEIC."""
+    ext = '.' + file_obj.name.rsplit('.', 1)[-1].lower() if '.' in file_obj.name else ''
+    return file_obj.content_type in ALLOWED_MIME_TYPES or ext in ALLOWED_EXTENSIONS
+
+
+def _process_image(file_obj):
+    """
+    Decode the image (any supported format including HEIC), apply EXIF
+    orientation, resize to MAX_DIMENSION on the longest side if larger,
+    and re-encode as JPEG. Returns a BytesIO ready to upload.
+
+    All formats go through the same path so memory usage is bounded:
+    worst case is MAX_DIMENSION x MAX_DIMENSION x 3 bytes (~12 MB) in RAM.
+    """
+    img = None
+    try:
+        img = Image.open(file_obj)
+        img = ImageOps.exif_transpose(img)   # fix phone/camera rotation
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        w, h = img.size
+        if w > MAX_DIMENSION or h > MAX_DIMENSION:
+            img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format='JPEG', quality=JPEG_QUALITY, optimize=True)
+        buf.seek(0)
+        buf.name = 'image.jpg'
+        buf.content_type = 'image/jpeg'
+        return buf
+    except Exception:
+        raise ValueError(
+            'Could not read the image. '
+            'Make sure it is a valid JPEG, PNG, WebP, or HEIC file.'
+        )
+    finally:
+        if img:
+            img.close()
 
 
 class CompetitionStatusView(APIView):
@@ -90,10 +147,21 @@ class CompetitionStatusView(APIView):
             'prize_amount': 1000,
             'prize_currency': 'INR',
             'result_announcement_date': result_announcement_date,
+            'image_limits': {
+                'max_images': MAX_IMAGES,
+                'max_size_mb': MAX_IMAGE_SIZE_MB,
+                'max_dimension_px': MAX_DIMENSION,
+                'allowed_types': ['JPEG', 'PNG', 'WebP', 'HEIC'],
+            },
         })
 
 
 class CompetitionEntryView(APIView):
+    """
+    POST /api/competition/enter/
+    Create the entry (no images). Frontend then calls CompetitionImageUploadView
+    for each image one at a time.
+    """
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -120,18 +188,6 @@ class CompetitionEntryView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        images = request.FILES.getlist('images')
-        if not images:
-            return Response(
-                {'error': 'At least one image of your aquascape is required.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if len(images) > 5:
-            return Response(
-                {'error': 'Maximum 5 images allowed per entry.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         follows_raw = request.data.get('follows_instagram', 'false')
         follows_instagram = follows_raw in (True, 'true', 'True', '1')
 
@@ -149,21 +205,110 @@ class CompetitionEntryView(APIView):
 
         entry = serializer.save(image_urls=[])
 
-        image_urls = []
-        try:
-            for img in images:
-                url = upload_to_firebase(img, str(entry.id), 'competition')
-                image_urls.append(url)
-            entry.image_urls = image_urls
-            entry.save(update_fields=['image_urls'])
-        except Exception as e:
-            # Entry is saved even if image upload fails; admin can handle manually
-            pass
-
         return Response({
             'success': True,
-            'message': 'Your aquascape entry has been registered! Good luck!',
             'entry_id': str(entry.id),
             'name': entry.name,
             'slots_remaining': max(0, MAX_ENTRIES - CompetitionEntry.objects.count()),
+            'image_limits': {
+                'max_images': MAX_IMAGES,
+                'max_size_mb': MAX_IMAGE_SIZE_MB,
+                'max_dimension_px': MAX_DIMENSION,
+                'allowed_types': ['JPEG', 'PNG', 'WebP', 'HEIC'],
+            },
         }, status=status.HTTP_201_CREATED)
+
+
+class CompetitionImageUploadView(APIView):
+    """
+    POST /api/competition/enter/<entry_id>/upload-image/
+    Upload one image at a time. Frontend calls this sequentially per image.
+    Image is resized to max 2048px and re-encoded as JPEG before upload.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request, entry_id):
+        try:
+            entry = CompetitionEntry.objects.get(id=entry_id)
+        except (CompetitionEntry.DoesNotExist, ValueError):
+            return Response(
+                {
+                    'error': 'Entry not found.',
+                    'support': _support_msg(),
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if len(entry.image_urls) >= MAX_IMAGES:
+            return Response(
+                {
+                    'error': f'You\'ve already uploaded the maximum of {MAX_IMAGES} images for this entry.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        image = request.FILES.get('image')
+        if not image:
+            return Response(
+                {
+                    'error': 'No image received. Please select a photo and try again.',
+                    'hint': f'Accepted formats: JPEG, PNG, WebP, HEIC — max {MAX_IMAGE_SIZE_MB} MB per image.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not _is_allowed_file(image):
+            return Response(
+                {
+                    'error': f'"{image.name}" is not a supported format.',
+                    'hint': f'Please upload a JPEG, PNG, WebP, or HEIC file. Max {MAX_IMAGE_SIZE_MB} MB per image.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if image.size > MAX_IMAGE_SIZE_BYTES:
+            actual_mb = round(image.size / (1024 * 1024), 1)
+            return Response(
+                {
+                    'error': f'"{image.name}" is {actual_mb} MB — over the {MAX_IMAGE_SIZE_MB} MB limit.',
+                    'hint': f'Please reduce the file size to under {MAX_IMAGE_SIZE_MB} MB and try again. '
+                            f'If you\'re unable to resize it, DM us on Instagram at {SUPPORT_INSTAGRAM} and we\'ll help you submit manually.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            processed = _process_image(image)
+        except ValueError:
+            return Response(
+                {
+                    'error': f'We couldn\'t read "{image.name}".',
+                    'hint': f'Make sure the file is a valid JPEG, PNG, WebP, or HEIC image under {MAX_IMAGE_SIZE_MB} MB. '
+                            f'{_support_msg()}',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            url = upload_to_firebase(processed, str(entry.id), 'competition')
+        except Exception:
+            return Response(
+                {
+                    'error': 'We couldn\'t upload your image right now.',
+                    'hint': f'Please try again in a moment. {_support_msg()}',
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        finally:
+            processed.close()
+
+        entry.image_urls = entry.image_urls + [url]
+        entry.save(update_fields=['image_urls'])
+
+        images_uploaded = len(entry.image_urls)
+        return Response({
+            'success': True,
+            'image_url': url,
+            'images_uploaded': images_uploaded,
+            'images_remaining': MAX_IMAGES - images_uploaded,
+        }, status=status.HTTP_200_OK)
