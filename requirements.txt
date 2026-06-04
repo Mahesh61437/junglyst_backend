@@ -52,7 +52,6 @@ MarkupSafe==3.0.3
 msgpack==1.1.2
 packaging==25.0
 Pillow==12.2.0
-pillow-heif==0.22.0
 payu-websdk==0.1.7
 prometheus_client==0.25.0
 prompt_toolkit==3.0.52

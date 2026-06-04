@@ -108,6 +108,7 @@ def _process_image(file_obj):
         buf = BytesIO()
         img.save(buf, format='JPEG', quality=JPEG_QUALITY, optimize=True)
         buf.seek(0)
+        buf.name = 'image.jpg'
         buf.content_type = 'image/jpeg'
         return buf
     except Exception:
