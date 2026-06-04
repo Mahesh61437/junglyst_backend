@@ -1,5 +1,5 @@
 # Use an official Python runtime as a parent image
-FROM python:3.14-slim
+FROM python:3.12-slim
 
 # Set environment variables for high-performance Python
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     iputils-ping \
     vim-tiny \
+    libheif-dev \
+    libde265-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

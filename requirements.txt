@@ -1,4 +1,4 @@
-amqp==5.3.1
+﻿amqp==5.3.1
 anyio==4.13.0
 asgiref==3.8.1
 billiard==4.2.4
@@ -52,6 +52,7 @@ MarkupSafe==3.0.3
 msgpack==1.1.2
 packaging==25.0
 Pillow==12.2.0
+pillow-heif==0.22.0
 payu-websdk==0.1.7
 prometheus_client==0.25.0
 prompt_toolkit==3.0.52
@@ -82,3 +83,5 @@ vine==5.1.0
 wcwidth==0.6.0
 Werkzeug==3.1.8
 whitenoise==6.8.2
+razorpay==2.0.1
+PyYAML==6.0.3
