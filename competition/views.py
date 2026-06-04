@@ -245,6 +245,31 @@ class CompetitionEntryView(APIView):
         }, status=status.HTTP_201_CREATED)
 
 
+class CompetitionEntryCancelView(APIView):
+    """
+    DELETE /api/competition/enter/<entry_id>/cancel/
+    Deletes an entry only if zero images have been uploaded yet.
+    Called by the frontend to clean up an orphaned entry when image upload fails.
+    """
+    permission_classes = [AllowAny]
+
+    def delete(self, request, entry_id):
+        try:
+            entry = CompetitionEntry.objects.get(id=entry_id)
+        except (CompetitionEntry.DoesNotExist, ValueError):
+            return Response({'error': 'Entry not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if entry.image_urls:
+            # Entry already has images — do not allow deletion
+            return Response(
+                {'error': 'Entry cannot be cancelled after images have been uploaded.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        entry.delete()
+        return Response({'success': True, 'message': 'Entry cancelled.'}, status=status.HTTP_200_OK)
+
+
 class CompetitionImageUploadView(APIView):
     """
     POST /api/competition/enter/<entry_id>/upload-image/
