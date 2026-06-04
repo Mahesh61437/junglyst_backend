@@ -13,10 +13,12 @@ from core.storage import upload_to_firebase
 from core.config_utils import get_config
 
 try:
-    from pillow_heif import register_heif_opener
-    register_heif_opener()
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIC_SUPPORTED = True
 except ImportError:
-    pass
+    pillow_heif = None
+    HEIC_SUPPORTED = False
 
 IST = dt_timezone(timedelta(hours=5, minutes=30))
 DEFAULT_LAUNCH_DATE = datetime(2026, 6, 1, 0, 0, 0, tzinfo=IST)
@@ -87,35 +89,59 @@ def _is_allowed_file(file_obj):
     return file_obj.content_type in ALLOWED_MIME_TYPES or ext in ALLOWED_EXTENSIONS
 
 
+def _is_heic(file_obj):
+    mime = getattr(file_obj, 'content_type', '') or ''
+    name = getattr(file_obj, 'name', '') or ''
+    return mime in ('image/heic', 'image/heif') or name.lower().endswith(('.heic', '.heif'))
+
+
 def _process_image(file_obj):
     """
     Decode the image (any supported format including HEIC), apply EXIF
     orientation, resize to MAX_DIMENSION on the longest side if larger,
     and re-encode as JPEG. Returns a BytesIO ready to upload.
 
-    All formats go through the same path so memory usage is bounded:
-    worst case is MAX_DIMENSION x MAX_DIMENSION x 3 bytes (~12 MB) in RAM.
+    HEIC files are opened directly via pillow_heif to avoid relying on
+    Pillow's lazy registered opener which can silently fail on some platforms.
     """
     img = None
     try:
-        img = Image.open(file_obj)
-        img = ImageOps.exif_transpose(img)   # fix phone/camera rotation
+        # Ensure we read from the start regardless of prior seeks
+        if hasattr(file_obj, 'seek'):
+            file_obj.seek(0)
+
+        if _is_heic(file_obj) and HEIC_SUPPORTED:
+            # Read all bytes first — ensures complete file is in memory for libheif
+            raw = file_obj.read()
+            heif_file = pillow_heif.open_heif(BytesIO(raw), convert_hdr_to_8bit=True)
+            img = heif_file.to_pillow()
+        else:
+            img = Image.open(file_obj)
+            img.load()  # Force decode now, not lazily
+
+        try:
+            img = ImageOps.exif_transpose(img)  # fix phone/camera rotation
+        except Exception:
+            pass  # EXIF transpose failure is non-fatal — continue with unrotated image
+
         if img.mode != 'RGB':
             img = img.convert('RGB')
+
         w, h = img.size
         if w > MAX_DIMENSION or h > MAX_DIMENSION:
             img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
+
         buf = BytesIO()
         img.save(buf, format='JPEG', quality=JPEG_QUALITY, optimize=True)
         buf.seek(0)
         buf.name = 'image.jpg'
         buf.content_type = 'image/jpeg'
         return buf
-    except Exception:
+    except Exception as exc:
         raise ValueError(
             'Could not read the image. '
             'Make sure it is a valid JPEG, PNG, WebP, or HEIC file.'
-        )
+        ) from exc
     finally:
         if img:
             img.close()
