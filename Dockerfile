@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     iputils-ping \
     vim-tiny \
+    libde265-0 \
+    libheif1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
