@@ -165,6 +165,19 @@ class NimbuspostService:
         logger.error("Generate manifest failed: %s %s", resp.status_code, resp.text[:200])
         return None
 
+    # ── Request Pickup ────────────────────────────────────────────────────────
+
+    @classmethod
+    def request_pickup(cls, awb_number: str, shipment_id: str | None = None) -> dict | None:
+        """
+        NimbusPost auto-pickups via the same /shipmentcargo/pickup endpoint when
+        request_auto_pickup was 'No' at shipment creation time.
+        """
+        result = cls.generate_manifest([awb_number])
+        if result and result.get("status"):
+            return {"status": True, "data": result.get("data")}
+        return result
+
     # ── Cancel Shipment ───────────────────────────────────────────────────────
 
     @classmethod
@@ -943,8 +956,11 @@ class ShiprocketService:
                 awb = adata.get("awb_code") or adata.get("awb")
                 courier_name = adata.get("courier_name")
 
-        # Request pickup — shipment_id must be a list of integers
-        if awb:
+        # Request pickup — shipment_id must be a list of integers.
+        # Skipped at the Confirm step (request_auto_pickup="No"); the seller
+        # triggers it later via the Ship Now action once they have packed
+        # the box and uploaded the packaging photo.
+        if awb and str(payload.get("request_auto_pickup", "Yes")).lower() == "yes":
             requests.post(
                 f"{SHIPROCKET_BASE}/courier/generate/pickup",
                 json={"shipment_id": [int(shipment_id_sr)]},
@@ -1074,6 +1090,41 @@ class ShiprocketService:
             return {"status": bool(manifest_url), "data": manifest_url}
         logger.error("Shiprocket manifest failed: %s %s", resp.status_code, resp.text[:200])
         return None
+
+    # ── Request Pickup ────────────────────────────────────────────────────────
+
+    @classmethod
+    def request_pickup(cls, awb_number: str, shipment_id: str | None = None) -> dict | None:
+        """Ask Shiprocket to schedule the courier pickup for this shipment."""
+        token = cls.get_token()
+        if not token:
+            return None
+
+        sr_shipment_id = shipment_id
+        if not sr_shipment_id:
+            from .models import Shipment
+            try:
+                sr_shipment_id = Shipment.objects.get(awb_number=awb_number).nimbuspost_id
+            except Shipment.DoesNotExist:
+                return {"status": False, "message": "Shipment not found"}
+
+        if not sr_shipment_id:
+            return {"status": False, "message": "Missing shipment id"}
+
+        resp = requests.post(
+            f"{SHIPROCKET_BASE}/courier/generate/pickup",
+            json={"shipment_id": [int(sr_shipment_id)]},
+            headers=cls._headers(token),
+            timeout=20,
+        )
+        if resp.status_code in (200, 201):
+            body = resp.json()
+            return {
+                "status": True,
+                "data": body.get("response") or body,
+            }
+        logger.error("Shiprocket request_pickup failed: %s %s", resp.status_code, resp.text[:300])
+        return {"status": False, "message": resp.text[:300]}
 
     # ── Cancel Shipment ───────────────────────────────────────────────────────
 

@@ -157,12 +157,27 @@ OrderSerializer = OrderDetailSerializer
 
 # ── Seller serializers ────────────────────────────────────────────────────────
 
+def _parse_shipping_address(raw):
+    """shipping_address is stored as JSONField but may also arrive as a JSON string.
+    Always return a dict so downstream getters don't have to handle both shapes."""
+    if isinstance(raw, str):
+        import json
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 class SellerSubOrderSerializer(serializers.ModelSerializer):
     """Sub-order view for the seller dashboard — seller sees only their sub-order."""
     items = OrderItemSerializer(many=True, read_only=True)
     shipment = serializers.SerializerMethodField()
     dispatch_hours_remaining = serializers.SerializerMethodField()
     buyer_first_name = serializers.SerializerMethodField()
+    buyer_full_name = serializers.SerializerMethodField()
+    buyer_phone = serializers.SerializerMethodField()
+    buyer_address = serializers.SerializerMethodField()
     buyer_pincode = serializers.SerializerMethodField()
 
     class Meta:
@@ -176,7 +191,8 @@ class SellerSubOrderSerializer(serializers.ModelSerializer):
             'awb_number', 'courier_name', 'booking_failure_reason',
             'created_at', 'updated_at',
             'items', 'shipment',
-            'buyer_first_name', 'buyer_pincode',
+            'buyer_first_name', 'buyer_full_name', 'buyer_phone',
+            'buyer_address', 'buyer_pincode',
         )
 
     def get_shipment(self, obj):
@@ -197,32 +213,50 @@ class SellerSubOrderSerializer(serializers.ModelSerializer):
         return max(0, round(delta.total_seconds() / 3600, 1))
 
     def get_buyer_first_name(self, obj):
-        if obj.order.user:
-            return obj.order.user.first_name or obj.order.user.username
-        
-        addr = obj.order.shipping_address
-        if isinstance(addr, str):
-            import json
-            try:
-                addr = json.loads(addr)
-            except Exception:
-                addr = {}
-        if not isinstance(addr, dict):
-            addr = {}
-            
-        return addr.get('firstName') or addr.get('full_name', '').split()[0] if addr.get('full_name') else 'Buyer'
+        addr = _parse_shipping_address(obj.order.shipping_address)
+        full = addr.get('full_name') or ''
+        first_from_full = full.split()[0] if full else ''
+        return (
+            addr.get('firstName')
+            or first_from_full
+            or (obj.order.user.first_name if obj.order.user else '')
+            or (obj.order.user.username if obj.order.user else '')
+            or 'Buyer'
+        )
+
+    def get_buyer_full_name(self, obj):
+        addr = _parse_shipping_address(obj.order.shipping_address)
+        return (
+            addr.get('full_name')
+            or addr.get('name')
+            or (obj.order.user.get_full_name() if obj.order.user else '')
+            or self.get_buyer_first_name(obj)
+        )
+
+    def get_buyer_phone(self, obj):
+        addr = _parse_shipping_address(obj.order.shipping_address)
+        return (
+            addr.get('phone')
+            or addr.get('mobile')
+            or addr.get('phone_number')
+            or (getattr(obj.order.user, 'phone', None) if obj.order.user else None)
+            or ''
+        )
+
+    def get_buyer_address(self, obj):
+        addr = _parse_shipping_address(obj.order.shipping_address)
+        return {
+            'address_line1': addr.get('address_line1') or addr.get('address1') or addr.get('line1') or '',
+            'address_line2': addr.get('address_line2') or addr.get('address2') or addr.get('line2') or '',
+            'landmark': addr.get('landmark') or '',
+            'city': addr.get('city') or '',
+            'state': addr.get('state') or '',
+            'pincode': addr.get('pincode') or addr.get('zip') or addr.get('postal_code') or '',
+            'country': addr.get('country') or 'India',
+        }
 
     def get_buyer_pincode(self, obj):
-        addr = obj.order.shipping_address
-        if isinstance(addr, str):
-            import json
-            try:
-                addr = json.loads(addr)
-            except Exception:
-                addr = {}
-        if not isinstance(addr, dict):
-            addr = {}
-            
+        addr = _parse_shipping_address(obj.order.shipping_address)
         return addr.get('zip') or addr.get('pincode') or addr.get('postal_code') or '—'
 
 

@@ -145,9 +145,16 @@ def _build_shipment_payload(order: Order, seller, courier_id: str, sub_order=Non
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
-def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = None, sub_order_id: str = None):
+def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = None, sub_order_id: str = None, schedule_pickup: bool = False):
     """
-    Create a NimbusPost shipment for a seller's sub-order.
+    Create a shipment (AWB + label) for a seller's sub-order.
+
+    `schedule_pickup`:
+        False (default, used at Confirm) — only book the courier and generate the
+        label. The seller schedules pickup separately via the Ship Now button.
+        True — also request pickup from the carrier immediately (legacy / manual-retry
+        path used by SubOrderShipView when there is no AWB yet).
+
     If courier_id is not supplied, the cheapest available courier is auto-selected.
     On failure after max retries, notifies admin and marks sub-order for manual AWB entry.
     """
@@ -238,6 +245,8 @@ def create_shipment_task(self, order_id: str, seller_id: str, courier_id: str = 
             return f"Blocked: {msg}"
 
     payload = _build_shipment_payload(order, seller, courier_id, sub_order, pickup_location_override)
+    # When called at Confirm, defer pickup until the seller clicks Ship Now.
+    payload["request_auto_pickup"] = "Yes" if schedule_pickup else "No"
     result = logistics_svc.create_shipment(payload)
 
     if not result or not result.get("status"):
@@ -359,6 +368,48 @@ def _notify_admin_booking_failure(order, sub_order, reason):
         )
     except Exception as e:
         logger.error("Failed to send admin notification: %s", e)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30)
+def schedule_pickup_task(self, sub_order_id: str):
+    """
+    Ask the carrier to schedule a pickup for a sub-order that already has an AWB.
+    Used after the seller uploads the packaging photo + actuals and clicks Ship Now.
+    """
+    try:
+        sub_order = SubOrder.objects.select_related("order").get(id=sub_order_id)
+    except SubOrder.DoesNotExist:
+        logger.error("schedule_pickup_task: SubOrder %s not found", sub_order_id)
+        return f"SubOrder {sub_order_id} not found"
+
+    awb = sub_order.awb_number
+    if not awb:
+        logger.warning("schedule_pickup_task: sub-order %s has no AWB yet", sub_order_id)
+        return "AWB not assigned yet"
+
+    shipment = Shipment.objects.filter(order=sub_order.order, seller=sub_order.seller).first()
+    shipment_id_external = getattr(shipment, "nimbuspost_id", None) if shipment else None
+
+    svc = get_logistics_service()
+    if not hasattr(svc, "request_pickup"):
+        logger.warning("schedule_pickup_task: provider %s has no request_pickup method", svc.__name__)
+        return "Pickup scheduling not supported by current provider"
+
+    result = svc.request_pickup(awb, shipment_id_external)
+    if not result or not result.get("status"):
+        msg = (result or {}).get("message", "Pickup request returned no status")
+        logger.error("schedule_pickup_task failed for sub-order %s: %s", sub_order_id, msg)
+        try:
+            raise self.retry(exc=Exception(msg))
+        except self.MaxRetriesExceededError:
+            return f"Pickup scheduling failed: {msg}"
+
+    if shipment:
+        from django.utils import timezone as _tz
+        Shipment.objects.filter(pk=shipment.pk).update(pickup_scheduled_at=_tz.now())
+
+    logger.info("schedule_pickup_task: pickup scheduled for sub-order %s (AWB %s)", sub_order_id, awb)
+    return f"Pickup scheduled for {awb}"
 
 
 @shared_task

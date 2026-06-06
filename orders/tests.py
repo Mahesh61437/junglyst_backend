@@ -94,13 +94,22 @@ def _make_fixtures():
         role="grower",
     )
 
-    # ── Seller profile (required for shipment payload) ─────────────────────
-    SellerProfile.objects.filter(user=seller).update(
+    # ── Seller profile (required for shipment payload + shipping-day check) ─
+    # NOTE: there is no auto-create signal for SellerProfile, so we have to
+    # create the row here. Using .filter().update() (the old approach) silently
+    # no-ops when the row doesn't exist, and the checkout view then rejects
+    # the cart with "seller is on a break" because seller_profile is None.
+    # shiprocket_pickup_location is set so ShiprocketService.ensure_seller_pickup_location
+    # short-circuits without trying to call the real Shiprocket auth API in tests.
+    SellerProfile.objects.create(
+        user=seller,
         store_name="Test Nursery",
+        slug="test-nursery",
         location_city="Bengaluru",
         location_state="Karnataka",
         location_pincode="560001",
         pickup_address="123 Green Street, Bengaluru",
+        shiprocket_pickup_location="Test Nursery",
     )
 
     # ── Category + Product + Variant ──────────────────────────────────────
@@ -398,27 +407,77 @@ class OrderLifecycleTest(TestCase):
 
         return SubOrder.objects.latest("id")
 
-    def test_08_seller_confirms_suborder(self):
-        """POST confirm/ → sub-order goes from 'placed' to 'confirmed', buyer notified."""
+    # Confirm now also books the courier in the same step, so the request body
+    # must carry the seller's approximate package weight + L×B×H. Photos remain
+    # optional at this stage — they're collected later at Ship Now.
+    APPROX_DIMS = {
+        "actual_weight_grams": 620,
+        "actual_length_cm": 22,
+        "actual_breadth_cm": 16,
+        "actual_height_cm": 28,
+    }
+
+    @patch("shipping.services.ShiprocketService.check_serviceability",
+           return_value=FAKE_SHIPROCKET_SERVICEABILITY)
+    @patch("shipping.services.ShiprocketService.create_shipment",
+           return_value=FAKE_SHIPROCKET_SHIPMENT)
+    def test_08_seller_confirms_suborder(self, mock_ship, mock_svc):
+        """
+        POST confirm/ with approx dims must:
+          - validate the body (weight + L×B×H required),
+          - move the sub-order from 'placed' to 'confirmed' with a 48h deadline,
+          - immediately queue the courier-booking task so the label is generated
+            up-front,
+          - notify the buyer.
+        """
         sub = self._placed_sub_order()
         self.assertEqual(sub.status, "placed")
 
         self.client.force_authenticate(user=self.fx["seller"])
-        resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/confirm/")
+        resp = self.client.post(
+            f"/api/orders/seller/sub-orders/{sub.id}/confirm/",
+            self.APPROX_DIMS, format="json",
+        )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
 
         sub.refresh_from_db()
-        self.assertEqual(sub.status, "confirmed")
+        # Status is 'booked' once Celery (eager mode) finishes the booking task.
+        self.assertIn(sub.status, ("confirmed", "booked"))
         self.assertIsNotNone(sub.confirmed_at)
         self.assertIsNotNone(sub.dispatch_deadline)
+        # Approx dims persisted on the sub-order
+        self.assertEqual(sub.actual_weight_grams, self.APPROX_DIMS["actual_weight_grams"])
+        self.assertEqual(sub.actual_length_cm, self.APPROX_DIMS["actual_length_cm"])
+
+        # Booking task ran (Celery eager) — AWB written and shipment created
+        self.assertEqual(sub.awb_number, FAKE_SHIPROCKET_SHIPMENT["data"]["awb_number"])
 
         # Buyer notified
         self.assertTrue(
             AppNotification.objects.filter(user=self.fx["buyer"]).exists()
         )
 
+    def test_08b_confirm_rejects_missing_dims(self):
+        """Confirm without weight/dimensions must return 400 — no silent default booking."""
+        sub = self._placed_sub_order()
+        self.client.force_authenticate(user=self.fx["seller"])
+        # No body at all
+        resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/confirm/")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.data)
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, "placed")
+
+        # Only weight, no L/B/H
+        resp2 = self.client.post(
+            f"/api/orders/seller/sub-orders/{sub.id}/confirm/",
+            {"actual_weight_grams": 500}, format="json",
+        )
+        self.assertEqual(resp2.status_code, status.HTTP_400_BAD_REQUEST, resp2.data)
+
     def test_09_upload_packaging_photo(self):
-        """POST upload-photo/ → URL appended to packaging_photos, status → packing."""
+        """POST upload-photo/ → URL appended to packaging_photos. Status transitions
+        confirmed→packing if still in legacy state; booked stays booked because the
+        courier is already assigned and photos are just a pre-pickup gate now."""
         sub = self._placed_sub_order()
         sub.status = "confirmed"
         sub.confirmed_at = timezone.now()
@@ -466,15 +525,40 @@ class OrderLifecycleTest(TestCase):
     # PHASE 4 — SHIPMENT CREATION (Shiprocket)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _packing_sub_order(self):
-        """Return a sub-order ready to ship (packing, photo uploaded, dimensions set)."""
+    def _booked_sub_order(self):
+        """
+        Return a sub-order in the new 'booked' state — courier assigned, label
+        generated, ready for the seller to upload the packaging photo and click
+        Ship Now. Skips the actual booking task and directly stamps the AWB +
+        shipment row so individual tests don't all pay for the Shiprocket
+        mock-roundtrip when they only want to exercise the pickup-scheduling
+        path.
+        """
         sub = self._placed_sub_order()
-        sub.status = "packing"
-        sub.packaging_photos = ["https://storage.googleapis.com/junglyst/pack1.jpg"]
+        sub.status = "booked"
+        sub.confirmed_at = timezone.now()
         sub.actual_weight_grams = 620
         sub.actual_length_cm = 22
         sub.actual_breadth_cm = 16
         sub.actual_height_cm = 28
+        sub.awb_number = FAKE_SHIPROCKET_SHIPMENT["data"]["awb_number"]
+        sub.courier_name = FAKE_SHIPROCKET_SHIPMENT["data"]["courier_name"]
+        sub.save()
+        Shipment.objects.create(
+            order=sub.order,
+            seller=self.fx["seller"],
+            awb_number=sub.awb_number,
+            courier_name=sub.courier_name,
+            nimbuspost_id=FAKE_SHIPROCKET_SHIPMENT["data"]["shipment_id"],
+            label_url=FAKE_SHIPROCKET_SHIPMENT["data"]["label"],
+            status="booked",
+        )
+        return sub
+
+    def _ready_to_ship_sub_order(self):
+        """Booked sub-order + packaging photo uploaded → eligible for Ship Now."""
+        sub = self._booked_sub_order()
+        sub.packaging_photos = ["https://storage.googleapis.com/junglyst/pack1.jpg"]
         sub.save()
         return sub
 
@@ -482,31 +566,43 @@ class OrderLifecycleTest(TestCase):
            return_value=FAKE_SHIPROCKET_SERVICEABILITY)
     @patch("shipping.services.ShiprocketService.create_shipment",
            return_value=FAKE_SHIPROCKET_SHIPMENT)
-    def test_11_ship_suborder_creates_shipment_record(self, mock_ship, mock_svc):
-        """POST ship/ → Shipment record created with AWB, label URL."""
-        sub = self._packing_sub_order()
+    def test_11_confirm_creates_shipment_with_label(self, mock_ship, mock_svc):
+        """
+        Under the new flow the Shipment record + AWB + label are created at
+        Confirm time, not Ship Now. POST confirm/ with approx dims must trigger
+        ShiprocketService.create_shipment and persist a Shipment with label_url.
+        """
+        sub = self._placed_sub_order()
 
         self.client.force_authenticate(user=self.fx["seller"])
-        resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/ship/")
+        resp = self.client.post(
+            f"/api/orders/seller/sub-orders/{sub.id}/confirm/",
+            self.APPROX_DIMS, format="json",
+        )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
 
-        # Shipment DB record created
         shipment = Shipment.objects.get(order=sub.order, seller=self.fx["seller"])
         self.assertEqual(shipment.awb_number, FAKE_SHIPROCKET_SHIPMENT["data"]["awb_number"])
         self.assertEqual(shipment.courier_name, FAKE_SHIPROCKET_SHIPMENT["data"]["courier_name"])
         self.assertIsNotNone(shipment.label_url)
+        # Shiprocket was called with request_auto_pickup="No" so pickup is deferred
+        call_payload = mock_ship.call_args[0][0]
+        self.assertEqual(call_payload.get("request_auto_pickup"), "No")
 
     @patch("shipping.services.ShiprocketService.check_serviceability",
            return_value=FAKE_SHIPROCKET_SERVICEABILITY)
     @patch("shipping.services.ShiprocketService.create_shipment",
            return_value=FAKE_SHIPROCKET_SHIPMENT)
     def test_12_awb_written_to_suborder_and_master_order(self, mock_ship, mock_svc):
-        """AWB number must propagate from Shipment → SubOrder → Order."""
-        sub = self._packing_sub_order()
+        """AWB number must propagate from Shipment → SubOrder → Order at Confirm."""
+        sub = self._placed_sub_order()
         order = sub.order
 
         self.client.force_authenticate(user=self.fx["seller"])
-        self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/ship/")
+        self.client.post(
+            f"/api/orders/seller/sub-orders/{sub.id}/confirm/",
+            self.APPROX_DIMS, format="json",
+        )
 
         sub.refresh_from_db()
         order.refresh_from_db()
@@ -520,22 +616,26 @@ class OrderLifecycleTest(TestCase):
            return_value=FAKE_SHIPROCKET_SERVICEABILITY)
     @patch("shipping.services.ShiprocketService.create_shipment",
            return_value=FAKE_SHIPROCKET_SHIPMENT)
-    def test_13_buyer_notified_on_shipment(self, mock_ship, mock_svc):
-        """Buyer must receive 'Your order has been shipped' notification."""
-        sub = self._packing_sub_order()
+    def test_13_buyer_notified_at_booking_and_pickup(self, mock_ship, mock_svc):
+        """Buyer gets an in-app notification when the courier is booked at Confirm."""
+        sub = self._placed_sub_order()
 
         AppNotification.objects.filter(user=self.fx["buyer"]).delete()  # clean slate
 
         self.client.force_authenticate(user=self.fx["seller"])
-        self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/ship/")
+        self.client.post(
+            f"/api/orders/seller/sub-orders/{sub.id}/confirm/",
+            self.APPROX_DIMS, format="json",
+        )
 
-        notif = AppNotification.objects.filter(user=self.fx["buyer"]).last()
-        self.assertIsNotNone(notif, "No notification sent to buyer after shipment")
-        # Message says "on its way" with AWB — exact wording from create_shipment_task
+        notifs = AppNotification.objects.filter(user=self.fx["buyer"])
+        self.assertTrue(notifs.exists(), "No notification sent to buyer at Confirm")
+        # At least one mentions the AWB — either the "confirmed" or the "shipped" message
         awb = FAKE_SHIPROCKET_SHIPMENT["data"]["awb_number"].lower()
+        joined = " ".join(n.message.lower() for n in notifs)
         self.assertTrue(
-            awb in notif.message.lower() or "way" in notif.message.lower(),
-            f"Unexpected notification message: {notif.message}",
+            awb in joined or "confirmed" in joined or "way" in joined,
+            f"Unexpected notification messages: {[n.message for n in notifs]}",
         )
 
     @patch("shipping.services.ShiprocketService.check_serviceability",
@@ -543,30 +643,105 @@ class OrderLifecycleTest(TestCase):
     @patch("shipping.services.ShiprocketService.create_shipment",
            return_value=FAKE_SHIPROCKET_SHIPMENT)
     def test_14_suborder_awb_written_after_booking(self, mock_ship, mock_svc):
-        """AWB must be written to sub-order immediately after shipment task.
-        Status stays 'packing' — it moves to 'shipped' via webhook/tracking sync."""
-        sub = self._packing_sub_order()
+        """AWB stamped on sub-order at Confirm; status moves placed → booked."""
+        sub = self._placed_sub_order()
 
         self.client.force_authenticate(user=self.fx["seller"])
-        self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/ship/")
+        self.client.post(
+            f"/api/orders/seller/sub-orders/{sub.id}/confirm/",
+            self.APPROX_DIMS, format="json",
+        )
 
         sub.refresh_from_db()
         self.assertEqual(
             sub.awb_number,
             FAKE_SHIPROCKET_SHIPMENT["data"]["awb_number"],
         )
-        # Status stays packing — webhook moves it to shipped
-        self.assertEqual(sub.status, "packing")
+        self.assertEqual(sub.status, "booked")
+
+    # ── Ship Now (schedule pickup) path ────────────────────────────────────
+
+    def test_14b_ship_now_schedules_pickup_when_already_booked(self):
+        """
+        Standard new-flow Ship Now path: AWB already exists (set at Confirm),
+        seller has uploaded photo + actuals. POST ship/ should call
+        schedule_pickup_task (which calls ShiprocketService.request_pickup)
+        rather than re-booking the shipment.
+        """
+        sub = self._ready_to_ship_sub_order()
+
+        self.client.force_authenticate(user=self.fx["seller"])
+        with patch(
+            "shipping.services.ShiprocketService.request_pickup",
+            return_value={"status": True, "data": {}},
+        ) as mock_pickup, patch(
+            "shipping.services.ShiprocketService.create_shipment"
+        ) as mock_create:
+            resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/ship/")
+            self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+            mock_pickup.assert_called_once()
+            mock_create.assert_not_called()  # AWB already exists, do not re-book
+
+    def test_14c_ship_now_blocked_without_photo(self):
+        """Booked status alone isn't enough — photo + actuals are still required."""
+        sub = self._booked_sub_order()  # no packaging_photos
+        self.client.force_authenticate(user=self.fx["seller"])
+        resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/ship/")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.data)
+
+    # ── Refresh label endpoint ─────────────────────────────────────────────
+
+    def test_14d_refresh_label_returns_url_when_available(self):
+        """POST /refresh-label/ → re-fetches label by AWB and persists it."""
+        sub = self._booked_sub_order()
+        # Wipe label_url to simulate Shiprocket initially returning empty
+        Shipment.objects.filter(order=sub.order, seller=self.fx["seller"]).update(label_url=None)
+
+        self.client.force_authenticate(user=self.fx["seller"])
+        with patch(
+            "shipping.services.ShiprocketService.generate_label",
+            return_value={"status": True, "data": "https://cdn.shiprocket.in/label/late.pdf"},
+        ) as mock_label:
+            resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/refresh-label/")
+            self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+            mock_label.assert_called_once_with([sub.awb_number])
+
+        shipment = Shipment.objects.get(order=sub.order, seller=self.fx["seller"])
+        self.assertEqual(shipment.label_url, "https://cdn.shiprocket.in/label/late.pdf")
+
+    def test_14e_refresh_label_returns_202_when_not_ready(self):
+        """When Shiprocket has not generated the PDF yet, the endpoint signals 'come back later'."""
+        sub = self._booked_sub_order()
+        Shipment.objects.filter(order=sub.order, seller=self.fx["seller"]).update(label_url=None)
+
+        self.client.force_authenticate(user=self.fx["seller"])
+        with patch(
+            "shipping.services.ShiprocketService.generate_label",
+            return_value={"status": False, "data": ""},
+        ):
+            resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/refresh-label/")
+            self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED, resp.data)
+
+    def test_14f_refresh_label_rejects_when_no_awb(self):
+        """Calling refresh-label before booking finishes is a bad request — no AWB to look up."""
+        sub = self._placed_sub_order()
+        self.client.force_authenticate(user=self.fx["seller"])
+        resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/refresh-label/")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.data)
 
     # ═══════════════════════════════════════════════════════════════════════
     # EDGE CASES
     # ═══════════════════════════════════════════════════════════════════════
 
     def test_15_ship_blocked_without_photo(self):
-        """Shipment must be rejected if no packaging photo uploaded."""
+        """Legacy `packing` orders (confirmed before the new flow shipped) must
+        still be blocked from Ship Now if there is no packaging photo."""
         sub = self._placed_sub_order()
         sub.status = "packing"
         sub.actual_weight_grams = 500
+        sub.actual_length_cm = 20
+        sub.actual_breadth_cm = 15
+        sub.actual_height_cm = 25
         # packaging_photos intentionally empty
         sub.save()
 
@@ -575,7 +750,8 @@ class OrderLifecycleTest(TestCase):
         self.assertIn(resp.status_code, [400, 422], resp.data)
 
     def test_16_wrong_seller_cannot_confirm_other_sellers_suborder(self):
-        """A different seller must not be able to confirm another seller's sub-order."""
+        """A different seller must not be able to confirm another seller's sub-order.
+        We pass valid dims so any rejection is purely on the ownership check."""
         sub = self._placed_sub_order()
 
         other_seller = User.objects.create_user(
@@ -585,7 +761,10 @@ class OrderLifecycleTest(TestCase):
             role="grower",
         )
         self.client.force_authenticate(user=other_seller)
-        resp = self.client.post(f"/api/orders/seller/sub-orders/{sub.id}/confirm/")
+        resp = self.client.post(
+            f"/api/orders/seller/sub-orders/{sub.id}/confirm/",
+            self.APPROX_DIMS, format="json",
+        )
         self.assertIn(resp.status_code, [403, 404], resp.data)
 
     @patch("orders.views.create_razorpay_order", return_value=FAKE_RAZORPAY_ORDER)

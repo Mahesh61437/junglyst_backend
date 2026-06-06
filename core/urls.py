@@ -10,7 +10,8 @@ from .views import (
     ProductCopyView, ProductBulkActionView, BulkStockUpdateView, SyncCartView, WishlistView, HomeDataView,
     ForgotPasswordView, ResetPasswordView,
     BugReportListCreateView, BugReportDetailView,
-    PublicConfigurationView, ConfigurationAdminView, ConfigurationAdminDetailView
+    PublicConfigurationView, ConfigurationAdminView, ConfigurationAdminDetailView,
+    FeatureFlagsView,
 )
 
 urlpatterns = [
@@ -57,6 +58,9 @@ urlpatterns = [
     # Bug Reports
     path('bug-reports/', BugReportListCreateView.as_view(), name='bug_report_list'),
     path('bug-reports/<uuid:pk>/', BugReportDetailView.as_view(), name='bug_report_detail'),
+
+    # Feature flags — public read of off-switches for half-built modules
+    path('features/', FeatureFlagsView.as_view(), name='feature_flags'),
 
     # Configuration — generic key/value settings
     path('config/public/<str:name>/', PublicConfigurationView.as_view(), name='config_public'),
