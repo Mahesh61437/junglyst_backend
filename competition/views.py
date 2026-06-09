@@ -1,14 +1,16 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime, parse_date
+from django.db.models import Count, Q
+from django.db import IntegrityError
 from datetime import datetime, date, time, timedelta, timezone as dt_timezone
 from io import BytesIO
 from PIL import Image, ImageOps
-from .models import CompetitionEntry
-from .serializers import CompetitionEntrySerializer
+from .models import CompetitionEntry, EntryVote
+from .serializers import CompetitionEntrySerializer, PublicEntrySerializer
 from core.storage import upload_to_firebase
 from core.config_utils import get_config
 
@@ -83,6 +85,28 @@ def _resolve_announcement_date_iso(settings_data):
     return d.isoformat()
 
 
+def _resolve_announcement_datetime(settings_data):
+    raw = (settings_data or {}).get('result_announcement_date')
+    d = _coerce_date(raw)
+    if d is None:
+        return None
+    return datetime.combine(d, time.min, tzinfo=IST)
+
+
+def _current_phase(now, launch_date, announcement_dt):
+    """submission → voting → results.
+
+    - submission: now < launch_date
+    - voting: launch_date <= now < announcement_dt (or no announcement_dt set)
+    - results: announcement_dt is set and now >= announcement_dt
+    """
+    if now < launch_date:
+        return 'submission'
+    if announcement_dt and now >= announcement_dt:
+        return 'results'
+    return 'voting'
+
+
 def _is_allowed_file(file_obj):
     """Check by both MIME type and extension — phones often send wrong MIME for HEIC."""
     ext = '.' + file_obj.name.rsplit('.', 1)[-1].lower() if '.' in file_obj.name else ''
@@ -153,23 +177,31 @@ class CompetitionStatusView(APIView):
         settings_data = get_config('competition_settings') or {}
         launch_date = _resolve_launch_date(settings_data)
         result_announcement_date = _resolve_announcement_date_iso(settings_data)
+        announcement_dt = _resolve_announcement_datetime(settings_data)
+        phase = _current_phase(now, launch_date, announcement_dt)
 
         total_entries = CompetitionEntry.objects.count()
         slots_remaining = max(0, MAX_ENTRIES - total_entries)
-        is_open = now < launch_date and slots_remaining > 0
+        is_open = phase == 'submission' and slots_remaining > 0
         seconds_until_launch = max(0, int((launch_date - now).total_seconds()))
+        seconds_until_results = (
+            max(0, int((announcement_dt - now).total_seconds())) if announcement_dt else None
+        )
 
-        winner = CompetitionEntry.objects.filter(is_winner=True).first()
+        winners_published = phase == 'results' and CompetitionEntry.objects.filter(
+            prize_tier__in=[c[0] for c in CompetitionEntry.PRIZE_CHOICES if c[0]],
+        ).exists()
 
         return Response({
             'launch_date': launch_date.isoformat(),
             'is_open': is_open,
+            'phase': phase,
             'total_entries': total_entries,
             'slots_remaining': slots_remaining,
             'max_entries': MAX_ENTRIES,
             'seconds_until_launch': seconds_until_launch,
-            'winner_announced': winner is not None,
-            'winner': {'name': winner.name} if winner else None,
+            'seconds_until_results': seconds_until_results,
+            'winners_published': winners_published,
             'prize_amount': 1000,
             'prize_currency': 'INR',
             'result_announcement_date': result_announcement_date,
@@ -363,3 +395,141 @@ class CompetitionImageUploadView(APIView):
             'images_uploaded': images_uploaded,
             'images_remaining': MAX_IMAGES - images_uploaded,
         }, status=status.HTTP_200_OK)
+
+
+def _voted_ids_for(request, entry_ids):
+    user = getattr(request, 'user', None)
+    if not user or not user.is_authenticated:
+        return set()
+    return set(
+        EntryVote.objects.filter(user=user, entry_id__in=entry_ids).values_list('entry_id', flat=True)
+    )
+
+
+class CompetitionEntryListView(APIView):
+    """
+    GET /api/competition/entries/
+    Public list of all submitted entries with at least one image. No PII.
+    Annotated with vote_count and (for logged-in users) has_voted.
+
+    Query params:
+      - sort: 'top' (votes desc, default) | 'new' (submitted_at desc) | 'old'
+      - limit: int (default 200, max 500)
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        sort = request.query_params.get('sort', 'top')
+        try:
+            limit = min(int(request.query_params.get('limit', 200)), 500)
+        except (ValueError, TypeError):
+            limit = 200
+
+        qs = (
+            CompetitionEntry.objects
+            .filter(is_disqualified=False)
+            .exclude(image_urls=[])
+            .annotate(vote_count=Count('votes'))
+        )
+
+        if sort == 'new':
+            qs = qs.order_by('-submitted_at')
+        elif sort == 'old':
+            qs = qs.order_by('submitted_at')
+        else:  # top
+            qs = qs.order_by('-vote_count', '-submitted_at')
+
+        qs = qs[:limit]
+        entry_ids = [e.id for e in qs]
+        voted_ids = _voted_ids_for(request, entry_ids)
+
+        data = PublicEntrySerializer(qs, many=True, context={'voted_entry_ids': voted_ids}).data
+        return Response({'count': len(data), 'sort': sort, 'results': data})
+
+
+class EntryVoteView(APIView):
+    """
+    POST /api/competition/entries/<entry_id>/vote/  → toggle vote (idempotent).
+    Body: {} — no payload required. Vote attaches to request.user.
+
+    Voting is only allowed during the 'voting' phase.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, entry_id):
+        settings_data = get_config('competition_settings') or {}
+        now = timezone.now()
+        launch_date = _resolve_launch_date(settings_data)
+        announcement_dt = _resolve_announcement_datetime(settings_data)
+        phase = _current_phase(now, launch_date, announcement_dt)
+
+        if phase != 'voting':
+            msg = (
+                'Voting opens after submissions close.' if phase == 'submission'
+                else 'Voting has ended — results are live.'
+            )
+            return Response({'error': msg, 'phase': phase}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            entry = CompetitionEntry.objects.get(id=entry_id, is_disqualified=False)
+        except (CompetitionEntry.DoesNotExist, ValueError):
+            return Response({'error': 'Entry not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        existing = EntryVote.objects.filter(entry=entry, user=request.user).first()
+        if existing:
+            existing.delete()
+            voted = False
+        else:
+            try:
+                EntryVote.objects.create(entry=entry, user=request.user)
+                voted = True
+            except IntegrityError:
+                voted = True  # race — vote already exists
+
+        count = EntryVote.objects.filter(entry=entry).count()
+        return Response({'voted': voted, 'vote_count': count, 'entry_id': str(entry.id)})
+
+
+class CompetitionWinnersView(APIView):
+    """
+    GET /api/competition/winners/
+    Returns entries that have been assigned a prize_tier, ordered by tier.
+    Only meaningful in the 'results' phase but always returns whatever is set,
+    so admins can preview.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        settings_data = get_config('competition_settings') or {}
+        now = timezone.now()
+        launch_date = _resolve_launch_date(settings_data)
+        announcement_dt = _resolve_announcement_datetime(settings_data)
+        phase = _current_phase(now, launch_date, announcement_dt)
+
+        tier_order = [
+            CompetitionEntry.PRIZE_FIRST,
+            CompetitionEntry.PRIZE_SECOND,
+            CompetitionEntry.PRIZE_THIRD,
+            CompetitionEntry.PRIZE_CONSOLATION,
+            CompetitionEntry.PRIZE_MYSTERY,
+        ]
+
+        winners_qs = (
+            CompetitionEntry.objects
+            .filter(prize_tier__in=tier_order)
+            .annotate(vote_count=Count('votes'))
+        )
+        winners_by_tier = {w.prize_tier: w for w in winners_qs}
+
+        # Ordered list following tier_order; missing tiers omitted.
+        ordered = [winners_by_tier[t] for t in tier_order if t in winners_by_tier]
+        entry_ids = [w.id for w in ordered]
+        voted_ids = _voted_ids_for(request, entry_ids)
+
+        data = PublicEntrySerializer(ordered, many=True, context={'voted_entry_ids': voted_ids}).data
+        return Response({
+            'phase': phase,
+            'published': phase == 'results',
+            'result_announcement_date': _resolve_announcement_date_iso(settings_data),
+            'winners': data,
+        })
