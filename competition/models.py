@@ -57,3 +57,19 @@ class EntryVote(models.Model):
 
     def __str__(self):
         return f"{self.user_id} → {self.entry_id}"
+
+
+# ── Cache invalidation ──────────────────────────────────────────────────────
+# Any change to a CompetitionEntry (winner assigned, disqualified, image edit)
+# bumps the cache version so the public entries/winners caches refresh at once.
+# Votes are EntryVote rows (a different sender) and deliberately do NOT bump —
+# vote counts are allowed to lag by the cache TTL so the gallery stays fast.
+from django.db.models.signals import post_save, post_delete  # noqa: E402
+from django.dispatch import receiver  # noqa: E402
+
+
+@receiver(post_save, sender=CompetitionEntry)
+@receiver(post_delete, sender=CompetitionEntry)
+def _bump_competition_cache(sender, **kwargs):
+    from .cache import bump_cache_version
+    bump_cache_version()

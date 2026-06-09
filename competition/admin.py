@@ -312,6 +312,9 @@ class CompetitionEntryAdmin(admin.ModelAdmin):
 
     def clear_prize(self, request, queryset):
         n = queryset.update(prize_tier='', is_winner=False)
+        # .update() bypasses signals, so refresh the public caches explicitly.
+        from .cache import bump_cache_version
+        bump_cache_version()
         self.message_user(request, f'Cleared prize from {n} entries.', level=messages.SUCCESS)
     clear_prize.short_description = 'Clear prize from selected entries'
 
