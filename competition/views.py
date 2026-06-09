@@ -9,8 +9,10 @@ from django.db import IntegrityError
 from datetime import datetime, date, time, timedelta, timezone as dt_timezone
 from io import BytesIO
 from PIL import Image, ImageOps
+from django.core.cache import cache
 from .models import CompetitionEntry, EntryVote
 from .serializers import CompetitionEntrySerializer, PublicEntrySerializer
+from . import cache as compcache
 from core.storage import upload_to_firebase
 from core.config_utils import get_config
 
@@ -173,6 +175,13 @@ def _process_image(file_obj):
 
 class CompetitionStatusView(APIView):
     def get(self, request):
+        # Status is identical for every visitor (no per-user data), so a short
+        # global cache absorbs the per-page-load traffic. Countdowns are derived
+        # client-side from the date fields, so a small lag here is invisible.
+        cached = cache.get(compcache.STATUS_KEY)
+        if cached is not None:
+            return Response(cached)
+
         now = timezone.now()
         settings_data = get_config('competition_settings') or {}
         launch_date = _resolve_launch_date(settings_data)
@@ -192,7 +201,7 @@ class CompetitionStatusView(APIView):
             prize_tier__in=[c[0] for c in CompetitionEntry.PRIZE_CHOICES if c[0]],
         ).exists()
 
-        return Response({
+        payload = {
             'launch_date': launch_date.isoformat(),
             'is_open': is_open,
             'phase': phase,
@@ -211,7 +220,9 @@ class CompetitionStatusView(APIView):
                 'max_dimension_px': MAX_DIMENSION,
                 'allowed_types': ['JPEG', 'PNG', 'WebP', 'HEIC'],
             },
-        })
+        }
+        cache.set(compcache.STATUS_KEY, payload, compcache.STATUS_TTL)
+        return Response(payload)
 
 
 class CompetitionEntryView(APIView):
@@ -406,6 +417,11 @@ def _voted_ids_for(request, entry_ids):
     )
 
 
+def _voted_str_ids_for(request, entry_ids):
+    """Same as _voted_ids_for but returns string UUIDs, to match serialized ids."""
+    return {str(x) for x in _voted_ids_for(request, entry_ids)}
+
+
 class CompetitionEntryListView(APIView):
     """
     GET /api/competition/entries/
@@ -425,26 +441,33 @@ class CompetitionEntryListView(APIView):
         except (ValueError, TypeError):
             limit = 200
 
-        qs = (
-            CompetitionEntry.objects
-            .filter(is_disqualified=False)
-            .exclude(image_urls=[])
-            .annotate(vote_count=Count('votes'))
-        )
+        # Shared base list (entries + vote_count, no per-user data) is cached;
+        # the per-user has_voted flag is overlaid below on every request.
+        key = compcache.entries_key(sort, limit)
+        base = cache.get(key)
+        if base is None:
+            qs = (
+                CompetitionEntry.objects
+                .filter(is_disqualified=False)
+                .exclude(image_urls=[])
+                .annotate(vote_count=Count('votes'))
+            )
+            if sort == 'new':
+                qs = qs.order_by('-submitted_at')
+            elif sort == 'old':
+                qs = qs.order_by('submitted_at')
+            else:  # top
+                qs = qs.order_by('-vote_count', '-submitted_at')
 
-        if sort == 'new':
-            qs = qs.order_by('-submitted_at')
-        elif sort == 'old':
-            qs = qs.order_by('submitted_at')
-        else:  # top
-            qs = qs.order_by('-vote_count', '-submitted_at')
+            serialized = PublicEntrySerializer(
+                list(qs[:limit]), many=True, context={'voted_entry_ids': set()}
+            ).data
+            base = [dict(d) for d in serialized]  # plain dicts for caching
+            cache.set(key, base, compcache.ENTRIES_TTL)
 
-        qs = qs[:limit]
-        entry_ids = [e.id for e in qs]
-        voted_ids = _voted_ids_for(request, entry_ids)
-
-        data = PublicEntrySerializer(qs, many=True, context={'voted_entry_ids': voted_ids}).data
-        return Response({'count': len(data), 'sort': sort, 'results': data})
+        voted_ids = _voted_str_ids_for(request, [d['id'] for d in base])
+        results = [{**d, 'has_voted': d['id'] in voted_ids} for d in base]
+        return Response({'count': len(results), 'sort': sort, 'results': results})
 
 
 class EntryVoteView(APIView):
@@ -506,27 +529,34 @@ class CompetitionWinnersView(APIView):
         announcement_dt = _resolve_announcement_datetime(settings_data)
         phase = _current_phase(now, launch_date, announcement_dt)
 
-        tier_order = [
-            CompetitionEntry.PRIZE_FIRST,
-            CompetitionEntry.PRIZE_SECOND,
-            CompetitionEntry.PRIZE_THIRD,
-            CompetitionEntry.PRIZE_CONSOLATION,
-            CompetitionEntry.PRIZE_MYSTERY,
-        ]
+        # Cached base winners list (no per-user data). Invalidated promptly when
+        # an admin changes a prize_tier (CompetitionEntry save bumps the version).
+        key = compcache.winners_key()
+        base = cache.get(key)
+        if base is None:
+            tier_order = [
+                CompetitionEntry.PRIZE_FIRST,
+                CompetitionEntry.PRIZE_SECOND,
+                CompetitionEntry.PRIZE_THIRD,
+                CompetitionEntry.PRIZE_CONSOLATION,
+                CompetitionEntry.PRIZE_MYSTERY,
+            ]
+            winners_qs = (
+                CompetitionEntry.objects
+                .filter(prize_tier__in=tier_order)
+                .annotate(vote_count=Count('votes'))
+            )
+            winners_by_tier = {w.prize_tier: w for w in winners_qs}
+            # Ordered list following tier_order; missing tiers omitted.
+            ordered = [winners_by_tier[t] for t in tier_order if t in winners_by_tier]
+            serialized = PublicEntrySerializer(
+                ordered, many=True, context={'voted_entry_ids': set()}
+            ).data
+            base = [dict(d) for d in serialized]
+            cache.set(key, base, compcache.WINNERS_TTL)
 
-        winners_qs = (
-            CompetitionEntry.objects
-            .filter(prize_tier__in=tier_order)
-            .annotate(vote_count=Count('votes'))
-        )
-        winners_by_tier = {w.prize_tier: w for w in winners_qs}
-
-        # Ordered list following tier_order; missing tiers omitted.
-        ordered = [winners_by_tier[t] for t in tier_order if t in winners_by_tier]
-        entry_ids = [w.id for w in ordered]
-        voted_ids = _voted_ids_for(request, entry_ids)
-
-        data = PublicEntrySerializer(ordered, many=True, context={'voted_entry_ids': voted_ids}).data
+        voted_ids = _voted_str_ids_for(request, [d['id'] for d in base])
+        data = [{**d, 'has_voted': d['id'] in voted_ids} for d in base]
         return Response({
             'phase': phase,
             'published': phase == 'results',
