@@ -470,6 +470,34 @@ class CompetitionEntryListView(APIView):
         return Response({'count': len(results), 'sort': sort, 'results': results})
 
 
+class CompetitionEntryDetailView(APIView):
+    """
+    GET /api/competition/entries/<entry_id>/
+    Single public entry — powers the standalone entry page (its own URL, so it
+    can be opened in a new tab / deep-linked). No PII; vote_count + has_voted.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, entry_id):
+        key = f'competition:entry:{compcache.cache_version()}:{entry_id}'
+        base = cache.get(key)
+        if base is None:
+            try:
+                entry = (
+                    CompetitionEntry.objects
+                    .filter(is_disqualified=False)
+                    .annotate(vote_count=Count('votes'))
+                    .get(id=entry_id)
+                )
+            except (CompetitionEntry.DoesNotExist, ValueError):
+                return Response({'error': 'Entry not found.'}, status=status.HTTP_404_NOT_FOUND)
+            base = dict(PublicEntrySerializer(entry, context={'voted_entry_ids': set()}).data)
+            cache.set(key, base, compcache.ENTRIES_TTL)
+
+        voted_ids = _voted_str_ids_for(request, [base['id']])
+        return Response({**base, 'has_voted': base['id'] in voted_ids})
+
+
 class EntryVoteView(APIView):
     """
     POST /api/competition/entries/<entry_id>/vote/  → toggle vote (idempotent).
