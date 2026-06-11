@@ -13,7 +13,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 import uuid
 from decimal import Decimal
-from cart.models import Cart
+from cart.models import Cart, CartItem
 from core.models import ProductVariant
 from shipping.models import ShippingAddress
 from shipping.serializers import ShippingAddressSerializer
@@ -185,6 +185,17 @@ class CheckoutView(generics.GenericAPIView):
                 return Response({"error": delivery_msg or "Sorry, we don't deliver to your pincode yet."}, status=400)
 
         # Stock check + group items by seller
+        # When using a saved backend cart (cart_id), stale items (e.g. removed in UI
+        # but not synced) may linger. Auto-remove them here so the user can still
+        # check out with the items they actually want.
+        # For inline item lists (guest / fallback), fail fast as normal.
+        if cart_id:
+            stale = [item for item in cart_items if item.quantity > item.variant.stock]
+            for item in stale:
+                CartItem.objects.filter(id=item.id).delete()
+            cart_items = [item for item in cart_items if item not in stale]
+            if not cart_items:
+                return Response({"error": "All items in your cart are out of stock. Please add available products."}, status=400)
 
         seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
         for item in cart_items:
