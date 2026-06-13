@@ -4,7 +4,7 @@ from rest_framework.decorators import action
 from django.db.models import Prefetch
 from core.models import ProductVariant
 from .models import Cart, CartItem
-from .serializers import CartSerializer
+from .serializers import CartSerializer, CheckoutNudgeProductSerializer
 
 
 def _cart_with_prefetch(cart):
@@ -202,3 +202,130 @@ class CartViewSet(viewsets.ModelViewSet):
                 break
 
         return Response(result)
+
+    @action(detail=False, methods=['get'], url_path='checkout-nudge')
+    def checkout_nudge(self, request):
+        """
+        GET /api/cart/checkout-nudge/
+        Returns up to 8 complementary products grouped by source category.
+
+        Priority rules:
+        - One pass per complement rule (ordered by rule priority), 2 slots each.
+        - Within each rule: same-rule-seller first → other cart sellers → rest.
+        - If 3+ distinct sellers are already in the cart, only show products
+          from those same sellers (avoid adding a 4th seller).
+        - No duplicate products across rules.
+        """
+        from core.models import Product, CategoryComplement
+        from django.db.models import BooleanField, Case, When, Value
+
+        # Q1: cart items with categories
+        cart = self.get_cart(request)
+        items = list(
+            cart.items.select_related('product')
+            .prefetch_related('product__categories')
+            .all()
+        )
+        if not items:
+            return Response({'recommendations': []})
+
+        cart_product_ids = {item.product_id for item in items}
+        cart_seller_ids  = {item.product.seller_id for item in items}
+
+        # source_category_id → set of seller_ids with that category in cart
+        source_cat_to_sellers: dict = {}
+        for item in items:
+            for cat in item.product.categories.all():
+                source_cat_to_sellers.setdefault(cat.id, set()).add(item.product.seller_id)
+
+        # Q2: complement rules in priority order, with source category name
+        rules = list(
+            CategoryComplement.objects.filter(
+                source_category_id__in=source_cat_to_sellers.keys()
+            ).select_related('source_category')
+            .prefetch_related('target_categories')
+            .order_by('priority')
+        )
+        if not rules:
+            return Response({'recommendations': []})
+
+        # If 3+ sellers in cart → only recommend products from those sellers
+        restrict_to_cart_sellers = len(cart_seller_ids) >= 3
+
+        # Collect all target category IDs across all rules and build
+        # a map: target_category_id → list of rule indices that want it.
+        # This lets us fetch all candidates in ONE query.
+        SLOTS_PER_RULE = 2
+        MAX_TOTAL = 8
+
+        rule_target_map = {}  # rule_index → set of target_cat_ids
+        all_target_cat_ids = set()
+        for i, rule in enumerate(rules):
+            tids = {tc.id for tc in rule.target_categories.all()}  # from prefetch cache
+            rule_target_map[i] = tids
+            all_target_cat_ids |= tids
+
+        if not all_target_cat_ids:
+            return Response({'recommendations': []})
+
+        # Q3: single query for all candidates across all rules
+        qs = Product.objects.filter(
+            is_active=True, is_draft=False,
+            categories__id__in=all_target_cat_ids,
+            variants__stock__gt=0, variants__is_active=True,
+        ).exclude(id__in=cart_product_ids)
+
+        if restrict_to_cart_sellers:
+            qs = qs.filter(seller_id__in=cart_seller_ids)
+
+        candidates = list(
+            qs.annotate(
+                from_cart_seller=Case(
+                    When(seller_id__in=cart_seller_ids, then=Value(True)),
+                    default=Value(False),
+                    output_field=BooleanField(),
+                ),
+            )
+            .select_related('seller', 'seller__seller_profile')
+            .prefetch_related('variants', 'images', 'categories')
+            .distinct()
+            .order_by('-from_cart_seller', '-rating')
+        )
+
+        # Build a lookup: product_id → set of category_ids (from prefetch cache)
+        product_cat_ids: dict = {
+            p.id: {c.id for c in p.categories.all()} for p in candidates
+        }
+
+        # Bucket candidates into rules in-Python, 2 slots per rule
+        seen_ids: set = set(cart_product_ids)
+        result = []
+
+        for i, rule in enumerate(rules):
+            if len(result) >= MAX_TOTAL:
+                break
+            target_ids = rule_target_map[i]
+            rule_seller_ids = source_cat_to_sellers.get(rule.source_category_id, set())
+
+            rule_picks = []
+            for p in candidates:
+                if p.id in seen_ids:
+                    continue
+                if not (product_cat_ids[p.id] & target_ids):
+                    continue
+                rule_picks.append(p)
+
+            # Sort: same-rule-seller first, then same-cart-seller, then by rating
+            rule_picks.sort(key=lambda p: (
+                0 if p.seller_id in rule_seller_ids else 1,
+                0 if p.from_cart_seller else 1,
+                -float(p.rating or 0),
+            ))
+
+            for p in rule_picks[:SLOTS_PER_RULE]:
+                seen_ids.add(p.id)
+                p._source_category_name = rule.source_category.name
+                result.append(p)
+
+        data = CheckoutNudgeProductSerializer(result, many=True).data
+        return Response({'recommendations': data})

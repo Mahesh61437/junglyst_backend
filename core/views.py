@@ -6,7 +6,7 @@ from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from django.utils.text import slugify
-from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem, BugReport, Configuration
+from .models import Product, Category, SubCategory, CategoryShippingRate, ProductVariant, ProductImage, ProductReview, WishlistItem, BugReport, Configuration, CategoryComplement
 from cart.models import Cart, CartItem
 from orders.models import Order
 from .serializers import (
@@ -1038,6 +1038,92 @@ class HomeDataView(generics.GenericAPIView):
         }
         cache.set(self._CACHE_KEY, data, self._CACHE_TTL)
         return Response(data)
+
+from django.db.models import Q as _Q
+
+class ProductRecommendationsView(generics.GenericAPIView):
+    """
+    GET /api/core/products/<slug>/recommendations/
+    Returns { similar: [...], complementary: [...] } — both lists use ProductListSerializer.
+    Results are Redis-cached per slug for 30 minutes.
+    """
+    permission_classes = (permissions.AllowAny,)
+    _CACHE_TTL = 60 * 30
+
+    def get(self, request, slug):
+        cache_key = f'rec:{slug}'
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
+        try:
+            product = Product.objects.prefetch_related(
+                'categories', 'sub_categories'
+            ).get(slug=slug, is_active=True, is_draft=False)
+        except Product.DoesNotExist:
+            return Response({'similar': [], 'complementary': []})
+
+        similar = self._similar(product)
+        complementary = self._complementary(product)
+
+        data = {
+            'similar': ProductListSerializer(similar, many=True).data,
+            'complementary': ProductListSerializer(complementary, many=True).data,
+        }
+        cache.set(cache_key, data, self._CACHE_TTL)
+        return Response(data)
+
+    def _similar(self, product):
+        subcats = list(product.sub_categories.values_list('id', flat=True))
+
+        candidates = list(
+            _product_list_queryset().filter(
+                is_active=True, is_draft=False
+            ).exclude(id=product.id).filter(
+                _Q(sub_categories__id__in=subcats) |
+                _Q(care_level=product.care_level) |
+                _Q(light_requirements=product.light_requirements)
+            ).distinct()[:40]
+        )
+
+        subcat_set = set(subcats)
+
+        def score(p):
+            s = float(p.rating) * 0.1
+            p_subcat_ids = {v.id for v in p.sub_categories.all()}
+            if p_subcat_ids & subcat_set:
+                s += 3
+            if p.care_level == product.care_level:
+                s += 2
+            if p.light_requirements == product.light_requirements:
+                s += 2
+            if p.co2_requirement == product.co2_requirement:
+                s += 1
+            return s
+
+        return sorted(candidates, key=score, reverse=True)[:4]
+
+    def _complementary(self, product):
+        cat_ids = list(product.categories.values_list('id', flat=True))
+        if not cat_ids:
+            return []
+
+        rules = CategoryComplement.objects.filter(
+            source_category_id__in=cat_ids
+        ).prefetch_related('target_categories')
+
+        target_ids = {tc.id for rule in rules for tc in rule.target_categories.all()}
+        if not target_ids:
+            return []
+
+        return list(
+            _product_list_queryset().filter(
+                is_active=True, is_draft=False,
+                categories__id__in=target_ids
+            ).exclude(id=product.id).distinct()
+            .order_by('-rating', '-view_count')[:4]
+        )
+
 
 from django.http import HttpResponse
 
