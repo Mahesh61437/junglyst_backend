@@ -50,11 +50,17 @@ class CartViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def add_item(self, request):
         variant_id = request.data.get('variant_id')
-        quantity = int(request.data.get('quantity', 1))
-        
+
         if not variant_id:
             return Response({"error": "variant_id is required"}, status=400)
-            
+
+        try:
+            quantity = int(request.data.get('quantity', 1))
+        except (TypeError, ValueError):
+            return Response({"error": "Quantity must be a whole number."}, status=400)
+        if quantity < 1:
+            return Response({"error": "Quantity must be at least 1."}, status=400)
+
         try:
             variant = ProductVariant.objects.select_related('product').get(id=variant_id)
         except ProductVariant.DoesNotExist:

@@ -183,3 +183,52 @@ class ProductFairnessTests(APITestCase):
         for s_id, count in seller_counts.items():
             self.assertTrue(count <= 2, f"Seller {s_id} has {count} products on homepage (limit is 2)")
 
+
+class SellerStorePaginationTests(APITestCase):
+    """The seller storefront filters products by ?seller_slug= and relies on
+    server-side pagination + search. Regression guard: a seller with more than
+    one page of products must expose every product across pages, not just the
+    first page_size (20)."""
+
+    def setUp(self):
+        from sellers.models import SellerProfile
+        self.products_url = reverse('product_list')
+        self.seller = User.objects.create_user(
+            email="store@example.com", username="store_seller", password="Password123", role="grower"
+        )
+        self.profile = SellerProfile.objects.create(
+            user=self.seller, store_name="Big Botanicals", slug="big-botanicals"
+        )
+        # 25 products → spans two pages (page_size=20). One uniquely-named
+        # product lets us assert search narrows the result set.
+        for i in range(25):
+            name = "Rare Monstera Albo" if i == 0 else f"Pothos {i}"
+            p = Product.objects.create(
+                name=name, description=f"Desc {i}", seller=self.seller,
+                is_active=True, is_draft=False,
+            )
+            ProductVariant.objects.create(product=p, name="Standard", stock=10, price=100.0)
+
+    def test_first_page_capped_at_page_size_with_full_count(self):
+        response = self.client.get(f"{self.products_url}?seller_slug=big-botanicals")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get('count'), 25)
+        self.assertEqual(len(response.data.get('results', [])), 20)
+        self.assertIsNotNone(response.data.get('next'))
+
+    def test_second_page_returns_remaining_products(self):
+        response = self.client.get(f"{self.products_url}?seller_slug=big-botanicals&page=2")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data.get('results', [])), 5)
+        self.assertIsNone(response.data.get('next'))
+
+    def test_search_narrows_seller_store_results(self):
+        response = self.client.get(
+            f"{self.products_url}?seller_slug=big-botanicals&search=Monstera"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get('count'), 1)
+        results = response.data.get('results', [])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['name'], "Rare Monstera Albo")
+
