@@ -24,7 +24,7 @@ from payments.models import Payment
 from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
 from payments.models import PaymentGatewaySettings, PaymentGateway
 from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
-from .models import Order, OrderItem, SubOrder
+from .models import Order, OrderItem, SubOrder, SellerSettlement
 from .serializers import (
     OrderSerializer, OrderListSerializer, OrderDetailSerializer,
     SellerOrderSerializer, SellerSubOrderSerializer,
@@ -1395,6 +1395,16 @@ class UpdateSubOrderStatusView(APIView):
             sub_order.dispatch_deadline = sub_order.confirmed_at + timedelta(hours=48)
         sub_order.save()
 
+        # Auto-create settlement record when order is delivered
+        if new_status == 'delivered':
+            SellerSettlement.objects.get_or_create(
+                sub_order=sub_order,
+                defaults={
+                    'seller': sub_order.seller,
+                    'amount': sub_order.seller_total,
+                },
+            )
+
         awb = sub_order.awb_number or 'pending'
         notifs = []
 
@@ -1418,3 +1428,204 @@ class UpdateSubOrderStatusView(APIView):
             AppNotification.objects.bulk_create(notifs)
 
         return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
+
+
+# ── Seller Settlement Views ────────────────────────────────────────────────────
+
+class SettlementListView(APIView):
+    """
+    GET  /api/orders/settlements/          → pending settlements grouped by seller then week
+    POST /api/orders/settlements/<id>/settle/ → mark one settlement as settled
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request):
+        qs = (
+            SellerSettlement.objects
+            .filter(status='pending')
+            .select_related(
+                'sub_order__order',
+                'seller__seller_profile',
+            )
+            .order_by('seller_id', '-created_at')
+        )
+
+        # Group: seller → week → settlements
+        from collections import defaultdict
+        import datetime
+
+        sellers = {}
+        for s in qs:
+            sid = str(s.seller_id)
+            if sid not in sellers:
+                sp = getattr(s.seller, 'seller_profile', None)
+                sellers[sid] = {
+                    'seller_id': sid,
+                    'seller_name': sp.store_name if sp else s.seller.get_full_name() or s.seller.username,
+                    'seller_email': s.seller.email,
+                    'payout_type': sp.payout_type if sp else '',
+                    'payout_account': sp.payout_account if sp else '',
+                    'ifsc_code': sp.ifsc_code if sp else '',
+                    'account_holder_name': sp.account_holder_name if sp else '',
+                    'weeks': {},
+                    'total_pending': 0,
+                }
+
+            # ISO week label e.g. "2026-W20  (12 May – 18 May)"
+            dt = s.created_at
+            iso_year, iso_week, _ = dt.isocalendar()
+            week_start = dt - datetime.timedelta(days=dt.weekday())
+            week_end = week_start + datetime.timedelta(days=6)
+            week_key = f"{iso_year}-W{iso_week:02d}"
+            week_label = f"{week_start.day} {week_start.strftime('%b')} – {week_end.day} {week_end.strftime('%b %Y')}"
+
+            if week_key not in sellers[sid]['weeks']:
+                sellers[sid]['weeks'][week_key] = {
+                    'week_key': week_key,
+                    'week_label': week_label,
+                    'orders': [],
+                    'week_total': 0,
+                }
+
+            sellers[sid]['weeks'][week_key]['orders'].append({
+                'settlement_id': s.id,
+                'sub_order_id': str(s.sub_order_id),
+                'sub_order_number': s.sub_order.sub_order_number,
+                'order_number': s.sub_order.order.order_number,
+                'amount': str(s.amount),
+                'created_at': s.created_at.isoformat(),
+                'sub_order_status': s.sub_order.status,
+            })
+            sellers[sid]['weeks'][week_key]['week_total'] += float(s.amount)
+            sellers[sid]['total_pending'] += float(s.amount)
+
+        # Flatten weeks dict → sorted list
+        result = []
+        for seller in sellers.values():
+            seller['weeks'] = sorted(seller['weeks'].values(), key=lambda w: w['week_key'], reverse=True)
+            result.append(seller)
+
+        return Response(result)
+
+
+class SettlementMarkView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+
+    def post(self, request, pk):
+        try:
+            settlement = SellerSettlement.objects.get(pk=pk)
+        except SellerSettlement.DoesNotExist:
+            return Response({'detail': 'Not found.'}, status=404)
+
+        if settlement.status == 'completed':
+            return Response({'detail': 'Already settled.'}, status=400)
+
+        notes = request.data.get('notes', '')
+        settlement.mark_settled(request.user, notes=notes)
+        return Response({
+            'settlement_id': settlement.id,
+            'settled_at': settlement.settled_at.isoformat(),
+        })
+
+
+class SettlementBulkMarkView(APIView):
+    """Mark all unsettled settlements for a seller (optionally filtered by week) as settled."""
+    permission_classes = [permissions.IsAdminUser]
+
+    def post(self, request):
+        ids = request.data.get('ids', [])
+        if not ids:
+            return Response({'detail': 'No ids provided.'}, status=400)
+        qs = SellerSettlement.objects.filter(pk__in=ids, status='pending')
+        notes = request.data.get('notes', '')
+        count = 0
+        for s in qs:
+            s.mark_settled(request.user, notes=notes)
+            count += 1
+        return Response({'settled': count})
+
+
+# ── Admin Status Manager ───────────────────────────────────────────────────────
+
+class AdminSubOrderListView(APIView):
+    """
+    GET /api/orders/admin/sub-orders/
+    Returns all sub-orders with seller info for the admin status manager.
+    Supports ?search=<order_number|seller_name> and ?status=<value>
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request):
+        qs = SubOrder.objects.select_related(
+            'order', 'order__user', 'seller', 'seller__seller_profile'
+        ).order_by('-created_at')
+
+        search = request.query_params.get('search', '').strip()
+        status_filter = request.query_params.get('status', '').strip()
+
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(sub_order_number__icontains=search) |
+                Q(order__order_number__icontains=search) |
+                Q(seller__seller_profile__store_name__icontains=search)
+            )
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        data = []
+        for so in qs[:200]:
+            user = so.order.user
+            profile = getattr(so.seller, 'seller_profile', None)
+            seller_name = profile.store_name if profile else (so.seller.get_full_name() or so.seller.username)
+            data.append({
+                'sub_order_id': str(so.id),
+                'sub_order_number': so.sub_order_number,
+                'order_number': so.order.order_number,
+                'status': so.status,
+                'seller_name': seller_name,
+                'seller_total': str(so.seller_total),
+                'created_at': so.created_at.isoformat(),
+                'customer': user.phone or user.email if user else (so.order.guest_phone or so.order.guest_email or '—'),
+            })
+        return Response(data)
+
+
+class AdminSubOrderStatusView(APIView):
+    """
+    PATCH /api/orders/admin/sub-orders/<pk>/status/
+    Force-sets a sub-order to any valid status, bypassing normal transition rules.
+    Also auto-creates SellerSettlement when forced to delivered.
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def patch(self, request, pk):
+        try:
+            sub_order = SubOrder.objects.select_related('order', 'seller').get(id=pk)
+        except SubOrder.DoesNotExist:
+            return Response({'error': 'Sub-order not found'}, status=404)
+
+        new_status = request.data.get('status', '').strip()
+        all_statuses = [s[0] for s in SubOrder._meta.get_field('status').choices]
+        if not new_status or new_status not in all_statuses:
+            return Response({'error': f"Invalid status. Choose from: {all_statuses}"}, status=400)
+
+        old_status = sub_order.status
+        sub_order.status = new_status
+        if new_status == 'confirmed' and not sub_order.confirmed_at:
+            sub_order.confirmed_at = timezone.now()
+            sub_order.dispatch_deadline = sub_order.confirmed_at + timedelta(hours=48)
+        sub_order.save()
+
+        if new_status == 'delivered':
+            SellerSettlement.objects.get_or_create(
+                sub_order=sub_order,
+                defaults={'seller': sub_order.seller, 'amount': sub_order.seller_total},
+            )
+
+        return Response({
+            'sub_order_id': str(sub_order.id),
+            'sub_order_number': sub_order.sub_order_number,
+            'old_status': old_status,
+            'new_status': new_status,
+        })
