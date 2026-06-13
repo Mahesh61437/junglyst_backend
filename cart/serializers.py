@@ -181,3 +181,49 @@ class CartSerializer(serializers.ModelSerializer):
                 s['shipping_category'] = 'light'
 
         return list(sellers.values())
+
+
+class CheckoutNudgeProductSerializer(serializers.Serializer):
+    """Minimal serializer for checkout nudge products — avoids heavy nested serializers."""
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    slug = serializers.CharField()
+    price = serializers.SerializerMethodField()
+    variant_id = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
+    stock = serializers.SerializerMethodField()
+    from_cart_seller = serializers.BooleanField()
+    seller_name = serializers.SerializerMethodField()
+    source_category_name = serializers.SerializerMethodField()
+
+    def get_source_category_name(self, obj):
+        return getattr(obj, '_source_category_name', '')
+
+    def get_price(self, obj):
+        variant = self._cheapest_variant(obj)
+        return float(variant.price) if variant else None
+
+    def get_variant_id(self, obj):
+        variant = self._cheapest_variant(obj)
+        return str(variant.id) if variant else None
+
+    def get_stock(self, obj):
+        variant = self._cheapest_variant(obj)
+        return variant.stock if variant else 0
+
+    def get_image_url(self, obj):
+        img = next(iter(obj.images.all()), None)
+        return img.image_url if img else None
+
+    def get_seller_name(self, obj):
+        try:
+            return obj.seller.seller_profile.store_name
+        except Exception:
+            return ''
+
+    def _cheapest_variant(self, obj):
+        return next(
+            (v for v in sorted(obj.variants.all(), key=lambda v: v.price)
+             if v.is_active and v.stock > 0),
+            None
+        )

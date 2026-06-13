@@ -11,7 +11,7 @@ from .views import (
     ForgotPasswordView, ResetPasswordView,
     BugReportListCreateView, BugReportDetailView,
     PublicConfigurationView, ConfigurationAdminView, ConfigurationAdminDetailView,
-    FeatureFlagsView,
+    FeatureFlagsView, ProductRecommendationsView,
 )
 
 urlpatterns = [
@@ -32,6 +32,7 @@ urlpatterns = [
     path('products/bulk-stock-update/', BulkStockUpdateView.as_view(), name='product_bulk_stock_update'),
     path('products/id/<uuid:id>/copy/', ProductCopyView.as_view(), name='product_copy'),
     path('products/id/<uuid:id>/', ProductDetailView.as_view(), name='product_detail_id'),
+    path('products/<slug:slug>/recommendations/', ProductRecommendationsView.as_view(), name='product_recommendations'),
     path('products/<slug:slug>/', ProductDetailView.as_view(lookup_field='slug'), name='product_detail_slug'),
     path('reviews/', ProductReviewListCreateView.as_view(), name='product_reviews'),
 

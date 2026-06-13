@@ -180,6 +180,32 @@ class Tag(SoftDeleteModel):
     def __str__(self):
         return self.name
 
+class CategoryComplement(models.Model):
+    """
+    Admin-defined rule: products in source_category should be complemented by
+    products from target_categories (e.g. Aquatic Plants → Fertilizers, CO2, Lighting).
+    """
+    source_category = models.ForeignKey(
+        Category, on_delete=models.CASCADE, related_name='complement_rules'
+    )
+    target_categories = models.ManyToManyField(
+        Category, related_name='complemented_by',
+        help_text="Products from these categories appear as complementary recommendations."
+    )
+    priority = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Lower number = shown first when multiple rules match."
+    )
+
+    class Meta:
+        ordering = ['priority']
+        verbose_name = "Category Complement Rule"
+        verbose_name_plural = "Category Complement Rules"
+
+    def __str__(self):
+        return f"{self.source_category.name} (priority {self.priority})"
+
+
 class Product(SoftDeleteModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
