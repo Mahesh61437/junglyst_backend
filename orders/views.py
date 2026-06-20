@@ -189,31 +189,29 @@ class CheckoutView(generics.GenericAPIView):
         # but not synced) may linger. Auto-remove them here so the user can still
         # check out with the items they actually want.
         # For inline item lists (guest / fallback), fail fast as normal.
-        if cart_id:
-            # Drop rows that can't be ordered: out-of-stock/over-stock (qty > stock)
-            # AND phantom zero-quantity rows (e.g. an item clamped to 0 by the UI
-            # when its variant sold out). A qty-0 row passes every `qty > stock`
-            # check, so without this it would silently become a 0-quantity
-            # OrderItem in the buyer's order.
-            stale = [
-                item for item in cart_items
-                if item.quantity < 1 or item.quantity > item.variant.stock
-            ]
-            for item in stale:
-                CartItem.objects.filter(id=item.id).delete()
-            cart_items = [item for item in cart_items if item not in stale]
-            if not cart_items:
-                return Response({"error": "All items in your cart are out of stock. Please add available products."}, status=400)
+        # Only phantom zero-quantity rows are pruned silently — items the buyer
+        # isn't actually ordering (e.g. a not-yet-synced removal). For a saved
+        # cart the row is also deleted from the DB so the UI reconciles on its
+        # next fetch. Out-of-stock / reduced items are deliberately NOT pruned:
+        # the buyer wants them, so we alert and block below instead.
+        phantom = [item for item in cart_items if item.quantity < 1]
+        if cart_id and phantom:
+            CartItem.objects.filter(id__in=[item.id for item in phantom]).delete()
+        cart_items = [item for item in cart_items if item not in phantom]
+        if not cart_items:
+            return Response({"error": "Your cart is empty. Please add available products."}, status=400)
 
         seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
         for item in cart_items:
-            # Never let a zero/negative-quantity row become an OrderItem.
-            if item.quantity < 1:
-                continue
+            # The buyer wants this item (qty >= 1) but stock can't fulfil it:
+            # alert and block. Distinguish fully out of stock from a partial
+            # shortfall so the message tells the buyer what to do.
             if item.quantity > item.variant.stock:
-                return Response({
-                    "error": f"Inventory mismatch: {item.product.name} has only {item.variant.stock} units available."
-                }, status=400)
+                if item.variant.stock < 1:
+                    msg = f"{item.product.name} is out of stock. Please remove it from your cart to continue."
+                else:
+                    msg = f"Only {item.variant.stock} unit(s) of {item.product.name} are available. Please update the quantity to continue."
+                return Response({"error": msg}, status=400)
 
             sid = str(item.product.seller_id)
             if sid not in seller_buckets:
@@ -425,6 +423,7 @@ class CheckoutView(generics.GenericAPIView):
             }, status=201)
         except Exception:
             logger.exception("Razorpay order initialization failed for order %s", order.order_number)
+            logger.error(f"debug: {Exception}")
             return Response({
                 "error": "Payment gateway is temporarily unavailable. Please try again in a moment."
             }, status=400)
