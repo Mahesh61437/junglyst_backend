@@ -190,9 +190,15 @@ class CheckoutView(generics.GenericAPIView):
         # check out with the items they actually want.
         # For inline item lists (guest / fallback), fail fast as normal.
         if cart_id:
-            # Also drop any quantity<=0 rows: they should never have been saved,
-            # but if one lingers it must not flow into an order as a 0-qty item.
-            stale = [item for item in cart_items if item.quantity > item.variant.stock or item.quantity < 1]
+            # Drop rows that can't be ordered: out-of-stock/over-stock (qty > stock)
+            # AND phantom zero-quantity rows (e.g. an item clamped to 0 by the UI
+            # when its variant sold out). A qty-0 row passes every `qty > stock`
+            # check, so without this it would silently become a 0-quantity
+            # OrderItem in the buyer's order.
+            stale = [
+                item for item in cart_items
+                if item.quantity < 1 or item.quantity > item.variant.stock
+            ]
             for item in stale:
                 CartItem.objects.filter(id=item.id).delete()
             cart_items = [item for item in cart_items if item not in stale]
@@ -201,10 +207,9 @@ class CheckoutView(generics.GenericAPIView):
 
         seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
         for item in cart_items:
+            # Never let a zero/negative-quantity row become an OrderItem.
             if item.quantity < 1:
-                return Response({
-                    "error": f"Invalid quantity for {item.product.name}. Quantity must be at least 1."
-                }, status=400)
+                continue
             if item.quantity > item.variant.stock:
                 return Response({
                     "error": f"Inventory mismatch: {item.product.name} has only {item.variant.stock} units available."
