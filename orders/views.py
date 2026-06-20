@@ -423,7 +423,6 @@ class CheckoutView(generics.GenericAPIView):
             }, status=201)
         except Exception:
             logger.exception("Razorpay order initialization failed for order %s", order.order_number)
-            logger.error(f"debug: {Exception}")
             return Response({
                 "error": "Payment gateway is temporarily unavailable. Please try again in a moment."
             }, status=400)
