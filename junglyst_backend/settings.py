@@ -101,6 +101,7 @@ INSTALLED_APPS = [
     'analytics',
     'competition',
     'community',
+    'combos',
     'django_celery_results',
     'django_celery_beat',
 ]

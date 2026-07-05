@@ -123,8 +123,13 @@ class OrderItem(SoftDeleteModel):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     gst_percentage = models.DecimalField(max_digits=5, decimal_places=2)
     quantity = models.PositiveIntegerField()
-    
+
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='order_items')
+
+    # Combo provenance — set when this item was purchased as part of a combo.
+    # Snapshot (id + name), not an FK, to avoid cross-app coupling / cascade issues.
+    combo_id = models.UUIDField(null=True, blank=True, db_index=True)
+    combo_name = models.CharField(max_length=255, blank=True, default='')
 
     def __str__(self):
         return f"{self.product_name} x {self.quantity}"
