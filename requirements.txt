@@ -54,6 +54,7 @@ packaging==25.0
 Pillow==12.2.0
 pillow-heif==0.22.0
 payu-websdk==0.1.7
+posthog==3.25.0
 prometheus_client==0.25.0
 prompt_toolkit==3.0.52
 proto-plus==1.27.2

@@ -292,8 +292,16 @@ class ProductListView(generics.ListAPIView):
 
         ordering_param = params.get('ordering', '').strip()
 
-        # 1. Seller-scoped pages (seller dashboard / storefront) — newest first
+        # 1. Seller-scoped pages (seller dashboard / storefront).
+        #    In-stock first, then the requested sort (e.g. storefront price sort);
+        #    newest-first when no explicit ordering is given.
         if params.get('seller') or params.get('seller_slug'):
+            if ordering_param:
+                secondary = [f.strip() for f in ordering_param.split(',')]
+                if any(f.lstrip('-') == 'price' for f in secondary):
+                    from django.db.models import Min
+                    qs = qs.annotate(price=Min('variants__price'))
+                return qs.order_by('-has_stock', *secondary)
             return qs.order_by('-has_stock', '-created_at')
 
         # 2. Explicit sort requested by the user
