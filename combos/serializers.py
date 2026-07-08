@@ -104,15 +104,60 @@ class ComboListSerializer(serializers.ModelSerializer):
     seller_count = serializers.IntegerField(read_only=True)
     in_stock = serializers.BooleanField(read_only=True)
     availability = serializers.CharField(read_only=True)
+    item_images = serializers.SerializerMethodField()
 
     class Meta:
         model = Combo
         fields = (
-            'id', 'name', 'slug', 'tagline', 'image_url',
+            'id', 'name', 'slug', 'tagline', 'image_url', 'item_images',
             'type', 'type_value', 'is_featured',
             'price', 'original_price', 'effective_price', 'shipping_fee', 'total_price',
             'item_count', 'seller_count', 'in_stock', 'availability',
         )
+
+    def get_item_count(self, obj):
+        return len(obj.items.all())
+
+    def get_item_images(self, obj):
+        # Up to 4 distinct component images — used by the frontend to build a
+        # fallback mosaic on combos that don't have a dedicated hero image.
+        images = []
+        for item in obj.items.all():
+            if item.variant_id is None:
+                continue
+            url = _variant_image(item.variant)
+            if url and url not in images:
+                images.append(url)
+            if len(images) >= 4:
+                break
+        return images
+
+
+class ComboAdminSerializer(serializers.ModelSerializer):
+    """Read/write serializer for the SuperAdmin combo builder.
+
+    Component items are NOT handled as a nested writable field here — the
+    builder UI sends a flat ``items: [{variant_id, quantity}, ...]`` list
+    (from a product/variant picker) which the admin views translate into
+    ComboItem rows directly, since that's simpler than DRF nested writes
+    for a full-replace-on-save flow.
+    """
+    type = serializers.CharField(source='get_combo_type_display', read_only=True)
+    items = ComboItemSerializer(many=True, read_only=True)
+    item_count = serializers.SerializerMethodField()
+    original_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    effective_price = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = Combo
+        fields = (
+            'id', 'name', 'slug', 'tagline', 'description',
+            'combo_type', 'type', 'image_url',
+            'price', 'original_price', 'effective_price', 'shipping_fee',
+            'is_featured', 'is_active', 'is_draft',
+            'item_count', 'items', 'created_at', 'updated_at',
+        )
+        read_only_fields = ('id', 'slug', 'created_at', 'updated_at')
 
     def get_item_count(self, obj):
         return len(obj.items.all())
