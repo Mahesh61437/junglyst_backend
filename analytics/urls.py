@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import AdminDashboardView, SuperAdminDashboardView, GSTDashboardView, SellerGSTDashboardView, AuthorizeGrowerView, RejectGrowerView, UserSearchView, SetGrowerView, ClearCacheView
+from .views import AdminDashboardView, SuperAdminDashboardView, GSTDashboardView, SellerGSTDashboardView, AuthorizeGrowerView, RejectGrowerView, UserSearchView, SetGrowerView, ClearCacheView, StockSyncPreviewView, StockSyncApplyView, StockSyncImportView, StockSyncStatusView, StockSyncJobView
 
 urlpatterns = [
     path('dashboard/', AdminDashboardView.as_view(), name='admin_dashboard'),
@@ -10,5 +10,10 @@ urlpatterns = [
     path('super-admin/user-search/', UserSearchView.as_view(), name='user_search'),
     path('super-admin/set-grower/<uuid:pk>/', SetGrowerView.as_view(), name='set_grower'),
     path('super-admin/clear-cache/', ClearCacheView.as_view(), name='clear_cache'),
+    path('super-admin/stock-sync/status/', StockSyncStatusView.as_view(), name='stock_sync_status'),
+    path('super-admin/stock-sync/preview/', StockSyncPreviewView.as_view(), name='stock_sync_preview'),
+    path('super-admin/stock-sync/job/<str:job_id>/', StockSyncJobView.as_view(), name='stock_sync_job'),
+    path('super-admin/stock-sync/apply/', StockSyncApplyView.as_view(), name='stock_sync_apply'),
+    path('super-admin/stock-sync/import/', StockSyncImportView.as_view(), name='stock_sync_import'),
     path('seller/gst-invoice/', SellerGSTDashboardView.as_view(), name='seller_gst_invoice'),
 ]

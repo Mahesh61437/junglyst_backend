@@ -390,3 +390,193 @@ class ClearCacheView(APIView):
     def post(self, request):
         cache.clear()
         return Response({'message': 'Cache cleared successfully.'}, status=200)
+
+
+# ---------------------------------------------------------------------------
+# Stock & Price Sync
+# ---------------------------------------------------------------------------
+
+from decimal import Decimal
+
+_SYNC_CACHE_PREFIX = 'stock_sync:pending:'
+
+_LAST_SYNCED_KEY = 'stock_sync:last_synced:{source}'
+
+
+def _get_last_synced(source: str) -> str | None:
+    return cache.get(_LAST_SYNCED_KEY.format(source=source))
+
+
+def _set_last_synced(source: str):
+    from django.utils import timezone
+    ts = timezone.now().strftime('%d %b %Y, %I:%M %p')
+    cache.set(_LAST_SYNCED_KEY.format(source=source), ts, 60 * 60 * 24 * 30)
+
+
+class StockSyncStatusView(APIView):
+    """GET /analytics/super-admin/stock-sync/status/ — last synced timestamps."""
+    permission_classes = (IsAdminUser,)
+
+    def get(self, request):
+        return Response({
+            'petkadai': _get_last_synced('petkadai'),
+            'himadri': _get_last_synced('himadri'),
+        })
+
+
+class StockSyncPreviewView(APIView):
+    """
+    POST /analytics/super-admin/stock-sync/preview/
+    Body: {
+      "source": "petkadai" | "himadri",
+      "seller_commission": 14.0,
+      "buyer_commission":  0.0
+    }
+    Kicks off a Celery scrape+diff task. Returns {job_id} immediately.
+    Poll GET /analytics/super-admin/stock-sync/job/<job_id>/ for results.
+    """
+    permission_classes = (IsAdminUser,)
+
+    def post(self, request):
+        from core.tasks import scrape_and_sync
+
+        source = request.data.get('source', '').lower()
+        if source not in ('petkadai', 'himadri'):
+            return Response({'error': 'source must be petkadai or himadri'}, status=400)
+
+        seller_email = (request.data.get('seller_email') or '').strip()
+        if not seller_email:
+            return Response({'error': 'seller_email is required.'}, status=400)
+
+        try:
+            source_markup     = float(request.data['source_markup'])     if 'source_markup'     in request.data else None
+            seller_commission = float(request.data['seller_commission']) if 'seller_commission' in request.data else None
+            buyer_commission  = float(request.data['buyer_commission'])  if 'buyer_commission'  in request.data else None
+        except Exception:
+            return Response({'error': 'Commission values must be numbers.'}, status=400)
+
+        task = scrape_and_sync.delay(source, seller_email, source_markup, seller_commission, buyer_commission)
+        return Response({'job_id': task.id, 'source': source}, status=202)
+
+
+class StockSyncJobView(APIView):
+    """GET /analytics/super-admin/stock-sync/job/<job_id>/ — poll Celery task status."""
+    permission_classes = (IsAdminUser,)
+
+    def get(self, request, job_id):
+        from celery.result import AsyncResult
+
+        result = AsyncResult(job_id)
+        state = result.state  # PENDING, STARTED, PROGRESS, SUCCESS, FAILURE
+
+        if state in ('PENDING', 'STARTED'):
+            return Response({'status': 'pending', 'progress': 'Starting…'})
+
+        if state == 'PROGRESS':
+            meta = result.info or {}
+            return Response({'status': 'scraping', 'progress': meta.get('progress', '')})
+
+        if state == 'SUCCESS':
+            return Response({'status': 'done', **result.result})
+
+        if state == 'FAILURE':
+            return Response({'status': 'error', 'error': str(result.result)})
+
+        return Response({'status': state.lower(), 'progress': ''})
+
+
+class StockSyncApplyView(APIView):
+    """
+    POST /analytics/super-admin/stock-sync/apply/
+    Body: {"session_key": "...", "approved_ids": ["variant-uuid", ...]}
+    Applies approved price + commission changes.
+    """
+    permission_classes = (IsAdminUser,)
+
+    def post(self, request):
+        from core.models import ProductVariant
+        from core.feed import invalidate_feed_cache
+
+        session_key = request.data.get('session_key', '')
+        approved_ids = request.data.get('approved_ids', [])
+
+        if not session_key:
+            return Response({'error': 'session_key is required'}, status=400)
+
+        pending = cache.get(f'{_SYNC_CACHE_PREFIX}{session_key}')
+        if pending is None:
+            return Response({'error': 'Session expired or not found. Run preview again.'}, status=404)
+
+        from core.models import User
+
+        applied = 0
+        errors = []
+
+        # If the sync specified a commission override, update it on the seller profile
+        # ONCE per seller (not per variant) — variant.save() reads from seller.seller_commission_rate.
+        # Doing it per-variant would be redundant and risks partial updates.
+        seller_commission_updated: set[int] = set()
+
+        for vid in approved_ids:
+            change = pending.get(vid)
+            if not change:
+                errors.append(f'{vid}: not in pending session')
+                continue
+            try:
+                variant = ProductVariant.objects.select_related('product__seller').get(id=vid)
+                variant.base_price = Decimal(str(change['new_base']))
+
+                # Update the seller's commission rate if the sync specified one and it differs.
+                # This is the field that ProductVariant.save() actually reads to compute price.
+                sync_rate = change.get('seller_commission')
+                if sync_rate is not None:
+                    seller = variant.product.seller
+                    new_rate = Decimal(str(sync_rate))
+                    if seller.id not in seller_commission_updated and seller.seller_commission_rate != new_rate:
+                        seller.seller_commission_rate = new_rate
+                        seller.save(update_fields=['seller_commission_rate'])
+                        seller_commission_updated.add(seller.id)
+
+                variant.save()  # recomputes price = base_price * (1 + seller.seller_commission_rate/100)
+                applied += 1
+            except ProductVariant.DoesNotExist:
+                errors.append(f'{vid}: variant not found')
+            except Exception as e:
+                errors.append(f'{vid}: {e}')
+
+        if applied > 0:
+            invalidate_feed_cache()
+            cache.delete(f'{_SYNC_CACHE_PREFIX}{session_key}')
+
+        return Response({'applied': applied, 'errors': errors})
+
+
+class StockSyncImportView(APIView):
+    """
+    POST /analytics/super-admin/stock-sync/import/
+    Body: { "session_key": "...", "approved_skus": ["SKU1", ...], "seller_email": "...", "seller_commission": 10 }
+    Creates new Product + ProductVariant + ProductImage for each approved SKU.
+    """
+    permission_classes = (IsAdminUser,)
+
+    def post(self, request):
+        from analytics.sync_utils import import_new_products
+
+        session_key = request.data.get('session_key', '').strip()
+        approved_skus = request.data.get('approved_skus', [])
+        seller_email = (request.data.get('seller_email') or '').strip()
+
+        if not session_key:
+            return Response({'error': 'session_key is required'}, status=400)
+        if not seller_email:
+            return Response({'error': 'seller_email is required'}, status=400)
+        if not approved_skus:
+            return Response({'error': 'No SKUs selected.'}, status=400)
+
+        try:
+            seller_commission = Decimal(str(request.data['seller_commission'])) if 'seller_commission' in request.data else None
+        except Exception:
+            return Response({'error': 'seller_commission must be a number.'}, status=400)
+
+        result = import_new_products(session_key, approved_skus, seller_email, seller_commission)
+        return Response(result)
