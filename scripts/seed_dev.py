@@ -7,11 +7,11 @@ from decimal import Decimal
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'junglyst_backend.settings')
 
 # Temporary override for Railway DB (provided by user)
-os.environ['DB_HOST'] = 'shuttle.proxy.rlwy.net'
-os.environ['DB_PORT'] = '44939'
-os.environ['DB_NAME'] = 'railway'
-os.environ['DB_USER'] = 'postgres'
-os.environ['DB_PASSWORD'] = 'gbvAbFfiHVijgytXsDmdfdRkvKVXFKgY'
+# os.environ['DB_HOST'] = 'shuttle.proxy.rlwy.net'
+# os.environ['DB_PORT'] = '44939'
+# os.environ['DB_NAME'] = 'railway'
+# os.environ['DB_USER'] = 'postgres'
+# os.environ['DB_PASSWORD'] = 'gbvAbFfiHVijgytXsDmdfdRkvKVXFKgY'
 
 django.setup()
 

@@ -47,17 +47,20 @@ query SyncProducts($categoryUid: String!, $pageSize: Int!, $currentPage: Int!) {
       }
       stock_status
       only_x_left_in_stock
+      image { url }
+      media_gallery { url }
     }
     page_info { current_page total_pages }
   }
 }
 """
 
-# Mirrors ALL_CATEGORIES from scrape_petkadai_category.py
+# Mirrors ALL_CATEGORIES from scrape_petkadai_category.py.
+# 'Live Fishes' (and any shrimp/live-animal categories) are intentionally excluded —
+# Junglyst no longer lists live fish/shrimp, only plants and aqua supplies.
 _PETKADAI_CATEGORIES = [
     {'uid': 'NA==',  'name': 'Live Plants'},
     {'uid': 'OA==',  'name': 'Starters'},
-    {'uid': 'OQ==',  'name': 'Live Fishes'},
     {'uid': 'MTA=',  'name': 'Aqua Essentials'},
     {'uid': 'MTI=',  'name': 'Fish Food'},
     {'uid': 'MTM=',  'name': 'Aqua Filters'},
@@ -67,7 +70,8 @@ _PETKADAI_CATEGORIES = [
     {'uid': 'MjQ=',  'name': 'Aquarium Lights'},
     {'uid': 'MzE=',  'name': 'Driftwoods'},
     {'uid': 'MjE=',  'name': 'Toys & Decors'},
-    {'uid': 'MTg=',  'name': 'Birds'},
+    # 'Birds' (uid 'MTg=') intentionally excluded — Junglyst has no bird category
+    # and doesn't sell birds/bird supplies, same as Live Fishes above.
 ]
 
 # Docker mounts E:\JungLyst → /project; outside Docker fall back to the relative path.
@@ -101,6 +105,19 @@ def _parse_stock(val) -> int:
     except (ValueError, TypeError):
         m = re.search(r'(\d+)', s)
         return int(m.group(1)) if m else 0
+
+
+def _petkadai_image_urls(item: dict) -> list[str]:
+    """Collect image URLs from a raw PetKadai GraphQL item (main image + gallery)."""
+    urls: list[str] = []
+    main = (item.get('image') or {}).get('url')
+    if main:
+        urls.append(main)
+    for entry in item.get('media_gallery') or []:
+        url = entry.get('url')
+        if url and url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _extract_petkadai(item: dict) -> dict | None:
@@ -192,6 +209,9 @@ def scrape_live_petkadai(progress_cb=None) -> list[dict]:
         if progress_cb:
             progress_cb(f'Scraping Pet Kadai: {cat["name"]} ({i + 1}/{total})…')
         items = _fetch_petkadai_category(cat['uid'], cat['name'])
+        for item in items:
+            item['images'] = _petkadai_image_urls(item)
+            item['categories'] = [cat['name']]
         records.extend(items)
     return records
 
@@ -405,6 +425,124 @@ def compute_diff(
     }
 
 
+# ── Category resolution (module-level so it's a single source of truth for ──
+# both the live import path and any one-off recategorization scripts) ────────
+
+# Himadri name fragment → (category_slug, subcategory_slug). Himadri's own
+# WooCommerce category names are already fine-grained plant-type names.
+CAT_MAP = [
+    ('lillies',         ('plants', 'plants-lily')),
+    ('lily',            ('plants', 'plants-lily')),
+    ('lotus',           ('plants', 'plants-lily')),
+    ('tissue culture',  ('plants', 'plants-tissue-culture')),
+    ('tc cup',          ('plants', 'plants-tissue-culture')),
+    ('carpet',          ('plants', 'plants-carpet-plants')),
+    ('foreground',      ('plants', 'plants-carpet-plants')),
+    ('moss',            ('plants', 'plants-mosses')),
+    ('fern',            ('plants', 'plants-ferns')),
+    ('anubias',         ('plants', 'plants-epiphytes')),
+    ('lagenandra',      ('plants', 'plants-epiphytes')),
+    ('bucephalandra',   ('plants', 'plants-epiphytes')),
+    ('floating',        ('plants', 'plants-floating-plants')),
+    ('pond',            ('plants', 'plants-floating-plants')),
+    ('low tech',        ('plants', 'plants-beginner-friendly')),
+    ('beginner',        ('plants', 'plants-beginner-friendly')),
+    ('stem',            ('plants', 'aquatic-plants')),
+    ('cryptocoryne',    ('plants', 'aquatic-plants')),
+    ('echinodorus',     ('plants', 'aquatic-plants')),
+    ('aquatic',         ('plants', 'aquatic-plants')),
+]
+
+# PetKadai source category → Junglyst (category, default subcategory). PetKadai's
+# own category (attached to each scraped item as `categories: [name]` in
+# scrape_live_petkadai) is a much more reliable signal than keyword-matching
+# descriptions, and covers non-plant products the keyword map above never could.
+# Keep in sync with _PETKADAI_CATEGORIES above — every non-excluded entry there
+# must have a key here (see test_category_mapping.py).
+PETKADAI_CATEGORY_MAP = {
+    'live plants':      ('plants',               'aquatic-plants'),
+    'starters':         ('aquascaping',           'aquascaping-starter-packs'),
+    'aqua essentials':  ('aquarium-accessories',  'aquarium-accessories-tank-accessories'),
+    'fish food':        ('fish-aquarium-care',    'fish-aquarium-care-fish-food'),
+    'aqua filters':     ('aquarium-filters',      'aquarium-filters-accessories-spares'),
+    'aquatic remedies': ('fish-aquarium-care',    'fish-aquarium-care-aquarium-medicines'),
+    'planted aquarium': ('planted-aquarium-co2',  'planted-aquarium-co2-co2-accessories'),
+    'aquarium tanks':   ('aquarium-tanks',        'aquarium-tanks-moulded-tanks'),
+    'aquarium lights':  ('aquarium-lights',       'aquarium-lights-led-lights'),
+    'driftwoods':       ('aquascaping',           'aquascaping-driftwood'),
+    'toys & decors':    ('aquarium-accessories',  'aquarium-accessories-tank-accessories'),
+}
+
+# Keyword refinement applied within a PetKadai-mapped category, using the
+# product name, to pick a more specific subcategory than the default above.
+SUBCAT_REFINE = {
+    'aquarium-filters': [
+        ('canister',      'aquarium-filters-external-canister-filters'),
+        ('hang on',       'aquarium-filters-hang-on-filters'),
+        ('hob',           'aquarium-filters-hang-on-filters'),
+        ('sponge',        'aquarium-filters-sponge-filters'),
+        ('internal',      'aquarium-filters-internal-filters'),
+        ('external',      'aquarium-filters-external-filters'),
+    ],
+    'aquarium-tanks': [
+        ('rimless',       'aquarium-tanks-rimless-tanks'),
+        ('ultra crystal', 'aquarium-tanks-ultra-crystal-clear-tanks'),
+        ('crystal clear', 'aquarium-tanks-ultra-crystal-clear-tanks'),
+    ],
+    'aquarium-lights': [
+        ('clip',          'aquarium-lights-clip-on-lights'),
+    ],
+    'planted-aquarium-co2': [
+        ('diffuser',      'planted-aquarium-co2-co2-diffusers'),
+        ('regulator',     'planted-aquarium-co2-co2-regulators'),
+        ('kit',           'planted-aquarium-co2-complete-co2-kits'),
+    ],
+}
+
+
+def resolve_category(scraped_cats: list[str], name: str = ''):
+    """Return (Category, SubCategory | None) best matching scraped category list."""
+    from core.models import Category, SubCategory
+
+    combined = ' '.join(scraped_cats).lower()
+    name_l = (name or '').lower()
+
+    # 1) Direct match against the PetKadai source category (most reliable —
+    #    covers non-plant products the keyword map below was never built for).
+    for cat_name in scraped_cats:
+        mapped = PETKADAI_CATEGORY_MAP.get((cat_name or '').strip().lower())
+        if not mapped:
+            continue
+        cat_slug, default_sub_slug = mapped
+        sub_slug = default_sub_slug
+        for keyword, refined_sub_slug in SUBCAT_REFINE.get(cat_slug, []):
+            if keyword in name_l:
+                sub_slug = refined_sub_slug
+                break
+        try:
+            cat = Category.objects.get(slug=cat_slug)
+            sub = SubCategory.objects.get(slug=sub_slug)
+            return cat, sub
+        except (Category.DoesNotExist, SubCategory.DoesNotExist):
+            pass
+
+    # 2) Keyword match against scraped category text (Himadri path).
+    for keyword, (cat_slug, sub_slug) in CAT_MAP:
+        if keyword in combined:
+            try:
+                cat = Category.objects.get(slug=cat_slug)
+                sub = SubCategory.objects.get(slug=sub_slug)
+                return cat, sub
+            except (Category.DoesNotExist, SubCategory.DoesNotExist):
+                pass
+
+    # fallback to Plants > Aquatic Plants
+    try:
+        return Category.objects.get(slug='plants'), SubCategory.objects.get(slug='aquatic-plants')
+    except Exception:
+        return None, None
+
+
 def import_new_products(session_key: str, approved_skus: list[str], seller_email: str, seller_commission: Decimal | None) -> dict:
     """
     Create Product + ProductVariant + ProductImage for each approved SKU
@@ -422,30 +560,6 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
         return {'imported': 0, 'errors': [f'Seller not found: {seller_email}']}
 
     s_rate = seller_commission if seller_commission is not None else Decimal(str(seller.seller_commission_rate))
-
-    # ── Category mapping: Himadri name fragment → (category_slug, subcategory_slug) ──
-    _CAT_MAP = [
-        ('lillies',         ('plants', 'plants-lily')),
-        ('lily',            ('plants', 'plants-lily')),
-        ('lotus',           ('plants', 'plants-lily')),
-        ('tissue culture',  ('plants', 'plants-tissue-culture')),
-        ('tc cup',          ('plants', 'plants-tissue-culture')),
-        ('carpet',          ('plants', 'plants-carpet-plants')),
-        ('foreground',      ('plants', 'plants-carpet-plants')),
-        ('moss',            ('plants', 'plants-mosses')),
-        ('fern',            ('plants', 'plants-ferns')),
-        ('anubias',         ('plants', 'plants-epiphytes')),
-        ('lagenandra',      ('plants', 'plants-epiphytes')),
-        ('bucephalandra',   ('plants', 'plants-epiphytes')),
-        ('floating',        ('plants', 'plants-floating-plants')),
-        ('pond',            ('plants', 'plants-floating-plants')),
-        ('low tech',        ('plants', 'plants-beginner-friendly')),
-        ('beginner',        ('plants', 'plants-beginner-friendly')),
-        ('stem',            ('plants', 'aquatic-plants')),
-        ('cryptocoryne',    ('plants', 'aquatic-plants')),
-        ('echinodorus',     ('plants', 'aquatic-plants')),
-        ('aquatic',         ('plants', 'aquatic-plants')),
-    ]
 
     # ── Care defaults by subcategory slug ────────────────────────────────────
     # (care_level, light_requirements, growth_rate, co2_requirement)
@@ -486,23 +600,6 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
             return VariantType.BUNCH
         return VariantType.PLANT
 
-    def _resolve_category(scraped_cats: list[str]):
-        """Return (Category, SubCategory | None) best matching scraped category list."""
-        combined = ' '.join(scraped_cats).lower()
-        for keyword, (cat_slug, sub_slug) in _CAT_MAP:
-            if keyword in combined:
-                try:
-                    cat = Category.objects.get(slug=cat_slug)
-                    sub = SubCategory.objects.get(slug=sub_slug)
-                    return cat, sub
-                except (Category.DoesNotExist, SubCategory.DoesNotExist):
-                    pass
-        # fallback to Plants > Aquatic Plants
-        try:
-            return Category.objects.get(slug='plants'), SubCategory.objects.get(slug='aquatic-plants')
-        except Exception:
-            return None, None
-
     imported = 0
     errors = []
 
@@ -522,7 +619,7 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
                 continue
 
             scraped_cats = raw.get('categories') or []
-            category, sub_category = _resolve_category(scraped_cats)
+            category, sub_category = resolve_category(scraped_cats, item['name'])
             sub_slug = sub_category.slug if sub_category else None
             care_level, light_req, growth_rate, co2_req = _CARE_DEFAULTS.get(sub_slug, _DEFAULT_CARE)
 
