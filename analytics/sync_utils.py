@@ -11,9 +11,30 @@ import os
 import sys
 import time
 from decimal import Decimal, ROUND_HALF_UP
+from html.parser import HTMLParser
 import re
 
 import requests
+
+
+class _HTMLStripper(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def get_text(self) -> str:
+        return " ".join(self._parts).strip()
+
+
+def _strip_html(html: str) -> str:
+    if not html:
+        return ""
+    s = _HTMLStripper()
+    s.feed(html)
+    return re.sub(r"\s+", " ", s.get_text()).strip()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -47,6 +68,8 @@ query SyncProducts($categoryUid: String!, $pageSize: Int!, $currentPage: Int!) {
       }
       stock_status
       only_x_left_in_stock
+      short_description { html }
+      description { html }
       image { url }
       media_gallery { url }
     }
@@ -212,6 +235,10 @@ def scrape_live_petkadai(progress_cb=None) -> list[dict]:
         for item in items:
             item['images'] = _petkadai_image_urls(item)
             item['categories'] = [cat['name']]
+            desc_text  = _strip_html((item.get('description') or {}).get('html', ''))
+            short_text = _strip_html((item.get('short_description') or {}).get('html', ''))
+            item['description'] = desc_text or short_text
+            item['short_description'] = short_text
         records.extend(items)
     return records
 
@@ -316,7 +343,8 @@ def compute_diff(
                 'new_stock': parsed['new_stock'] or 0,
                 'source':    source,
                 '_raw': {
-                    'description':     rec.get('description', ''),
+                    'description':       rec.get('description', ''),
+                    'short_description': rec.get('short_description', ''),
                     'scientific_name': rec.get('scientific_name', ''),
                     'categories':      rec.get('categories', []),
                     'tags':            rec.get('tags', []),
@@ -623,9 +651,16 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
             sub_slug = sub_category.slug if sub_category else None
             care_level, light_req, growth_rate, co2_req = _CARE_DEFAULTS.get(sub_slug, _DEFAULT_CARE)
 
+            # Never fall back to the product name here — an empty description lets
+            # the frontend's own placeholder copy render instead of a fake description
+            # that's just the title repeated (see backfill_petkadai_descriptions).
+            description = raw.get('description') or raw.get('short_description') or ''
+            tagline = (raw.get('short_description') or '')[:499] or None
+
             product = Product(
                 name=item['name'],
-                description=raw.get('description') or item['name'],
+                description=description,
+                tagline=tagline,
                 seller=seller,
                 scientific_name=raw.get('scientific_name') or '',
                 rating=Decimal(str(raw.get('rating') or 5.0)),

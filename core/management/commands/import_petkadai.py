@@ -455,7 +455,11 @@ class Command(BaseCommand):
         product_fields = dict(
             name               = name,
             tagline            = (product_data.get("tagline") or "")[:499] or None,
-            description        = product_data.get("description") or name,
+            # NB: description is a required TextField (no null=True) but DOES allow
+            # an empty string — never fall back to `name` here, it silently produces
+            # a "description" that's just the product title with no real content.
+            # Empty string lets the frontend's own fallback copy render instead.
+            description        = product_data.get("description") or product_data.get("tagline") or "",
             seller             = seller,
             scientific_name    = product_data.get("scientific_name") or None,
             care_level         = product_data.get("care_level")         or "Easy",
