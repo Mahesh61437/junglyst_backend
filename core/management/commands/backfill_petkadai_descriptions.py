@@ -1,23 +1,35 @@
 """
 Management command: backfill_petkadai_descriptions
 ====================================================
-Fixes the fallout of the `import_petkadai` bug where products with no
-scraped description got `description = name` instead of real content
+Fixes the fallout of the `import_petkadai` / dashboard-sync bug where products
+with no scraped description got `description = name` instead of real content
 (e.g. a product literally described as "Ammonia Remover 500g").
 
+Two source modes:
+  --json-dir (default)  Match against local petkadai JSON snapshots in
+                         pet_kadai/*.json by slug/name. Fast, no network,
+                         but only as fresh as the last CLI scrape.
+  --live                 Re-scrape petkadai.com's GraphQL API right now (same
+                         code path as the Super Admin "Sync Pet Kadai" button)
+                         and match by SKU via ProductVariant. Slower (hits
+                         every category live) but far more complete — petkadai
+                         stores the real product copy in `short_description`
+                         and leaves `description` empty for every product, so
+                         this pulls the same "Product Details" text shown on
+                         the live page.
+
 For every Product whose description is junk (description == name), this
-looks up the slug across the local petkadai JSON snapshots in
-`pet_kadai/*.json` and, if a real (non-junk) description is found there,
-stages an update. Products with no real description available anywhere
-locally are left untouched and listed separately — they need a fresh
-scrape from petkadai.com.
+looks for a real (non-junk) description in the chosen source and, if found,
+stages an update. Products with nothing found anywhere are left untouched
+and listed separately.
 
 This is READ-ONLY by default. Nothing is written unless --apply is passed.
 
 Usage
 -----
-  python manage.py backfill_petkadai_descriptions                # dry-run report only
+  python manage.py backfill_petkadai_descriptions                # dry-run, local snapshots
   python manage.py backfill_petkadai_descriptions --apply         # write the fixes
+  python manage.py backfill_petkadai_descriptions --live --apply  # re-scrape live + write
   python manage.py backfill_petkadai_descriptions --json-dir /path/to/pet_kadai
   python manage.py backfill_petkadai_descriptions --limit 20
   python manage.py backfill_petkadai_descriptions --still-missing-out missing.txt
@@ -87,6 +99,32 @@ def _load_snapshot_map(json_dir: str) -> dict[str, dict]:
     return {"by_slug": by_slug, "by_name": by_name}
 
 
+def _load_live_sku_map(stdout) -> dict[str, dict]:
+    """
+    Re-scrape petkadai.com live (all categories) via the same GraphQL path the
+    Super Admin dashboard sync uses, and build sku -> {description, tagline, name}
+    for every item with real (non-empty) description content.
+    """
+    from analytics.sync_utils import scrape_live_petkadai
+
+    def _progress(msg: str) -> None:
+        stdout.write(f"  {msg}")
+
+    records = scrape_live_petkadai(progress_cb=_progress)
+
+    by_sku: dict[str, dict] = {}
+    for item in records:
+        sku = item.get("sku") or ""
+        name = (item.get("name") or "").strip()
+        desc = (item.get("description") or "").strip()
+        short = (item.get("short_description") or "").strip()
+        if not sku or not desc:
+            continue
+        by_sku[sku] = {"description": desc, "tagline": short, "name": name}
+
+    return by_sku
+
+
 class Command(BaseCommand):
     help = (
         "Backfill real descriptions for petkadai-imported products whose "
@@ -111,33 +149,38 @@ class Command(BaseCommand):
             help="Stop after examining this many junk products (0 = all).",
         )
         parser.add_argument(
+            "--live",
+            action="store_true",
+            help="Re-scrape petkadai.com live instead of reading local JSON "
+                 "snapshots, and match by SKU. Slower, far more complete.",
+        )
+        parser.add_argument(
+            "--description-only",
+            action="store_true",
+            help="Only write the description field. Do not touch tagline "
+                 "or any other field, even when tagline is currently blank.",
+        )
+        parser.add_argument(
             "--still-missing-out",
             default=None,
             help="Optional file path to write the list of slugs that couldn't be "
-                 "fixed from local snapshots (need a fresh scrape).",
+                 "fixed (need a fresh scrape / no longer on petkadai).",
         )
 
     def handle(self, *args, **options):
-        from core.models import Product
+        from core.models import Product, ProductVariant
 
         json_dir          : str = options["json_dir"]
         apply_changes      : bool = options["apply"]
         limit               : int = options["limit"]
+        live                : bool = options["live"]
+        description_only    : bool = options["description_only"]
         still_missing_out : str | None = options["still_missing_out"]
-
-        if not os.path.isdir(json_dir):
-            raise CommandError(f"JSON directory not found: {json_dir}")
 
         self.stdout.write(
             self.style.WARNING("DRY RUN — no changes will be written.\n")
             if not apply_changes
             else self.style.WARNING("APPLY MODE — matched products WILL be updated.\n")
-        )
-
-        self.stdout.write(f"Scanning snapshots in {json_dir} ...")
-        snapshot = _load_snapshot_map(json_dir)
-        self.stdout.write(
-            f"Loaded {len(snapshot['by_slug'])} usable descriptions from local snapshots.\n"
         )
 
         junk_products = [
@@ -152,15 +195,48 @@ class Command(BaseCommand):
         fixable: list[tuple] = []   # (product, new_description, new_tagline)
         still_missing: list[str] = []
 
-        for p in junk_products:
-            match = (
-                snapshot["by_slug"].get(p.slug)
-                or snapshot["by_name"].get((p.name or "").strip().lower())
+        if live:
+            self.stdout.write("Re-scraping petkadai.com live (all categories)...")
+            sku_map = _load_live_sku_map(self.stdout)
+            self.stdout.write(
+                f"Loaded {len(sku_map)} usable descriptions from the live site.\n"
             )
-            if match:
-                fixable.append((p, match["description"], match.get("tagline")))
-            else:
-                still_missing.append(p.slug)
+
+            # Preload sku -> product_id for all junk products in one query
+            junk_ids = [p.id for p in junk_products]
+            sku_by_product: dict = {}
+            for pid, sku in ProductVariant.objects.filter(product_id__in=junk_ids).values_list("product_id", "sku"):
+                sku_by_product.setdefault(pid, []).append(sku)
+
+            for p in junk_products:
+                match = None
+                for sku in sku_by_product.get(p.id, []):
+                    if sku in sku_map:
+                        match = sku_map[sku]
+                        break
+                if match:
+                    fixable.append((p, match["description"], match.get("tagline")))
+                else:
+                    still_missing.append(p.slug)
+        else:
+            if not os.path.isdir(json_dir):
+                raise CommandError(f"JSON directory not found: {json_dir}")
+
+            self.stdout.write(f"Scanning snapshots in {json_dir} ...")
+            snapshot = _load_snapshot_map(json_dir)
+            self.stdout.write(
+                f"Loaded {len(snapshot['by_slug'])} usable descriptions from local snapshots.\n"
+            )
+
+            for p in junk_products:
+                match = (
+                    snapshot["by_slug"].get(p.slug)
+                    or snapshot["by_name"].get((p.name or "").strip().lower())
+                )
+                if match:
+                    fixable.append((p, match["description"], match.get("tagline")))
+                else:
+                    still_missing.append(p.slug)
 
         self.stdout.write(self.style.SUCCESS(f"Fixable from local snapshots: {len(fixable)}"))
         self.stdout.write(self.style.WARNING(f"Still missing (need live re-scrape): {len(still_missing)}\n"))
@@ -173,13 +249,17 @@ class Command(BaseCommand):
 
         if apply_changes and fixable:
             self.stdout.write("")
+            if description_only:
+                self.stdout.write(self.style.WARNING("--description-only: tagline will NOT be touched.\n"))
             updated = 0
             with transaction.atomic():
                 for p, new_desc, new_tagline in fixable:
                     p.description = new_desc
-                    if not p.tagline and new_tagline:
+                    update_fields = ["description", "updated_at"]
+                    if not description_only and not p.tagline and new_tagline:
                         p.tagline = new_tagline[:499]
-                    p.save(update_fields=["description", "tagline", "updated_at"])
+                        update_fields.append("tagline")
+                    p.save(update_fields=update_fields)
                     updated += 1
             self.stdout.write(self.style.SUCCESS(f"Updated {updated} products."))
         elif not apply_changes and fixable:

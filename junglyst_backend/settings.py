@@ -204,6 +204,12 @@ if config('DB_HOST', default=None):
             'PASSWORD': config('DB_PASSWORD'),
             'HOST': config('DB_HOST'),
             'PORT': config('DB_PORT', default='5432'),
+            # DB is reached through Railway's TCP proxy, which silently drops
+            # idle connections. Without this, a connection that died between
+            # two queries in the same request raises "SSL SYSCALL error: EOF
+            # detected" instead of transparently reconnecting — hit by the
+            # stock-sync job-status poll during long (multi-minute) scrapes.
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 else:

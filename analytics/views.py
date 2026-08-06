@@ -465,24 +465,34 @@ class StockSyncJobView(APIView):
 
     def get(self, request, job_id):
         from celery.result import AsyncResult
+        from django.db import close_old_connections
+        from django.db.utils import OperationalError
 
-        result = AsyncResult(job_id)
-        state = result.state  # PENDING, STARTED, PROGRESS, SUCCESS, FAILURE
+        try:
+            result = AsyncResult(job_id)
+            state = result.state  # PENDING, STARTED, PROGRESS, SUCCESS, FAILURE
 
-        if state in ('PENDING', 'STARTED'):
-            return Response({'status': 'pending', 'progress': 'Starting…'})
+            if state in ('PENDING', 'STARTED'):
+                return Response({'status': 'pending', 'progress': 'Starting…'})
 
-        if state == 'PROGRESS':
-            meta = result.info or {}
-            return Response({'status': 'scraping', 'progress': meta.get('progress', '')})
+            if state == 'PROGRESS':
+                meta = result.info or {}
+                return Response({'status': 'scraping', 'progress': meta.get('progress', '')})
 
-        if state == 'SUCCESS':
-            return Response({'status': 'done', **result.result})
+            if state == 'SUCCESS':
+                return Response({'status': 'done', **result.result})
 
-        if state == 'FAILURE':
-            return Response({'status': 'error', 'error': str(result.result)})
+            if state == 'FAILURE':
+                return Response({'status': 'error', 'error': str(result.result)})
 
-        return Response({'status': state.lower(), 'progress': ''})
+            return Response({'status': state.lower(), 'progress': ''})
+        except OperationalError:
+            # Transient DB connection drop (Railway's proxy silently kills idle
+            # connections during long scrapes) — don't kill the whole sync over
+            # one flaky poll. Discard the dead connection so the next request
+            # opens a fresh one, and tell the frontend to just keep polling.
+            close_old_connections()
+            return Response({'status': 'pending', 'progress': 'Reconnecting…'})
 
 
 class StockSyncApplyView(APIView):
