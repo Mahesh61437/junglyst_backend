@@ -6,6 +6,8 @@ from .views import (
     UpdateShipmentDetailsView, SubOrderShipView, UpdateSubOrderStatusView,
     RefreshShippingLabelView,
     CancelOrderView,
+    SettlementListView, SettlementMarkView, SettlementBulkMarkView,
+    AdminSubOrderListView, AdminSubOrderStatusView,
 )
 
 urlpatterns = [
@@ -26,4 +28,9 @@ urlpatterns = [
     path('seller/sub-orders/<uuid:pk>/refresh-label/', RefreshShippingLabelView.as_view(), name='suborder_refresh_label'),
     path('seller/sub-orders/<uuid:pk>/status/', UpdateSubOrderStatusView.as_view(), name='suborder_update_status'),
     path('ship-now/', ShipNowView.as_view(), name='ship_now'),
+    path('settlements/', SettlementListView.as_view(), name='settlement_list'),
+    path('settlements/<int:pk>/settle/', SettlementMarkView.as_view(), name='settlement_mark'),
+    path('settlements/bulk-settle/', SettlementBulkMarkView.as_view(), name='settlement_bulk'),
+    path('admin/sub-orders/', AdminSubOrderListView.as_view(), name='admin_suborder_list'),
+    path('admin/sub-orders/<uuid:pk>/status/', AdminSubOrderStatusView.as_view(), name='admin_suborder_status'),
 ]

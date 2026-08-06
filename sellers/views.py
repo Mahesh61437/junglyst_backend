@@ -23,40 +23,51 @@ class GrowerDashboardView(generics.GenericAPIView):
             return Response({"error": "Access denied"}, status=403)
             
         profile, _ = SellerProfile.objects.get_or_get_default(user=seller)
-        order_items = OrderItem.objects.filter(seller=seller)
-        
-        # Calculate Advanced Metrics
-        total_revenue = order_items.aggregate(total=Sum('unit_price'))['total'] or 0
-        total_items_sold = order_items.aggregate(total=Sum('quantity'))['total'] or 0
-        
-        # Sales Chart Data (Last 14 days)
-        from django.utils import timezone
-        from datetime import timedelta
-        from django.db.models.functions import TruncDay
-        
-        fourteen_days_ago = timezone.now() - timedelta(days=14)
-        sales_by_day = order_items.filter(order__created_at__gte=fourteen_days_ago)\
-            .annotate(day=TruncDay('order__created_at'))\
-            .values('day')\
-            .annotate(revenue=Sum('unit_price'))\
-            .order_by('day')
-            
-        sales_chart = []
-        # Fill in gaps with zeros
-        for i in range(15):
-            day = (fourteen_days_ago + timedelta(days=i)).date()
-            revenue = 0
-            for entry in sales_by_day:
-                if entry['day'].date() == day:
-                    revenue = entry['revenue']
-                    break
-            sales_chart.append({"date": day.strftime('%b %d'), "revenue": revenue})
 
-        # Top Products
-        from django.db.models import Count
-        top_products = order_items.values('product__name')\
-            .annotate(total_qty=Sum('quantity'), total_rev=Sum('unit_price'))\
-            .order_by('-total_qty')[:5]
+        from analytics.services import (
+            REVENUE_STATUSES, REVENUE_EXPR, parse_date_range, filter_by_range,
+            pct_change, revenue_core_metrics, daily_revenue_series,
+            seller_pnl_breakdown,
+        )
+
+        rng = parse_date_range(request)
+
+        # Realised sales only (paid/fulfilled orders), scoped to the window.
+        seller_items = OrderItem.objects.filter(
+            seller=seller, order__status__in=REVENUE_STATUSES
+        )
+        order_items = filter_by_range(seller_items, rng)
+
+        # Current-window headline metrics (revenue now correctly = price x qty).
+        current = revenue_core_metrics(order_items)
+        total_revenue = current['revenue']
+        total_items_sold = current['items_sold']
+        total_orders = current['orders']
+
+        # Period-over-period trends vs the immediately preceding equal window.
+        prev_items = filter_by_range(
+            seller_items, {'start': rng['prev_start'], 'end': rng['prev_end']}
+        )
+        previous = revenue_core_metrics(prev_items)
+        avg_order_value = (total_revenue / total_orders) if total_orders else 0
+        prev_aov = (previous['revenue'] / previous['orders']) if previous['orders'] else 0
+        trends = {
+            'revenue': pct_change(total_revenue, previous['revenue']),
+            'items_sold': pct_change(total_items_sold, previous['items_sold']),
+            'orders': pct_change(total_orders, previous['orders']),
+            'avg_order_value': pct_change(avg_order_value, prev_aov),
+        }
+
+        # Time-series + top movers for the window.
+        sales_chart = daily_revenue_series(order_items, rng)
+        top_products = list(
+            order_items.values('product__name')
+            .annotate(total_qty=Sum('quantity'), total_rev=REVENUE_EXPR)
+            .order_by('-total_rev')[:5]
+        )
+
+        # Net earnings (gross → fees/taxes → settlement) for the window.
+        net_earnings = seller_pnl_breakdown(order_items)
 
         # Product status counts — single query, drives tab badges on the seller dashboard
         product_counts = Product.objects.filter(seller=seller).aggregate(
@@ -77,11 +88,18 @@ class GrowerDashboardView(generics.GenericAPIView):
 
         metrics = {
             "product_counts": product_counts,
-            "total_revenue": total_revenue,
-            "total_orders": order_items.values('order').distinct().count(),
+            "total_revenue": round(total_revenue, 2),
+            "total_orders": total_orders,
             "total_items_sold": total_items_sold,
-            "pending_orders": order_items.filter(order__status='pending').values('order').distinct().count(),
+            "avg_order_value": round(avg_order_value, 2),
+            # Pending across ALL time (actionable queue, not window-scoped).
+            "pending_orders": OrderItem.objects.filter(
+                seller=seller, order__status='pending'
+            ).values('order').distinct().count(),
             "low_stock_variants": low_stock,
+            "trends": trends,
+            "net_earnings": net_earnings,
+            "date_range": {"label": rng['label']},
             "sales_chart": sales_chart,
             "top_products": top_products,
             "inventory_distribution": {
@@ -89,7 +107,7 @@ class GrowerDashboardView(generics.GenericAPIView):
                 "low_stock": low_stock,
                 "healthy": healthy_stock
             },
-            "recent_activity": order_items.order_by('-order__created_at')[:8].values(
+            "recent_activity": seller_items.order_by('-order__created_at')[:8].values(
                 'order__order_number', 'order__status', 'order__created_at', 'product__name', 'quantity'
             )
         }
@@ -241,6 +259,80 @@ class GrowerDashboardView(generics.GenericAPIView):
                 "username": seller.username
             }
         }, status=status.HTTP_200_OK)
+
+
+class SellerSalesReportCSVView(generics.GenericAPIView):
+    """Download a seller's sales / P&L report for a date range as CSV.
+
+    Same window semantics as the dashboard (?period= or ?start=&end=). Computed
+    synchronously from order data — one streamed file, no stored report.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request):
+        seller = request.user
+        if seller.role not in ('grower', 'admin'):
+            return Response({"error": "Access denied"}, status=403)
+
+        import csv
+        from django.http import HttpResponse
+        from analytics.services import (
+            REVENUE_STATUSES, parse_date_range, filter_by_range, seller_pnl_breakdown,
+        )
+
+        rng = parse_date_range(request)
+        items = filter_by_range(
+            OrderItem.objects.filter(seller=seller, order__status__in=REVENUE_STATUSES),
+            rng,
+        ).select_related('order', 'variant').order_by('order__created_at')
+
+        response = HttpResponse(content_type='text/csv')
+        fname = f"junglyst_sales_{(rng['label'] or 'report').replace(' ', '_').replace('–', 'to')}.csv"
+        response['Content-Disposition'] = f'attachment; filename="{fname}"'
+
+        writer = csv.writer(response)
+        writer.writerow([
+            'Order #', 'Date', 'Product', 'Qty', 'Unit Price (inc.)', 'Gross',
+            'Taxable Value', 'GST %', 'GST Amount', 'Platform Fee', 'Order Status',
+        ])
+        for it in items.iterator():
+            line = float(it.unit_price) * it.quantity
+            gst_rate = float(it.gst_percentage or 0)
+            comm_rate = float(it.variant.commission_rate) if it.variant else 10.0
+            factor = 1 + (gst_rate / 100) + (comm_rate / 100)
+            base = line / factor if factor else line
+            writer.writerow([
+                it.order.order_number,
+                it.order.created_at.strftime('%Y-%m-%d'),
+                it.product_name,
+                it.quantity,
+                round(float(it.unit_price), 2),
+                round(line, 2),
+                round(base, 2),
+                gst_rate,
+                round(base * gst_rate / 100, 2),
+                round(base * comm_rate / 100, 2),
+                it.order.status,
+            ])
+
+        # Summary footer (net settlement breakdown for the window).
+        pnl = seller_pnl_breakdown(
+            filter_by_range(
+                OrderItem.objects.filter(seller=seller, order__status__in=REVENUE_STATUSES), rng,
+            )
+        )
+        writer.writerow([])
+        writer.writerow(['Summary', rng['label']])
+        for label, key in [
+            ('Gross Sales', 'gross_sales'), ('Taxable Value', 'taxable_value'),
+            ('Total GST', 'total_gst'), ('Platform Fee', 'platform_fee'),
+            ('Platform Fee GST', 'platform_fee_gst'), ('TCS Deducted', 'tcs_deducted'),
+            ('TDS Deducted', 'tds_deducted'), ('Net Settlement', 'net_settlement'),
+        ]:
+            writer.writerow([label, pnl[key]])
+
+        return response
+
 
 class SellerStoreView(generics.RetrieveAPIView):
     permission_classes = (permissions.AllowAny,)

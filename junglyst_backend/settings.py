@@ -101,6 +101,7 @@ INSTALLED_APPS = [
     'analytics',
     'competition',
     'community',
+    'combos',
     'django_celery_results',
     'django_celery_beat',
 ]
@@ -147,6 +148,9 @@ JAZZMIN_UI_CONFIG = {
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
+    # API performance & error telemetry — no-op unless POSTHOG_API_KEY is set.
+    # Placed early so it measures the full request/response duration.
+    'core.middleware.PostHogAPIMetricsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -155,6 +159,19 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# PostHog — operational telemetry (API performance & error metrics).
+# Disabled (no events sent) unless POSTHOG_API_KEY is configured.
+POSTHOG_API_KEY = config('POSTHOG_API_KEY', default='')
+POSTHOG_HOST = config('POSTHOG_HOST', default='https://app.posthog.com')
+# Sampling for fast, successful requests (errors & slow requests always captured).
+POSTHOG_API_SAMPLE_RATE = config('POSTHOG_API_SAMPLE_RATE', default=1.0, cast=float)
+# Requests at/above this duration (ms) are always captured regardless of sampling.
+POSTHOG_API_SLOW_MS = config('POSTHOG_API_SLOW_MS', default=1000, cast=float)
+# Minimum log level forwarded to PostHog (see core.posthog_client.PostHogLoggingHandler).
+# ERROR captures errors + CRITICAL with full tracebacks (no WARNING/INFO noise).
+# API 4xx/5xx are captured separately by the middleware regardless of this level.
+POSTHOG_LOG_LEVEL = config('POSTHOG_LOG_LEVEL', default='ERROR')
 
 ROOT_URLCONF = 'junglyst_backend.urls'
 
@@ -443,33 +460,56 @@ LOGGING = {
             'filename': BASE_DIR / 'logs/debug.log',
             'formatter': 'verbose',
         },
+        # Forwards WARNING+ (config POSTHOG_LOG_LEVEL) records to PostHog.
+        # No-op unless POSTHOG_API_KEY is set.
+        'posthog': {
+            'class': 'core.posthog_client.PostHogLoggingHandler',
+            'level': POSTHOG_LOG_LEVEL,
+        },
+    },
+    # Root logger — catches every app not listed below (payments, notifications,
+    # combos, celery, etc.) so nothing slips past PostHog.
+    'root': {
+        'handlers': ['console', 'posthog'],
+        'level': 'WARNING',
     },
     'loggers': {
         'django': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console', 'file', 'posthog'],
             'level': config('DJANGO_LOG_LEVEL', default='INFO'),
             'propagate': True,
         },
+        # Django logs every unhandled 500 here with full exc_info → PostHog gets
+        # the traceback even when DRF converts the exception into a 500 response.
+        'django.request': {
+            'handlers': ['console', 'file', 'posthog'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
         'core': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console', 'file', 'posthog'],
             'level': 'DEBUG',
             'propagate': True,
         },
         'shipping': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console', 'file', 'posthog'],
             'level': 'DEBUG',
             'propagate': False,
         },
         'sellers': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console', 'file', 'posthog'],
             'level': 'DEBUG',
             'propagate': False,
         },
         'orders': {
-            'handlers': ['console', 'file'],
+            'handlers': ['console', 'file', 'posthog'],
             'level': 'DEBUG',
             'propagate': False,
         },
+        # PostHog SDK + its HTTP transport: never forward their own logs back to
+        # PostHog (the handler also skips these, this is belt-and-braces).
+        'posthog': {'handlers': ['console'], 'level': 'ERROR', 'propagate': False},
+        'urllib3': {'handlers': ['console'], 'level': 'ERROR', 'propagate': False},
     },
 }
 

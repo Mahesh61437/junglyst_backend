@@ -1,0 +1,7 @@
+from django.apps import AppConfig
+
+
+class CombosConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'combos'
+    verbose_name = 'Product Combos'

@@ -24,7 +24,7 @@ from payments.models import Payment
 from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payment
 from payments.models import PaymentGatewaySettings, PaymentGateway
 from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
-from .models import Order, OrderItem, SubOrder
+from .models import Order, OrderItem, SubOrder, SellerSettlement
 from .serializers import (
     OrderSerializer, OrderListSerializer, OrderDetailSerializer,
     SellerOrderSerializer, SellerSubOrderSerializer,
@@ -149,6 +149,9 @@ class CheckoutView(generics.GenericAPIView):
                     variant=variant,
                     quantity=qty,
                 ))
+        elif request.data.get('combos'):
+            # Combo-only checkout — no per-variant cart/items list.
+            cart_items = []
         else:
             return Response({"error": "cart_id or items is required"}, status=400)
 
@@ -198,10 +201,52 @@ class CheckoutView(generics.GenericAPIView):
         if cart_id and phantom:
             CartItem.objects.filter(id__in=[item.id for item in phantom]).delete()
         cart_items = [item for item in cart_items if item not in phantom]
-        if not cart_items:
+        # Empty is only an error when there are no combos to expand below
+        # (a combo-only checkout starts with an empty cart_items list).
+        if not cart_items and not request.data.get('combos'):
             return Response({"error": "Your cart is empty. Please add available products."}, status=400)
 
-        seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
+        # ── Combos: expand each into its in-stock component variants ──────────
+        # A combo can span more sellers than the 3-seller cap and carries ONE
+        # flat shipping fee (not the per-seller split). Its components still flow
+        # into the normal per-seller SubOrders below, so stock decrement, seller
+        # notifications and fulfillment all reuse the existing machinery.
+        combo_shipping_total = 0.0
+        combo_entries = request.data.get('combos') or []
+        if combo_entries:
+            from combos.models import Combo
+            for entry in combo_entries:
+                cid = entry.get('combo_id')
+                try:
+                    cqty = int(entry.get('quantity', 1))
+                except (TypeError, ValueError):
+                    cqty = 1
+                if not cid or cqty < 1:
+                    continue
+                try:
+                    combo = Combo.objects.filter(is_active=True, is_draft=False).prefetch_related(
+                        'items__variant__product__seller'
+                    ).get(id=cid)
+                except Combo.DoesNotExist:
+                    return Response({"error": "One of the combos is no longer available."}, status=400)
+                added_any = False
+                for ci in combo.items.all():
+                    v = ci.variant
+                    needed = ci.quantity * cqty
+                    if not v or v.stock < needed:
+                        continue  # skip out-of-stock components (partial availability)
+                    cart_items.append(SimpleNamespace(
+                        product=v.product, variant=v, quantity=needed,
+                        is_combo=True, combo_id=str(combo.id), combo_name=combo.name,
+                    ))
+                    added_any = True
+                if added_any:
+                    combo_shipping_total += float(combo.shipping_fee or 0)
+
+        if not cart_items:
+            return Response({"error": "All items are out of stock. Please add available products."}, status=400)
+
+        seller_buckets = {}  # seller_id → {seller, items, subtotal, ship_subtotal, has_heavy, has_light}
         for item in cart_items:
             # The buyer wants this item (qty >= 1) but stock can't fulfil it:
             # alert and block. Distinguish fully out of stock from a partial
@@ -213,26 +258,34 @@ class CheckoutView(generics.GenericAPIView):
                     msg = f"Only {item.variant.stock} unit(s) of {item.product.name} are available. Please update the quantity to continue."
                 return Response({"error": msg}, status=400)
 
+            is_combo = getattr(item, 'is_combo', False)
             sid = str(item.product.seller_id)
             if sid not in seller_buckets:
                 seller_buckets[sid] = {
                     'seller': item.product.seller,
                     'items': [],
                     'subtotal': 0,
+                    'ship_subtotal': 0,   # excludes combo items — combo ships flat
                     'has_heavy': False,
                     'has_light': False,
+                    'has_normal': False,  # has at least one non-combo item
                 }
             price = float(item.variant.price) * item.quantity
             seller_buckets[sid]['items'].append(item)
             seller_buckets[sid]['subtotal'] += price
+            if not is_combo:
+                seller_buckets[sid]['ship_subtotal'] += price
+                seller_buckets[sid]['has_normal'] = True
             # Track both light and heavy items to detect hybrid carts
             if item.variant.item_category == 'heavy':
                 seller_buckets[sid]['has_heavy'] = True
             elif item.variant.item_category == 'light':
                 seller_buckets[sid]['has_light'] = True
 
-        # SHIP-003: max 3 sellers
-        if len(seller_buckets) > 3:
+        # SHIP-003: max 3 sellers — combos are exempt, so only count sellers
+        # contributing standalone (non-combo) items toward the cap.
+        normal_seller_count = sum(1 for b in seller_buckets.values() if b['has_normal'])
+        if normal_seller_count > 3:
             return Response({"error": "Cart supports up to 3 sellers. Please remove items."}, status=400)
 
         # Shipping availability: snapshot each seller's next dispatch date.
@@ -286,11 +339,12 @@ class CheckoutView(generics.GenericAPIView):
             if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
-        # Master shipping = sum of per-seller fees (each seller has independent config)
+        # Master shipping = per-seller fees on standalone items (combo items
+        # excluded) + one flat fee per combo.
         total_shipping = sum(
-            _shipping_fee_for_seller(b['subtotal'], b['shipping_config'])
+            _shipping_fee_for_seller(b['ship_subtotal'], b['shipping_config']) if b['ship_subtotal'] > 0 else 0
             for b in seller_buckets.values()
-        )
+        ) + combo_shipping_total
         total_amount = subtotal + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
@@ -316,7 +370,10 @@ class CheckoutView(generics.GenericAPIView):
         dispatch_deadline = now + timedelta(hours=48)
 
         for idx, (sid, bucket) in enumerate(seller_buckets.items()):
-            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['shipping_config'])
+            seller_shipping = (
+                _shipping_fee_for_seller(bucket['ship_subtotal'], bucket['shipping_config'])
+                if bucket['ship_subtotal'] > 0 else 0
+            )
             promised_ship = bucket.get('next_shipping_date')
             promised_min = (promised_ship + timedelta(days=min_transit)) if promised_ship else None
             promised_max = (promised_ship + timedelta(days=max_transit)) if promised_ship else None
@@ -347,6 +404,8 @@ class CheckoutView(generics.GenericAPIView):
                     gst_percentage=gst_pct,
                     quantity=item.quantity,
                     seller=bucket['seller'],
+                    combo_id=getattr(item, 'combo_id', None),
+                    combo_name=getattr(item, 'combo_name', '') or '',
                 )
 
         active_gateway = PaymentGatewaySettings.get_solo().active_gateway
@@ -1404,6 +1463,16 @@ class UpdateSubOrderStatusView(APIView):
             sub_order.dispatch_deadline = sub_order.confirmed_at + timedelta(hours=48)
         sub_order.save()
 
+        # Auto-create settlement record when order is delivered
+        if new_status == 'delivered':
+            SellerSettlement.objects.get_or_create(
+                sub_order=sub_order,
+                defaults={
+                    'seller': sub_order.seller,
+                    'amount': sub_order.seller_total,
+                },
+            )
+
         awb = sub_order.awb_number or 'pending'
         notifs = []
 
@@ -1427,3 +1496,204 @@ class UpdateSubOrderStatusView(APIView):
             AppNotification.objects.bulk_create(notifs)
 
         return Response(SellerSubOrderSerializer(sub_order, context={'request': request}).data)
+
+
+# ── Seller Settlement Views ────────────────────────────────────────────────────
+
+class SettlementListView(APIView):
+    """
+    GET  /api/orders/settlements/          → pending settlements grouped by seller then week
+    POST /api/orders/settlements/<id>/settle/ → mark one settlement as settled
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request):
+        qs = (
+            SellerSettlement.objects
+            .filter(status='pending')
+            .select_related(
+                'sub_order__order',
+                'seller__seller_profile',
+            )
+            .order_by('seller_id', '-created_at')
+        )
+
+        # Group: seller → week → settlements
+        from collections import defaultdict
+        import datetime
+
+        sellers = {}
+        for s in qs:
+            sid = str(s.seller_id)
+            if sid not in sellers:
+                sp = getattr(s.seller, 'seller_profile', None)
+                sellers[sid] = {
+                    'seller_id': sid,
+                    'seller_name': sp.store_name if sp else s.seller.get_full_name() or s.seller.username,
+                    'seller_email': s.seller.email,
+                    'payout_type': sp.payout_type if sp else '',
+                    'payout_account': sp.payout_account if sp else '',
+                    'ifsc_code': sp.ifsc_code if sp else '',
+                    'account_holder_name': sp.account_holder_name if sp else '',
+                    'weeks': {},
+                    'total_pending': 0,
+                }
+
+            # ISO week label e.g. "2026-W20  (12 May – 18 May)"
+            dt = s.created_at
+            iso_year, iso_week, _ = dt.isocalendar()
+            week_start = dt - datetime.timedelta(days=dt.weekday())
+            week_end = week_start + datetime.timedelta(days=6)
+            week_key = f"{iso_year}-W{iso_week:02d}"
+            week_label = f"{week_start.day} {week_start.strftime('%b')} – {week_end.day} {week_end.strftime('%b %Y')}"
+
+            if week_key not in sellers[sid]['weeks']:
+                sellers[sid]['weeks'][week_key] = {
+                    'week_key': week_key,
+                    'week_label': week_label,
+                    'orders': [],
+                    'week_total': 0,
+                }
+
+            sellers[sid]['weeks'][week_key]['orders'].append({
+                'settlement_id': s.id,
+                'sub_order_id': str(s.sub_order_id),
+                'sub_order_number': s.sub_order.sub_order_number,
+                'order_number': s.sub_order.order.order_number,
+                'amount': str(s.amount),
+                'created_at': s.created_at.isoformat(),
+                'sub_order_status': s.sub_order.status,
+            })
+            sellers[sid]['weeks'][week_key]['week_total'] += float(s.amount)
+            sellers[sid]['total_pending'] += float(s.amount)
+
+        # Flatten weeks dict → sorted list
+        result = []
+        for seller in sellers.values():
+            seller['weeks'] = sorted(seller['weeks'].values(), key=lambda w: w['week_key'], reverse=True)
+            result.append(seller)
+
+        return Response(result)
+
+
+class SettlementMarkView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+
+    def post(self, request, pk):
+        try:
+            settlement = SellerSettlement.objects.get(pk=pk)
+        except SellerSettlement.DoesNotExist:
+            return Response({'detail': 'Not found.'}, status=404)
+
+        if settlement.status == 'completed':
+            return Response({'detail': 'Already settled.'}, status=400)
+
+        notes = request.data.get('notes', '')
+        settlement.mark_settled(request.user, notes=notes)
+        return Response({
+            'settlement_id': settlement.id,
+            'settled_at': settlement.settled_at.isoformat(),
+        })
+
+
+class SettlementBulkMarkView(APIView):
+    """Mark all unsettled settlements for a seller (optionally filtered by week) as settled."""
+    permission_classes = [permissions.IsAdminUser]
+
+    def post(self, request):
+        ids = request.data.get('ids', [])
+        if not ids:
+            return Response({'detail': 'No ids provided.'}, status=400)
+        qs = SellerSettlement.objects.filter(pk__in=ids, status='pending')
+        notes = request.data.get('notes', '')
+        count = 0
+        for s in qs:
+            s.mark_settled(request.user, notes=notes)
+            count += 1
+        return Response({'settled': count})
+
+
+# ── Admin Status Manager ───────────────────────────────────────────────────────
+
+class AdminSubOrderListView(APIView):
+    """
+    GET /api/orders/admin/sub-orders/
+    Returns all sub-orders with seller info for the admin status manager.
+    Supports ?search=<order_number|seller_name> and ?status=<value>
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request):
+        qs = SubOrder.objects.select_related(
+            'order', 'order__user', 'seller', 'seller__seller_profile'
+        ).order_by('-created_at')
+
+        search = request.query_params.get('search', '').strip()
+        status_filter = request.query_params.get('status', '').strip()
+
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(sub_order_number__icontains=search) |
+                Q(order__order_number__icontains=search) |
+                Q(seller__seller_profile__store_name__icontains=search)
+            )
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        data = []
+        for so in qs[:200]:
+            user = so.order.user
+            profile = getattr(so.seller, 'seller_profile', None)
+            seller_name = profile.store_name if profile else (so.seller.get_full_name() or so.seller.username)
+            data.append({
+                'sub_order_id': str(so.id),
+                'sub_order_number': so.sub_order_number,
+                'order_number': so.order.order_number,
+                'status': so.status,
+                'seller_name': seller_name,
+                'seller_total': str(so.seller_total),
+                'created_at': so.created_at.isoformat(),
+                'customer': user.phone or user.email if user else (so.order.guest_phone or so.order.guest_email or '—'),
+            })
+        return Response(data)
+
+
+class AdminSubOrderStatusView(APIView):
+    """
+    PATCH /api/orders/admin/sub-orders/<pk>/status/
+    Force-sets a sub-order to any valid status, bypassing normal transition rules.
+    Also auto-creates SellerSettlement when forced to delivered.
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def patch(self, request, pk):
+        try:
+            sub_order = SubOrder.objects.select_related('order', 'seller').get(id=pk)
+        except SubOrder.DoesNotExist:
+            return Response({'error': 'Sub-order not found'}, status=404)
+
+        new_status = request.data.get('status', '').strip()
+        all_statuses = [s[0] for s in SubOrder._meta.get_field('status').choices]
+        if not new_status or new_status not in all_statuses:
+            return Response({'error': f"Invalid status. Choose from: {all_statuses}"}, status=400)
+
+        old_status = sub_order.status
+        sub_order.status = new_status
+        if new_status == 'confirmed' and not sub_order.confirmed_at:
+            sub_order.confirmed_at = timezone.now()
+            sub_order.dispatch_deadline = sub_order.confirmed_at + timedelta(hours=48)
+        sub_order.save()
+
+        if new_status == 'delivered':
+            SellerSettlement.objects.get_or_create(
+                sub_order=sub_order,
+                defaults={'seller': sub_order.seller, 'amount': sub_order.seller_total},
+            )
+
+        return Response({
+            'sub_order_id': str(sub_order.id),
+            'sub_order_number': sub_order.sub_order_number,
+            'old_status': old_status,
+            'new_status': new_status,
+        })
