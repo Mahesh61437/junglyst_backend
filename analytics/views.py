@@ -88,6 +88,7 @@ class SuperAdminDashboardView(generics.GenericAPIView):
 
             all_orders.append({
                 'id': so.order.id,
+                'sub_order_id': so.id,
                 'order_number': so.sub_order_number,  # Use sub-order number
                 'total_amount': so.seller_total,
                 'status': so.status,

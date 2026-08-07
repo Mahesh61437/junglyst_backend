@@ -2,6 +2,7 @@ from django.db import models
 from core.models import User, Product, ProductVariant, SoftDeleteModel
 from django.utils.translation import gettext_lazy as _
 import uuid
+from django.utils import timezone
 
 class OrderStatus(models.TextChoices):
     PENDING = 'pending', _('Pending')           # order created, awaiting payment
@@ -127,3 +128,39 @@ class OrderItem(SoftDeleteModel):
 
     def __str__(self):
         return f"{self.product_name} x {self.quantity}"
+
+
+class SettlementStatus(models.TextChoices):
+    PENDING   = 'pending',   _('Pending')
+    COMPLETED = 'completed', _('Completed')
+
+
+class SellerSettlement(models.Model):
+    """Tracks whether a delivered sub-order's payout has been transferred to the seller."""
+    sub_order = models.OneToOneField(SubOrder, on_delete=models.CASCADE, related_name='settlement')
+    seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='settlements')
+    amount = models.DecimalField(max_digits=12, decimal_places=2)  # = sub_order.seller_total
+
+    status = models.CharField(max_length=10, choices=SettlementStatus.choices, default=SettlementStatus.PENDING)
+    settled_at = models.DateTimeField(null=True, blank=True)
+    settled_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='settlements_marked')
+    notes = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    @property
+    def is_settled(self):
+        return self.status == SettlementStatus.COMPLETED
+
+    def mark_settled(self, admin_user, notes=''):
+        self.status = SettlementStatus.COMPLETED
+        self.settled_at = timezone.now()
+        self.settled_by = admin_user
+        self.notes = notes
+        self.save()
+
+    def __str__(self):
+        return f"Settlement {self.sub_order.sub_order_number} [{self.status}]"
