@@ -1,8 +1,10 @@
+from datetime import datetime, timedelta
+
 from rest_framework import generics, permissions as drf_permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.core.cache import cache
-from django.db.models import Sum, Count, F, Value, DecimalField
+from django.db.models import Sum, Count, F, Q, Value, DecimalField
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from orders.models import Order, OrderItem
@@ -41,21 +43,52 @@ class SuperAdminDashboardView(generics.GenericAPIView):
     permission_classes = (IsAdminUser,)
 
     def get(self, request):
-        now = timezone.now()
-        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        
-        # Overall Analytics
-        orders_this_month = Order.objects.filter(created_at__gte=start_of_month)
-        total_revenue_month = orders_this_month.aggregate(total=Sum('total_amount'))['total'] or 0
-        total_orders_month = orders_this_month.count()
-        
+        from orders.models import SubOrder, SubOrderStatus, OrderStatus, PaymentStatus
+
+        rng = self._resolve_range(request)
+
+        # ── Overall analytics ────────────────────────────────────────────────
+        # Revenue counts only orders whose payment actually completed, and
+        # excludes cancelled/returned orders. Summing every order (including
+        # abandoned/failed checkouts) was inflating the figure.
+        orders_in_range = self._apply_range(Order.objects.all(), rng, 'created_at')
+        paid_orders = orders_in_range.filter(
+            payment_status=PaymentStatus.COMPLETED
+        ).exclude(status__in=[OrderStatus.CANCELLED, OrderStatus.RETURNED])
+
+        total_revenue_month = paid_orders.aggregate(total=Sum('total_amount'))['total'] or 0
+        total_orders_month = paid_orders.count()
+
+        unpaid_orders = orders_in_range.exclude(payment_status=PaymentStatus.COMPLETED)
+        unpaid_value = unpaid_orders.aggregate(total=Sum('total_amount'))['total'] or 0
+        unpaid_count = unpaid_orders.count()
+
         total_sellers = User.objects.filter(role__in=['grower', 'admin'], is_verified_seller=True).count()
         total_users = User.objects.exclude(role='admin').count()
 
-        # Seller Wise Analytics — single query with annotations instead of N+1 loop
+        # Seller Wise Analytics — single query with annotations instead of N+1 loop.
+        # Same rule as above: realised revenue only, within the selected window.
+        # Positive status list (rather than a negated Q) so the annotate filter
+        # stays a plain JOIN condition across the multi-valued order_items rel.
+        countable_statuses = [
+            s for s in OrderStatus.values
+            if s not in (OrderStatus.CANCELLED, OrderStatus.RETURNED)
+        ]
+        item_filter = (
+            Q(order_items__order__payment_status=PaymentStatus.COMPLETED)
+            & Q(order_items__order__status__in=countable_statuses)
+        )
+        if rng['start'] is not None:
+            item_filter &= Q(order_items__order__created_at__gte=rng['start'])
+        if rng['end'] is not None:
+            item_filter &= Q(order_items__order__created_at__lte=rng['end'])
+
         sellers = User.objects.filter(role__in=['grower', 'admin']).select_related('seller_profile').annotate(
-            seller_orders_count=Count('order_items__order', distinct=True),
-            seller_revenue=Coalesce(Sum(F('order_items__unit_price') * F('order_items__quantity')), Value(0, output_field=DecimalField())),
+            seller_orders_count=Count('order_items__order', distinct=True, filter=item_filter),
+            seller_revenue=Coalesce(
+                Sum(F('order_items__unit_price') * F('order_items__quantity'), filter=item_filter),
+                Value(0, output_field=DecimalField()),
+            ),
         )
         sellers_data = []
         for seller in sellers:
@@ -72,11 +105,17 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 'is_verified': seller.is_verified_seller,
             })
 
-        # Categorized Orders — prefetch payment and seller_profile to avoid N+1
-        from orders.models import SubOrder
-        all_sub_orders_qs = SubOrder.objects.select_related(
-            'order', 'order__user', 'order__payment', 'seller', 'seller__seller_profile'
-        ).all().order_by('-created_at')
+        # Orders — every sub-order in the window, no status is filtered out.
+        # Prefetch payment and seller_profile to avoid N+1.
+        all_sub_orders_qs = self._apply_range(
+            SubOrder.objects.select_related(
+                'order', 'order__user', 'order__payment', 'seller', 'seller__seller_profile'
+            ).all(),
+            rng, 'created_at',
+        ).order_by('-created_at')
+
+        status_labels = dict(SubOrderStatus.choices)
+        payment_labels = dict(PaymentStatus.choices)
 
         all_orders = []
         for so in all_sub_orders_qs:
@@ -90,8 +129,13 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 'id': so.order.id,
                 'sub_order_id': so.id,
                 'order_number': so.sub_order_number,  # Use sub-order number
+                'master_order_number': so.order.order_number,
                 'total_amount': so.seller_total,
                 'status': so.status,
+                'status_label': status_labels.get(so.status, so.status),
+                'order_status': so.order.status,
+                'payment_status': so.order.payment_status,
+                'payment_status_label': payment_labels.get(so.order.payment_status, so.order.payment_status),
                 'created_at': so.created_at,
                 'payment_gateway': so.order.payment_gateway or pg,
                 'guest_email': so.order.guest_email,
@@ -101,27 +145,99 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 'seller_name': seller_store,
                 'seller_contact': so.seller.phone or so.seller.email,
             })
-        
-        pending_orders = [o for o in all_orders if o['status'] in ['placed', 'confirmed', 'packing']]
-        transit_orders = [o for o in all_orders if o['status'] in ['shipped', 'in_transit', 'out_for_delivery']]
-        delivered_orders = [o for o in all_orders if o['status'] == 'delivered']
+
+        # Completed payments drive the main stream; everything else (pending,
+        # failed, refunded) is surfaced separately so it never skews the view.
+        paid_rows = [o for o in all_orders if o['payment_status'] == PaymentStatus.COMPLETED]
+        unpaid_rows = [o for o in all_orders if o['payment_status'] != PaymentStatus.COMPLETED]
+
+        status_counts = {value: 0 for value, _ in SubOrderStatus.choices}
+        for o in paid_rows:
+            status_counts[o['status']] = status_counts.get(o['status'], 0) + 1
 
         metrics = {
+            "date_range": {
+                "start": rng['start'],
+                "end": rng['end'],
+                "label": rng['label'],
+            },
             "overall_analytics": {
                 "revenue_this_month": total_revenue_month,
                 "orders_this_month": total_orders_month,
                 "total_sellers": total_sellers,
                 "total_users": total_users,
+                "unpaid_orders": unpaid_count,
+                "unpaid_value": unpaid_value,
             },
             "sellers": sellers_data,
+            "status_choices": [{"value": v, "label": l} for v, l in SubOrderStatus.choices],
+            "status_counts": status_counts,
             "orders": {
-                "pending": pending_orders,
-                "transit": transit_orders,
-                "delivered": delivered_orders
-            }
+                "all": paid_rows,
+                "unpaid": unpaid_rows,
+            },
         }
-        
+
         return Response(metrics)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_range(request):
+        """Reporting window for the dashboard.
+
+        Accepts ``?start=YYYY-MM-DD&end=YYYY-MM-DD`` or a named ``?period=`` of
+        ``7d``, ``30d``, ``90d``, ``this_month``, ``last_month``, ``ytd``,
+        ``all``. Defaults to the current month so the headline cards keep their
+        original meaning when no filter is applied.
+        """
+        now = timezone.now()
+        tz = timezone.get_current_timezone()
+        params = request.query_params
+        period = (params.get('period') or '').strip().lower()
+        start_str, end_str = params.get('start'), params.get('end')
+
+        def _aware(d, end_of_day=False):
+            t = datetime.combine(d, datetime.max.time() if end_of_day else datetime.min.time())
+            return timezone.make_aware(t, tz)
+
+        if start_str and end_str:
+            try:
+                s = datetime.strptime(start_str, '%Y-%m-%d').date()
+                e = datetime.strptime(end_str, '%Y-%m-%d').date()
+                return {
+                    'start': _aware(s), 'end': _aware(e, end_of_day=True),
+                    'label': f"{s.strftime('%d %b %Y')} – {e.strftime('%d %b %Y')}",
+                }
+            except ValueError:
+                pass  # malformed dates fall through to the default window
+
+        if period == 'all':
+            return {'start': None, 'end': None, 'label': 'All time'}
+        if period == 'last_month':
+            first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = first_this - timedelta(microseconds=1)
+            start = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            return {'start': start, 'end': end, 'label': start.strftime('%B %Y')}
+        if period == 'ytd':
+            start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+            return {'start': start, 'end': now, 'label': f'YTD {now.year}'}
+        if period in ('7d', '30d', '90d'):
+            days = int(period[:-1])
+            start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return {'start': start, 'end': now, 'label': f'Last {days} days'}
+
+        # 'this_month' and anything unrecognised
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return {'start': start, 'end': now, 'label': now.strftime('%B %Y')}
+
+    @staticmethod
+    def _apply_range(qs, rng, field):
+        if rng.get('start') is not None:
+            qs = qs.filter(**{f'{field}__gte': rng['start']})
+        if rng.get('end') is not None:
+            qs = qs.filter(**{f'{field}__lte': rng['end']})
+        return qs
 
 class GSTDashboardView(APIView):
     permission_classes = (IsAdminUser,)
