@@ -5,6 +5,7 @@ logger = logging.getLogger(__name__)
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db import models
 from django.db.models import Prefetch
@@ -30,7 +31,9 @@ from .serializers import (
     SellerOrderSerializer, SellerSubOrderSerializer,
     OrderSuccessSerializer, OrderTrackingSerializer)
 from .email_utils import send_order_confirmation_emails
-from .tasks import send_order_confirmation_emails_task, create_order_notifications_task, clear_buyer_cart_task
+from .tasks import (
+    send_order_confirmation_emails_task, create_order_notifications_task,
+    clear_buyer_cart_task, clear_ordered_cart_items)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -97,9 +100,7 @@ def _finalize_order(order, payment=None, payment_data=None):
         if seller_notifs:
             AppNotification.objects.bulk_create(seller_notifs)
 
-        Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
-        from cart.models import CartItem
-        CartItem.objects.filter(cart__user=order.user).delete()
+        clear_ordered_cart_items(order)
 
     for item in order.items.all():
         if item.variant:
@@ -116,6 +117,7 @@ class CheckoutView(generics.GenericAPIView):
         address_id = request.data.get('address_id')
         guest_info = request.data.get('guest_info')
         raw_items = request.data.get('items')   # guest itemized checkout (no cart)
+        item_ids = request.data.get('item_ids')  # explicit row selection within cart_id
         pincode = request.data.get('pincode', '')
 
         # ── Resolve cart items ──────────────────────────────────────────────
@@ -126,9 +128,31 @@ class CheckoutView(generics.GenericAPIView):
                 return Response({"error": "Cart not found"}, status=404)
             if not cart_obj.items.exists():
                 return Response({"error": "Cart is empty"}, status=400)
-            cart_items = list(cart_obj.items.select_related(
+            items_qs = cart_obj.items.select_related(
                 'product', 'product__seller', 'variant'
-            ).prefetch_related('product__categories').all())
+            ).prefetch_related('product__categories')
+            # `item_ids` is the set of rows the buyer actually confirmed at
+            # checkout. Rows outside it are not part of this order and must not
+            # be inspected at all — otherwise a row the UI excluded (out of
+            # stock, or a quantity stock can no longer fulfil) rejects the whole
+            # cart with a 400 the buyer has no way to act on. Prices, quantities
+            # and stock still come from the DB; the client only chooses which of
+            # its own rows to buy. Totals and per-seller shipping slabs are then
+            # computed over exactly this set, further down.
+            if item_ids is not None:
+                if not isinstance(item_ids, list) or len(item_ids) == 0:
+                    return Response({"error": "item_ids must be a non-empty list"}, status=400)
+                # Coerce through the model's own pk field rather than assuming a
+                # type, so this keeps working if CartItem's pk ever changes.
+                pk_field = CartItem._meta.pk
+                try:
+                    selected = [pk_field.to_python(i) for i in item_ids]
+                except (DjangoValidationError, ValueError, TypeError):
+                    return Response({"error": "item_ids must be valid item IDs"}, status=400)
+                items_qs = items_qs.filter(id__in=selected)
+            cart_items = list(items_qs.all())
+            if not cart_items:
+                return Response({"error": "None of the selected items are still in your cart."}, status=400)
         elif raw_items:
             if not isinstance(raw_items, list) or len(raw_items) == 0:
                 return Response({"error": "Items list is empty"}, status=400)
@@ -149,6 +173,9 @@ class CheckoutView(generics.GenericAPIView):
                     variant=variant,
                     quantity=qty,
                 ))
+        elif request.data.get('combos'):
+            # Combo-only checkout — no per-variant cart/items list.
+            cart_items = []
         else:
             return Response({"error": "cart_id or items is required"}, status=400)
 
@@ -198,10 +225,52 @@ class CheckoutView(generics.GenericAPIView):
         if cart_id and phantom:
             CartItem.objects.filter(id__in=[item.id for item in phantom]).delete()
         cart_items = [item for item in cart_items if item not in phantom]
-        if not cart_items:
+        # Empty is only an error when there are no combos to expand below
+        # (a combo-only checkout starts with an empty cart_items list).
+        if not cart_items and not request.data.get('combos'):
             return Response({"error": "Your cart is empty. Please add available products."}, status=400)
 
-        seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
+        # ── Combos: expand each into its in-stock component variants ──────────
+        # A combo can span more sellers than the 3-seller cap and carries ONE
+        # flat shipping fee (not the per-seller split). Its components still flow
+        # into the normal per-seller SubOrders below, so stock decrement, seller
+        # notifications and fulfillment all reuse the existing machinery.
+        combo_shipping_total = 0.0
+        combo_entries = request.data.get('combos') or []
+        if combo_entries:
+            from combos.models import Combo
+            for entry in combo_entries:
+                cid = entry.get('combo_id')
+                try:
+                    cqty = int(entry.get('quantity', 1))
+                except (TypeError, ValueError):
+                    cqty = 1
+                if not cid or cqty < 1:
+                    continue
+                try:
+                    combo = Combo.objects.filter(is_active=True, is_draft=False).prefetch_related(
+                        'items__variant__product__seller'
+                    ).get(id=cid)
+                except Combo.DoesNotExist:
+                    return Response({"error": "One of the combos is no longer available."}, status=400)
+                added_any = False
+                for ci in combo.items.all():
+                    v = ci.variant
+                    needed = ci.quantity * cqty
+                    if not v or v.stock < needed:
+                        continue  # skip out-of-stock components (partial availability)
+                    cart_items.append(SimpleNamespace(
+                        product=v.product, variant=v, quantity=needed,
+                        is_combo=True, combo_id=str(combo.id), combo_name=combo.name,
+                    ))
+                    added_any = True
+                if added_any:
+                    combo_shipping_total += float(combo.shipping_fee or 0)
+
+        if not cart_items:
+            return Response({"error": "All items are out of stock. Please add available products."}, status=400)
+
+        seller_buckets = {}  # seller_id → {seller, items, subtotal, ship_subtotal, has_heavy, has_light}
         for item in cart_items:
             # The buyer wants this item (qty >= 1) but stock can't fulfil it:
             # alert and block. Distinguish fully out of stock from a partial
@@ -213,26 +282,34 @@ class CheckoutView(generics.GenericAPIView):
                     msg = f"Only {item.variant.stock} unit(s) of {item.product.name} are available. Please update the quantity to continue."
                 return Response({"error": msg}, status=400)
 
+            is_combo = getattr(item, 'is_combo', False)
             sid = str(item.product.seller_id)
             if sid not in seller_buckets:
                 seller_buckets[sid] = {
                     'seller': item.product.seller,
                     'items': [],
                     'subtotal': 0,
+                    'ship_subtotal': 0,   # excludes combo items — combo ships flat
                     'has_heavy': False,
                     'has_light': False,
+                    'has_normal': False,  # has at least one non-combo item
                 }
             price = float(item.variant.price) * item.quantity
             seller_buckets[sid]['items'].append(item)
             seller_buckets[sid]['subtotal'] += price
+            if not is_combo:
+                seller_buckets[sid]['ship_subtotal'] += price
+                seller_buckets[sid]['has_normal'] = True
             # Track both light and heavy items to detect hybrid carts
             if item.variant.item_category == 'heavy':
                 seller_buckets[sid]['has_heavy'] = True
             elif item.variant.item_category == 'light':
                 seller_buckets[sid]['has_light'] = True
 
-        # SHIP-003: max 3 sellers
-        if len(seller_buckets) > 3:
+        # SHIP-003: max 3 sellers — combos are exempt, so only count sellers
+        # contributing standalone (non-combo) items toward the cap.
+        normal_seller_count = sum(1 for b in seller_buckets.values() if b['has_normal'])
+        if normal_seller_count > 3:
             return Response({"error": "Cart supports up to 3 sellers. Please remove items."}, status=400)
 
         # Shipping availability: snapshot each seller's next dispatch date.
@@ -286,11 +363,12 @@ class CheckoutView(generics.GenericAPIView):
             if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
-        # Master shipping = sum of per-seller fees (each seller has independent config)
+        # Master shipping = per-seller fees on standalone items (combo items
+        # excluded) + one flat fee per combo.
         total_shipping = sum(
-            _shipping_fee_for_seller(b['subtotal'], b['shipping_config'])
+            _shipping_fee_for_seller(b['ship_subtotal'], b['shipping_config']) if b['ship_subtotal'] > 0 else 0
             for b in seller_buckets.values()
-        )
+        ) + combo_shipping_total
         total_amount = subtotal + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
@@ -316,7 +394,10 @@ class CheckoutView(generics.GenericAPIView):
         dispatch_deadline = now + timedelta(hours=48)
 
         for idx, (sid, bucket) in enumerate(seller_buckets.items()):
-            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['shipping_config'])
+            seller_shipping = (
+                _shipping_fee_for_seller(bucket['ship_subtotal'], bucket['shipping_config'])
+                if bucket['ship_subtotal'] > 0 else 0
+            )
             promised_ship = bucket.get('next_shipping_date')
             promised_min = (promised_ship + timedelta(days=min_transit)) if promised_ship else None
             promised_max = (promised_ship + timedelta(days=max_transit)) if promised_ship else None
@@ -347,6 +428,8 @@ class CheckoutView(generics.GenericAPIView):
                     gst_percentage=gst_pct,
                     quantity=item.quantity,
                     seller=bucket['seller'],
+                    combo_id=getattr(item, 'combo_id', None),
+                    combo_name=getattr(item, 'combo_name', '') or '',
                 )
 
         active_gateway = PaymentGatewaySettings.get_solo().active_gateway
@@ -514,8 +597,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    from cart.models import CartItem
-                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
+                    clear_ordered_cart_items(order)
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -596,8 +678,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    from cart.models import CartItem
-                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
+                    clear_ordered_cart_items(order)
 
                 return Response({
                     "message": "Payment verified and order placed",

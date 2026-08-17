@@ -12,7 +12,8 @@ class OrderItemListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = OrderItem
-        fields = ('id', 'product_name', 'variant_name', 'unit_price', 'quantity', 'product_image')
+        fields = ('id', 'product_name', 'variant_name', 'unit_price', 'quantity', 'product_image',
+                  'combo_id', 'combo_name')
 
     def get_product_image(self, obj):
         if not obj.product:
@@ -32,6 +33,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'product', 'variant', 'product_name', 'variant_name',
             'unit_price', 'gst_percentage', 'quantity', 'seller', 'product_image',
+            'combo_id', 'combo_name',
         )
 
     def get_product_image(self, obj):
@@ -347,6 +349,8 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
                 'quantity': item.quantity,
                 'unit_price': float(item.unit_price),
                 'product_image': self._get_product_image_cached(item),
+                'combo_id': str(item.combo_id) if item.combo_id else None,
+                'combo_name': item.combo_name or '',
             }
             for item in obj.items.all()
         ]
@@ -362,6 +366,8 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
                     'quantity': item.quantity,
                     'unit_price': float(item.unit_price),
                     'product_image': self._get_product_image_cached(item),
+                    'combo_id': str(item.combo_id) if item.combo_id else None,
+                    'combo_name': item.combo_name or '',
                 }
                 for item in so.items.all()
             ]

@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django import forms
-from .models import User, Category, SubCategory, CategoryShippingRate, Tag, Product, ProductVariant, ProductImage, Configuration
+from .models import User, Category, SubCategory, CategoryShippingRate, Tag, CategoryComplement, Product, ProductVariant, ProductImage, Configuration
 
 
 # ── Custom Forms ────────────────────────────────────────────────────────────
@@ -39,6 +39,17 @@ class UserAdmin(admin.ModelAdmin):
         ('Timestamps', {'fields': ('last_login', 'date_joined')}),
     )
     readonly_fields = ('last_login', 'date_joined')
+
+
+@admin.register(CategoryComplement)
+class CategoryComplementAdmin(admin.ModelAdmin):
+    list_display = ('source_category', 'priority', 'get_targets')
+    list_editable = ('priority',)
+    filter_horizontal = ('target_categories',)
+
+    def get_targets(self, obj):
+        return ", ".join(tc.name for tc in obj.target_categories.all())
+    get_targets.short_description = 'Recommends from'
 
 
 class ShippingRateInline(admin.TabularInline):
