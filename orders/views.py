@@ -5,6 +5,7 @@ logger = logging.getLogger(__name__)
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db import models
 from django.db.models import Prefetch
@@ -30,7 +31,9 @@ from .serializers import (
     SellerOrderSerializer, SellerSubOrderSerializer,
     OrderSuccessSerializer, OrderTrackingSerializer)
 from .email_utils import send_order_confirmation_emails
-from .tasks import send_order_confirmation_emails_task, create_order_notifications_task, clear_buyer_cart_task
+from .tasks import (
+    send_order_confirmation_emails_task, create_order_notifications_task,
+    clear_buyer_cart_task, clear_ordered_cart_items)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -97,9 +100,7 @@ def _finalize_order(order, payment=None, payment_data=None):
         if seller_notifs:
             AppNotification.objects.bulk_create(seller_notifs)
 
-        Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
-        from cart.models import CartItem
-        CartItem.objects.filter(cart__user=order.user).delete()
+        clear_ordered_cart_items(order)
 
     for item in order.items.all():
         if item.variant:
@@ -116,6 +117,7 @@ class CheckoutView(generics.GenericAPIView):
         address_id = request.data.get('address_id')
         guest_info = request.data.get('guest_info')
         raw_items = request.data.get('items')   # guest itemized checkout (no cart)
+        item_ids = request.data.get('item_ids')  # explicit row selection within cart_id
         pincode = request.data.get('pincode', '')
 
         # ── Resolve cart items ──────────────────────────────────────────────
@@ -126,9 +128,31 @@ class CheckoutView(generics.GenericAPIView):
                 return Response({"error": "Cart not found"}, status=404)
             if not cart_obj.items.exists():
                 return Response({"error": "Cart is empty"}, status=400)
-            cart_items = list(cart_obj.items.select_related(
+            items_qs = cart_obj.items.select_related(
                 'product', 'product__seller', 'variant'
-            ).prefetch_related('product__categories').all())
+            ).prefetch_related('product__categories')
+            # `item_ids` is the set of rows the buyer actually confirmed at
+            # checkout. Rows outside it are not part of this order and must not
+            # be inspected at all — otherwise a row the UI excluded (out of
+            # stock, or a quantity stock can no longer fulfil) rejects the whole
+            # cart with a 400 the buyer has no way to act on. Prices, quantities
+            # and stock still come from the DB; the client only chooses which of
+            # its own rows to buy. Totals and per-seller shipping slabs are then
+            # computed over exactly this set, further down.
+            if item_ids is not None:
+                if not isinstance(item_ids, list) or len(item_ids) == 0:
+                    return Response({"error": "item_ids must be a non-empty list"}, status=400)
+                # Coerce through the model's own pk field rather than assuming a
+                # type, so this keeps working if CartItem's pk ever changes.
+                pk_field = CartItem._meta.pk
+                try:
+                    selected = [pk_field.to_python(i) for i in item_ids]
+                except (DjangoValidationError, ValueError, TypeError):
+                    return Response({"error": "item_ids must be valid item IDs"}, status=400)
+                items_qs = items_qs.filter(id__in=selected)
+            cart_items = list(items_qs.all())
+            if not cart_items:
+                return Response({"error": "None of the selected items are still in your cart."}, status=400)
         elif raw_items:
             if not isinstance(raw_items, list) or len(raw_items) == 0:
                 return Response({"error": "Items list is empty"}, status=400)
@@ -514,8 +538,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    from cart.models import CartItem
-                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
+                    clear_ordered_cart_items(order)
 
                 return Response({
                     "message": "Payment verified and order placed",
@@ -596,8 +619,7 @@ class VerifyPaymentView(generics.GenericAPIView):
                 create_order_notifications_task.delay(str(order.id))
                 send_order_confirmation_emails_task.delay(str(order.id))
                 if order.user_id:
-                    from cart.models import CartItem
-                    CartItem.objects.filter(cart__user_id=order.user_id).delete()
+                    clear_ordered_cart_items(order)
 
                 return Response({
                     "message": "Payment verified and order placed",

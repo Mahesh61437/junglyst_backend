@@ -147,8 +147,8 @@ class CashfreeWebhookView(APIView):
                             )
 
                 if order.user:
-                    Cart.objects.filter(user=order.user).update(updated_at=timezone.now())
-                    CartItem.objects.filter(cart__user=order.user).delete()
+                    from orders.tasks import clear_ordered_cart_items
+                    clear_ordered_cart_items(order)
 
                 order_number = order.order_number
 
