@@ -785,3 +785,131 @@ class OrderLifecycleTest(TestCase):
         # Restore
         self.fx["variant"].stock = 10
         self.fx["variant"].save()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 8 — PARTIAL CHECKOUT (item_ids selection)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _add_second_cart_item(self, stock=0, quantity=1):
+        """Add a second seller-owned product to the buyer's cart."""
+        product = Product.objects.create(
+            name="Philodendron Pink Princess",
+            seller=self.fx["seller"],
+            is_active=True,
+            is_draft=False,
+        )
+        product.categories.add(Category.objects.first())
+        variant = ProductVariant.objects.create(
+            product=product,
+            name="Standard",
+            base_price=Decimal("800.00"),
+            price=Decimal("1200.00"),
+            stock=stock,
+            weight=Decimal("0.5"),
+            length=Decimal("20.0"),
+            width=Decimal("15.0"),
+            height=Decimal("25.0"),
+            packed_weight_grams=600,
+        )
+        return CartItem.objects.create(
+            cart=self.fx["cart"], product=product, variant=variant, quantity=quantity,
+        )
+
+    @patch("orders.views.create_razorpay_order", return_value=FAKE_RAZORPAY_ORDER)
+    @patch("payments.tasks.schedule_payment_checks")
+    def test_18_item_ids_excludes_unfulfillable_row(self, mock_schedule, mock_rzp):
+        """A row left out of item_ids must not block checkout, even when its
+        stock could never be fulfilled. Without the selection the same cart 400s
+        (test_17) and the buyer has no way to proceed."""
+        stale = self._add_second_cart_item(stock=0, quantity=1)
+        good = CartItem.objects.get(cart=self.fx["cart"], variant=self.fx["variant"])
+
+        resp = self.client.post("/api/orders/checkout/", {
+            "cart_id": str(self.fx["cart"].id),
+            "address_id": str(self.fx["address"].id),
+            "item_ids": [str(good.id)],
+        }, format="json")
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+
+        # The order covers only the selected row — the stale one is untouched.
+        order = Order.objects.get(id=resp.data["order"]["id"])
+        self.assertEqual(
+            list(order.items.values_list("variant_id", flat=True)),
+            [self.fx["variant"].id],
+        )
+        self.assertTrue(CartItem.objects.filter(id=stale.id).exists())
+
+        # Totals are computed over the selection only, not the whole cart.
+        # (variant.price is derived from base_price + commission on save, so read
+        # it back rather than hardcoding the figure passed to the fixture.)
+        good.variant.refresh_from_db()
+        self.assertEqual(order.subtotal, good.variant.price * good.quantity)
+        self.assertEqual(order.total_amount, order.subtotal + order.shipping_fee)
+
+    @patch("orders.views.create_razorpay_order", return_value=FAKE_RAZORPAY_ORDER)
+    @patch("orders.views.verify_razorpay_signature", return_value=True)
+    @patch("payments.tasks.schedule_payment_checks")
+    def test_19_payment_clears_only_ordered_cart_rows(self, mock_schedule, mock_verify, mock_rzp):
+        """Paying for a partial cart must not wipe the rows that weren't ordered
+        — checkout tells the buyer those stay in their cart."""
+        stale = self._add_second_cart_item(stock=0, quantity=1)
+        good = CartItem.objects.get(cart=self.fx["cart"], variant=self.fx["variant"])
+
+        resp = self.client.post("/api/orders/checkout/", {
+            "cart_id": str(self.fx["cart"].id),
+            "address_id": str(self.fx["address"].id),
+            "item_ids": [str(good.id)],
+        }, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+
+        verify = self.client.post("/api/orders/checkout/verify/", {
+            "gateway": "razorpay",
+            "razorpay_order_id": FAKE_RAZORPAY_ORDER["id"],
+            "razorpay_payment_id": FAKE_RAZORPAY_PAYMENT_ID,
+            "razorpay_signature": FAKE_RAZORPAY_SIGNATURE,
+        }, format="json")
+        self.assertEqual(verify.status_code, status.HTTP_200_OK, verify.data)
+
+        # Ordered row gone, unordered row survives.
+        self.assertFalse(CartItem.objects.filter(id=good.id).exists())
+        self.assertTrue(CartItem.objects.filter(id=stale.id).exists())
+
+    @patch("orders.views.create_razorpay_order", return_value=FAKE_RAZORPAY_ORDER)
+    @patch("payments.tasks.schedule_payment_checks")
+    def test_20_item_ids_cannot_reach_another_cart(self, mock_schedule, mock_rzp):
+        """item_ids is filtered through cart_id, so IDs from elsewhere resolve to
+        nothing rather than being ordered."""
+        other_buyer = User.objects.create_user(
+            email="other-buyer@test.com", username="otherbuyer",
+            password="Pass@123", role="collector",
+        )
+        other_cart = Cart.objects.create(user=other_buyer)
+        foreign = CartItem.objects.create(
+            cart=other_cart, product=self.fx["product"],
+            variant=self.fx["variant"], quantity=1,
+        )
+
+        resp = self.client.post("/api/orders/checkout/", {
+            "cart_id": str(self.fx["cart"].id),
+            "address_id": str(self.fx["address"].id),
+            "item_ids": [str(foreign.id)],
+        }, format="json")
+
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertFalse(Order.objects.filter(user=self.fx["buyer"]).exists())
+        self.assertTrue(CartItem.objects.filter(id=foreign.id).exists())
+
+    @patch("orders.views.create_razorpay_order", return_value=FAKE_RAZORPAY_ORDER)
+    @patch("payments.tasks.schedule_payment_checks")
+    def test_21_malformed_item_ids_rejected(self, mock_schedule, mock_rzp):
+        """Garbage in item_ids must be refused outright, not silently ignored
+        (which would fall back to ordering the whole cart)."""
+        for bad in ([], "not-a-list", ["not-a-uuid"]):
+            resp = self.client.post("/api/orders/checkout/", {
+                "cart_id": str(self.fx["cart"].id),
+                "address_id": str(self.fx["address"].id),
+                "item_ids": bad,
+            }, format="json")
+            self.assertEqual(resp.status_code, 400, f"{bad!r} → {resp.data}")
+            self.assertFalse(Order.objects.filter(user=self.fx["buyer"]).exists())

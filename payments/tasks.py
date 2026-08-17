@@ -276,7 +276,7 @@ def _capture_payment(payment, gateway_payment_id=None, gateway_data=None):
     create_order_notifications_task.delay(str(order.id))
     send_order_confirmation_emails_task.delay(str(order.id))
     if order.user_id:
-        clear_buyer_cart_task.delay(str(order.user_id))
+        clear_buyer_cart_task.delay(str(order.user_id), str(order.id))
 
     logger.info("Reconcile: captured order %s via %s", order_number, payment.gateway)
 

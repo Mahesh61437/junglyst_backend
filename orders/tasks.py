@@ -53,11 +53,41 @@ def create_order_notifications_task(order_id):
         logger.error("Notification task failed for order %s: %s", order_id, exc)
 
 
-@shared_task(name='orders.tasks.clear_buyer_cart_task')
-def clear_buyer_cart_task(user_id):
+def clear_ordered_cart_items(order):
+    """Remove only the rows this order actually covered.
+
+    An order no longer necessarily spans the whole cart: checkout can exclude
+    items stock couldn't fulfil, and the buyer is told those stay in their cart.
+    Wiping the cart wholesale would silently discard them. Falls back to a full
+    clear only when the order has no resolvable variants.
+    """
     from cart.models import Cart, CartItem
     from django.utils import timezone
+
+    if not order.user_id:
+        return
+    Cart.objects.filter(user_id=order.user_id).update(updated_at=timezone.now())
+    ordered_variant_ids = [
+        vid for vid in order.items.values_list('variant_id', flat=True) if vid
+    ]
+    rows = CartItem.objects.filter(cart__user_id=order.user_id)
+    if ordered_variant_ids:
+        rows = rows.filter(variant_id__in=ordered_variant_ids)
+    rows.delete()
+
+
+@shared_task(name='orders.tasks.clear_buyer_cart_task')
+def clear_buyer_cart_task(user_id, order_id=None):
+    from cart.models import Cart, CartItem
+    from django.utils import timezone
+    from .models import Order
     try:
+        if order_id:
+            order = Order.objects.filter(id=order_id).first()
+            if order:
+                clear_ordered_cart_items(order)
+                logger.info("Ordered cart rows cleared for user %s (order %s)", user_id, order_id)
+                return
         Cart.objects.filter(user_id=user_id).update(updated_at=timezone.now())
         CartItem.objects.filter(cart__user_id=user_id).delete()
         logger.info("Cart cleared for user %s", user_id)
