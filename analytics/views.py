@@ -399,8 +399,6 @@ class ClearCacheView(APIView):
 
 from decimal import Decimal
 
-_SYNC_CACHE_PREFIX = 'stock_sync:pending:'
-
 _LAST_SYNCED_KEY = 'stock_sync:last_synced:{source}'
 
 
@@ -514,9 +512,12 @@ class StockSyncApplyView(APIView):
         if not session_key:
             return Response({'error': 'session_key is required'}, status=400)
 
-        pending = cache.get(f'{_SYNC_CACHE_PREFIX}{session_key}')
-        if pending is None:
-            return Response({'error': 'Session expired or not found. Run preview again.'}, status=404)
+        from analytics.sync_utils import _load_session
+
+        session = _load_session(session_key)
+        if session is None:
+            return Response({'error': 'Sync session not found. Run preview again.'}, status=404)
+        pending = session.price_changes or {}
 
         from core.models import User
 
@@ -535,6 +536,20 @@ class StockSyncApplyView(APIView):
                 continue
             try:
                 variant = ProductVariant.objects.select_related('product__seller').get(id=vid)
+
+                # The preview is a snapshot. Sessions are durable now, so an admin
+                # can approve one hours or days after it was taken — by which point
+                # someone may have repriced the variant by hand. Only write if the
+                # price is still what the preview showed the admin, otherwise this
+                # would silently clobber the newer value.
+                old_base = change.get('old_base')
+                if old_base is not None and abs(variant.base_price - Decimal(str(old_base))) >= Decimal('0.01'):
+                    errors.append(
+                        f'{vid}: base price changed since preview '
+                        f'(now {variant.base_price}, preview saw {old_base}) — run preview again'
+                    )
+                    continue
+
                 variant.base_price = Decimal(str(change['new_base']))
 
                 # Update the seller's commission rate if the sync specified one and it differs.
@@ -557,7 +572,13 @@ class StockSyncApplyView(APIView):
 
         if applied > 0:
             invalidate_feed_cache()
-            cache.delete(f'{_SYNC_CACHE_PREFIX}{session_key}')
+            # Drop only what was applied. The session itself stays alive so the
+            # new-product imports from the same preview keep working — deleting
+            # it here is what used to strand the rest of the run.
+            for vid in approved_ids:
+                pending.pop(vid, None)
+            session.price_changes = pending
+            session.save(update_fields=['price_changes'])
 
         return Response({'applied': applied, 'errors': errors})
 

@@ -24,8 +24,18 @@ def _invalidate_product_detail_cache(product_id, slug=None):
 @receiver([post_save, post_delete], sender=Category)
 @receiver([post_save, post_delete], sender=SubCategory)
 def clear_api_cache(sender, **kwargs):
-    """Clear cached API responses whenever catalogue data changes."""
-    cache.clear()
+    """
+    Catalogue data changed → drop the shop feed so ordering is recomputed.
+
+    This used to be a bare cache.clear(). On django_redis that is a FLUSHDB of
+    the whole database, not just the catalogue keys — so saving a single Product
+    also destroyed unrelated state, including in-progress stock-sync sessions.
+    invalidate_feed_cache() bumps the version stamp every filtered and sorted
+    feed key is built from, so it expires all of them without touching anything
+    else. Product detail caches have their own receivers below.
+    """
+    from .feed import invalidate_feed_cache
+    invalidate_feed_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +68,7 @@ def image_detail_invalidate(sender, instance, **kwargs):
 def product_feed_invalidate(sender, instance, **kwargs):
     """
     Product published, archived, or deleted → feed order may change.
-    cache.clear() above already removes the feed key, but we also
+    clear_api_cache above already drops the feed key, but we also
     pre-warm the cache via Celery so the next user doesn't wait.
     """
     from .tasks import rebuild_feed_cache

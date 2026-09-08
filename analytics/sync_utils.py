@@ -111,6 +111,32 @@ _DELIST_ENABLED = {
 }
 
 
+# Preview sessions are kept for a day. Purging is opportunistic — it runs when a
+# new preview is taken, which is also the only time the table grows. An older row
+# that has not been purged yet still works; correctness does not rest on this
+# window but on the old_base check in StockSyncApplyView, which refuses any write
+# that would clobber a value changed since the preview.
+_SESSION_RETENTION_DAYS = 1
+
+
+def _load_session(session_key: str):
+    """Fetch a sync session by key, tolerating a malformed or unknown key."""
+    from analytics.models import StockSyncSession
+    try:
+        return StockSyncSession.objects.get(key=session_key)
+    except (StockSyncSession.DoesNotExist, ValueError, TypeError):
+        return None
+
+
+def _purge_stale_sessions():
+    """Drop sessions older than the retention window. Returns Django's delete() tuple."""
+    from datetime import timedelta
+    from django.utils import timezone
+    from analytics.models import StockSyncSession
+    cutoff = timezone.now() - timedelta(days=_SESSION_RETENTION_DAYS)
+    return StockSyncSession.objects.filter(created_at__lt=cutoff).delete()
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _q(val) -> Decimal:
@@ -301,10 +327,9 @@ def compute_diff(
     - Returns price_changes list for admin approval.
     - Returns a session_key stored in cache for the apply step.
     """
-    import uuid as _uuid
-    from django.core.cache import cache
     from core.models import ProductVariant
     from core.feed import invalidate_feed_cache
+    from analytics.models import StockSyncSession
 
     markup = (1 + (source_markup or Decimal('0')) / Decimal('100'))
     extractor = _extract_petkadai if source == 'petkadai' else lambda rec: _extract_himadri(rec, markup)
@@ -429,20 +454,19 @@ def compute_diff(
     if stock_updated > 0:
         invalidate_feed_cache()
 
-    session_key = str(_uuid.uuid4())
-    cache.set(
-        f'stock_sync:pending:{session_key}',
-        {item['id']: item for item in price_changes},
-        3600,
+    # Persisted, not cached: an import saves Products, which invalidates
+    # catalogue caches. Keeping the session in the DB is what lets every row the
+    # admin can see stay importable for as long as the preview is on screen.
+    session = StockSyncSession.objects.create(
+        source=source,
+        seller_email=seller_email or '',
+        price_changes={item['id']: item for item in price_changes},
+        new_products={p['sku']: p for p in new_products},
     )
-    cache.set(
-        f'stock_sync:new_products:{session_key}',
-        {p['sku']: p for p in new_products},
-        3600,
-    )
+    _purge_stale_sessions()
 
     return {
-        'session_key': session_key,
+        'session_key': str(session.key),
         'source': source,
         'stock_updated': stock_updated,
         'stock_unchanged': stock_unchanged,
@@ -577,17 +601,30 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
     from the new_products session cache. Maps Himadri categories to Junglyst
     categories/subcategories and sets sensible defaults per plant type.
     """
-    from django.core.cache import cache
+    from django.db import transaction
     from core.models import Product, ProductVariant, ProductImage, User, VariantType, Category, SubCategory, Tag
     from core.feed import invalidate_feed_cache
+    from analytics.models import StockSyncSession
 
-    pending = cache.get(f'stock_sync:new_products:{session_key}', {})
+    session = _load_session(session_key)
+    if session is None:
+        return {'imported': 0, 'errors': ['Sync session not found. Run preview again.']}
+    pending = session.new_products or {}
+
     try:
         seller = User.objects.get(email=seller_email)
     except User.DoesNotExist:
         return {'imported': 0, 'errors': [f'Seller not found: {seller_email}']}
 
+    # The rate the admin typed only reaches the buyer-facing price through the
+    # seller profile — ProductVariant.save() reads seller_commission_rate, not
+    # anything passed in here. Set it once up front (same as the price-apply
+    # path) so price and compare_at_price can't be computed off two different
+    # rates, which is how mismatched pricing used to get written.
     s_rate = seller_commission if seller_commission is not None else Decimal(str(seller.seller_commission_rate))
+    if seller_commission is not None and seller.seller_commission_rate != seller_commission:
+        seller.seller_commission_rate = seller_commission
+        seller.save(update_fields=['seller_commission_rate'])
 
     # ── Care defaults by subcategory slug ────────────────────────────────────
     # (care_level, light_requirements, growth_rate, co2_requirement)
@@ -646,75 +683,80 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
                 errors.append(f'{sku}: already exists')
                 continue
 
-            scraped_cats = raw.get('categories') or []
-            category, sub_category = resolve_category(scraped_cats, item['name'])
-            sub_slug = sub_category.slug if sub_category else None
-            care_level, light_req, growth_rate, co2_req = _CARE_DEFAULTS.get(sub_slug, _DEFAULT_CARE)
+            # One transaction per SKU: without it a failure partway through (bad
+            # category, bad image URL, unique-SKU clash) left the Product row
+            # behind with no variant, no price and no images — a broken listing
+            # the shop would happily render.
+            with transaction.atomic():
+                scraped_cats = raw.get('categories') or []
+                category, sub_category = resolve_category(scraped_cats, item['name'])
+                sub_slug = sub_category.slug if sub_category else None
+                care_level, light_req, growth_rate, co2_req = _CARE_DEFAULTS.get(sub_slug, _DEFAULT_CARE)
 
-            # Never fall back to the product name here — an empty description lets
-            # the frontend's own placeholder copy render instead of a fake description
-            # that's just the title repeated (see backfill_petkadai_descriptions).
-            description = raw.get('description') or raw.get('short_description') or ''
-            tagline = (raw.get('short_description') or '')[:499] or None
+                # Never fall back to the product name here — an empty description lets
+                # the frontend's own placeholder copy render instead of a fake description
+                # that's just the title repeated (see backfill_petkadai_descriptions).
+                description = raw.get('description') or raw.get('short_description') or ''
+                tagline = (raw.get('short_description') or '')[:499] or None
 
-            product = Product(
-                name=item['name'],
-                description=description,
-                tagline=tagline,
-                seller=seller,
-                scientific_name=raw.get('scientific_name') or '',
-                rating=Decimal(str(raw.get('rating') or 5.0)),
-                care_level=care_level,
-                light_requirements=light_req,
-                growth_rate=growth_rate,
-                co2_requirement=co2_req,
-                is_draft=False,
-            )
-            product.save()
-
-            if category:
-                product.categories.add(category)
-            if sub_category:
-                product.sub_categories.add(sub_category)
-
-            # Tags
-            for tag_name in (raw.get('tags') or [])[:10]:
-                tag, _ = Tag.objects.get_or_create(name=tag_name.strip())
-                product.tags.add(tag)
-
-            # compare_at_price — use regular_price × markup if higher than sale
-            sale_p = raw.get('sale_price')
-            reg_p = raw.get('regular_price')
-            compare_at_price = None
-            if reg_p and sale_p and reg_p > sale_p:
-                # reg_p was NOT multiplied by markup yet (raw scraper value)
-                # new_base already has markup applied: new_base = sale_p × markup
-                # So compare = reg_p × markup × (1 + s_rate/100)
-                markup_factor = base_price / Decimal(str(sale_p)) if sale_p else Decimal('1')
-                compare_base = (Decimal(str(reg_p)) * markup_factor).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
-                compare_at_price = (compare_base * (1 + s_rate / Decimal('100'))).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
-
-            variant = ProductVariant(
-                product=product,
-                name='Standard',
-                variant_type=_infer_variant_type(sku, item['name']),
-                sku=sku,
-                base_price=base_price,
-                price=base_price,  # recomputed by save()
-                compare_at_price=compare_at_price,
-                stock=new_stock,
-            )
-            variant.save()  # recomputes price = base_price × (1 + seller_commission_rate/100)
-
-            # Images
-            for i, url in enumerate((raw.get('images') or [])[:5]):
-                ProductImage.objects.create(
-                    product=product,
-                    variant=variant,
-                    image_url=url,
-                    is_primary=(i == 0),
-                    order=i,
+                product = Product(
+                    name=item['name'],
+                    description=description,
+                    tagline=tagline,
+                    seller=seller,
+                    scientific_name=raw.get('scientific_name') or '',
+                    rating=Decimal(str(raw.get('rating') or 5.0)),
+                    care_level=care_level,
+                    light_requirements=light_req,
+                    growth_rate=growth_rate,
+                    co2_requirement=co2_req,
+                    is_draft=False,
                 )
+                product.save()
+
+                if category:
+                    product.categories.add(category)
+                if sub_category:
+                    product.sub_categories.add(sub_category)
+
+                # Tags
+                for tag_name in (raw.get('tags') or [])[:10]:
+                    tag, _ = Tag.objects.get_or_create(name=tag_name.strip())
+                    product.tags.add(tag)
+
+                # compare_at_price — use regular_price × markup if higher than sale
+                sale_p = raw.get('sale_price')
+                reg_p = raw.get('regular_price')
+                compare_at_price = None
+                if reg_p and sale_p and reg_p > sale_p:
+                    # reg_p was NOT multiplied by markup yet (raw scraper value)
+                    # new_base already has markup applied: new_base = sale_p × markup
+                    # So compare = reg_p × markup × (1 + s_rate/100)
+                    markup_factor = base_price / Decimal(str(sale_p)) if sale_p else Decimal('1')
+                    compare_base = (Decimal(str(reg_p)) * markup_factor).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                    compare_at_price = (compare_base * (1 + s_rate / Decimal('100'))).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+
+                variant = ProductVariant(
+                    product=product,
+                    name='Standard',
+                    variant_type=_infer_variant_type(sku, item['name']),
+                    sku=sku,
+                    base_price=base_price,
+                    price=base_price,  # recomputed by save()
+                    compare_at_price=compare_at_price,
+                    stock=new_stock,
+                )
+                variant.save()  # recomputes price = base_price × (1 + seller_commission_rate/100)
+
+                # Images
+                for i, url in enumerate((raw.get('images') or [])[:5]):
+                    ProductImage.objects.create(
+                        product=product,
+                        variant=variant,
+                        image_url=url,
+                        is_primary=(i == 0),
+                        order=i,
+                    )
 
             imported += 1
         except Exception as e:
