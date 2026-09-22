@@ -98,6 +98,7 @@ INSTALLED_APPS = [
     'payments',
     'notifications',
     'sellers',
+    'coupons',
     'analytics',
     'competition',
     'community',

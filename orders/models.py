@@ -34,7 +34,11 @@ class Order(SoftDeleteModel):
     subtotal = models.DecimalField(max_digits=12, decimal_places=2)
     shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     gst_total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    total_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    # Coupon snapshot: `coupon` may be soft-deleted later, so keep the code too.
+    coupon = models.ForeignKey('coupons.Coupon', on_delete=models.SET_NULL, null=True, blank=True, related_name='orders')
+    coupon_code = models.CharField(max_length=40, blank=True, default='')
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2)  # subtotal - discount + shipping
     
     awb_number = models.CharField(max_length=100, blank=True, null=True)
     courier_name = models.CharField(max_length=100, blank=True, null=True)
@@ -77,6 +81,10 @@ class SubOrder(SoftDeleteModel):
 
     subtotal = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    # Coupon discount landing on this seller's lines. Only deducted from
+    # seller_total when the coupon is seller-funded; platform-funded coupons
+    # leave the payout untouched.
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     seller_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
 
     # Dispatch tracking
@@ -123,7 +131,8 @@ class OrderItem(SoftDeleteModel):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     gst_percentage = models.DecimalField(max_digits=5, decimal_places=2)
     quantity = models.PositiveIntegerField()
-
+    discount_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)  # coupon share for this line
+    
     seller = models.ForeignKey(User, on_delete=models.CASCADE, related_name='order_items')
 
     # Combo provenance — set when this item was purchased as part of a combo.

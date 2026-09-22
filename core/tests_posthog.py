@@ -131,3 +131,64 @@ class ApiMetricsErrorContextTests(SimpleTestCase):
         self.assertEqual(cleaned['card'], '[REDACTED]')
         self.assertEqual(cleaned['items'][0]['authToken'], '[REDACTED]')
         self.assertEqual(cleaned['name'], 'ok')
+
+
+class PostHogAPIMetricsMiddlewareTests(SimpleTestCase):
+    """Gating behaviour: the middleware must (a) stay silent when PostHog is
+    unconfigured, (b) capture an api_request event for /api/ traffic when
+    enabled, (c) ignore non-API paths, and (d) always capture errors regardless
+    of sampling.
+
+    The middleware reads its settings in __init__, so it must be constructed
+    inside the override_settings block for these to take effect.
+    """
+
+    def _build(self, response_status=200, exc=None):
+        from django.http import HttpResponse
+
+        def get_response(request):
+            if exc:
+                raise exc
+            return HttpResponse(status=response_status)
+        return PostHogAPIMetricsMiddleware(get_response)
+
+    def test_noop_when_disabled(self):
+        with override_settings(POSTHOG_API_KEY=''):
+            mw = self._build()
+            with patch('core.middleware.get_posthog') as gp:
+                mw(RequestFactory().get('/api/core/products/'))
+                gp.assert_not_called()
+
+    def test_captures_api_request_when_enabled(self):
+        with override_settings(POSTHOG_API_KEY='phc_test'):
+            mw = self._build(response_status=200)
+            client = MagicMock()
+            with patch('core.middleware.get_posthog', return_value=client):
+                mw(RequestFactory().get('/api/core/products/'))
+            self.assertTrue(client.capture.called)
+            _, kwargs = client.capture.call_args
+            self.assertEqual(kwargs['event'], 'api_request')
+            self.assertEqual(kwargs['properties']['status_code'], 200)
+            self.assertTrue(kwargs['properties']['success'])
+
+    def test_skips_non_api_paths(self):
+        with override_settings(POSTHOG_API_KEY='phc_test'):
+            mw = self._build()
+            client = MagicMock()
+            with patch('core.middleware.get_posthog', return_value=client):
+                mw(RequestFactory().get('/static/app.css'))
+            client.capture.assert_not_called()
+
+    def test_error_always_captured_even_when_fully_sampled_out(self):
+        # sample_rate=0 would drop all *successful* requests, but errors must survive.
+        with override_settings(POSTHOG_API_KEY='phc_test', POSTHOG_API_SAMPLE_RATE=0.0):
+            mw = self._build(exc=ValueError("boom"))
+            client = MagicMock()
+            with patch('core.middleware.get_posthog', return_value=client):
+                with self.assertRaises(ValueError):
+                    mw(RequestFactory().get('/api/core/products/'))
+            self.assertTrue(client.capture.called)
+            _, kwargs = client.capture.call_args
+            self.assertEqual(kwargs['properties']['status_code'], 500)
+            self.assertFalse(kwargs['properties']['success'])
+            self.assertEqual(kwargs['properties']['error_type'], 'ValueError')
