@@ -12,7 +12,8 @@ class OrderItemListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = OrderItem
-        fields = ('id', 'product_name', 'variant_name', 'unit_price', 'quantity', 'product_image')
+        fields = ('id', 'product_name', 'variant_name', 'unit_price', 'quantity', 'product_image',
+                  'combo_id', 'combo_name')
 
     def get_product_image(self, obj):
         if not obj.product:
@@ -31,7 +32,8 @@ class OrderItemSerializer(serializers.ModelSerializer):
         model = OrderItem
         fields = (
             'id', 'product', 'variant', 'product_name', 'variant_name',
-            'unit_price', 'gst_percentage', 'quantity', 'seller', 'product_image',
+            'unit_price', 'gst_percentage', 'quantity', 'discount_amount', 'seller', 'product_image',
+            'combo_id', 'combo_name',
         )
 
     def get_product_image(self, obj):
@@ -54,7 +56,7 @@ class SubOrderListSerializer(serializers.ModelSerializer):
         model = SubOrder
         fields = (
             'id', 'sub_order_number', 'status', 'seller', 'seller_name',
-            'subtotal', 'shipping_fee', 'seller_total',
+            'subtotal', 'shipping_fee', 'discount_amount', 'seller_total',
             'awb_number', 'courier_name',
             'created_at', 'items', 'shipment',
         )
@@ -82,7 +84,7 @@ class OrderListSerializer(serializers.ModelSerializer):
         model = Order
         fields = (
             'id', 'order_number', 'status', 'payment_status',
-            'subtotal', 'shipping_fee', 'total_amount',
+            'subtotal', 'shipping_fee', 'discount_amount', 'total_amount',
             'is_paid', 'created_at', 'shipping_address',
             'items', 'sub_orders',
         )
@@ -100,7 +102,7 @@ class SubOrderSerializer(serializers.ModelSerializer):
         model = SubOrder
         fields = (
             'id', 'sub_order_number', 'status', 'seller', 'seller_name',
-            'subtotal', 'shipping_fee', 'seller_total',
+            'subtotal', 'shipping_fee', 'discount_amount', 'seller_total',
             'confirmed_at', 'dispatch_deadline', 'dispatch_hours_remaining',
             'packaging_photos',
             'actual_weight_grams', 'actual_length_cm', 'actual_breadth_cm', 'actual_height_cm',
@@ -144,7 +146,8 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             'id', 'order_number', 'status', 'payment_status',
             'user', 'guest_email', 'guest_phone',
             'shipping_address',
-            'subtotal', 'shipping_fee', 'gst_total', 'total_amount',
+            'subtotal', 'shipping_fee', 'gst_total',
+            'coupon_code', 'discount_amount', 'total_amount',
             'awb_number', 'courier_name', 'estimated_delivery',
             'is_paid', 'created_at', 'updated_at',
             'items', 'sub_orders', 'shipments',
@@ -184,7 +187,7 @@ class SellerSubOrderSerializer(serializers.ModelSerializer):
         model = SubOrder
         fields = (
             'id', 'sub_order_number', 'status',
-            'subtotal', 'shipping_fee', 'seller_total',
+            'subtotal', 'shipping_fee', 'discount_amount', 'seller_total',
             'confirmed_at', 'dispatch_deadline', 'dispatch_hours_remaining',
             'packaging_photos',
             'actual_weight_grams', 'actual_length_cm', 'actual_breadth_cm', 'actual_height_cm',
@@ -298,7 +301,7 @@ class OrderSuccessSerializer(serializers.ModelSerializer):
         model = Order
         fields = (
             'id', 'order_number', 'total_quantity', 'total_amount', 'is_paid',
-            'shipping_address', 'subtotal', 'shipping_fee', 'items'
+            'shipping_address', 'subtotal', 'shipping_fee', 'coupon_code', 'discount_amount', 'items'
         )
 
     def get_total_quantity(self, obj):
@@ -347,6 +350,8 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
                 'quantity': item.quantity,
                 'unit_price': float(item.unit_price),
                 'product_image': self._get_product_image_cached(item),
+                'combo_id': str(item.combo_id) if item.combo_id else None,
+                'combo_name': item.combo_name or '',
             }
             for item in obj.items.all()
         ]
@@ -362,6 +367,8 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
                     'quantity': item.quantity,
                     'unit_price': float(item.unit_price),
                     'product_image': self._get_product_image_cached(item),
+                    'combo_id': str(item.combo_id) if item.combo_id else None,
+                    'combo_name': item.combo_name or '',
                 }
                 for item in so.items.all()
             ]

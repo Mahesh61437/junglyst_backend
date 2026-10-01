@@ -98,9 +98,11 @@ INSTALLED_APPS = [
     'payments',
     'notifications',
     'sellers',
+    'coupons',
     'analytics',
     'competition',
     'community',
+    'combos',
     'django_celery_results',
     'django_celery_beat',
 ]

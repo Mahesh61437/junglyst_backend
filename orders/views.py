@@ -31,6 +31,8 @@ from .serializers import (
     SellerOrderSerializer, SellerSubOrderSerializer,
     OrderSuccessSerializer, OrderTrackingSerializer)
 from .email_utils import send_order_confirmation_emails
+from coupons.engine import evaluate_coupon, CouponError
+from coupons.models import FundedBy
 from .tasks import (
     send_order_confirmation_emails_task, create_order_notifications_task,
     clear_buyer_cart_task, clear_ordered_cart_items)
@@ -119,6 +121,7 @@ class CheckoutView(generics.GenericAPIView):
         raw_items = request.data.get('items')   # guest itemized checkout (no cart)
         item_ids = request.data.get('item_ids')  # explicit row selection within cart_id
         pincode = request.data.get('pincode', '')
+        coupon_code = (request.data.get('coupon_code') or '').strip()
 
         # ── Resolve cart items ──────────────────────────────────────────────
         if cart_id:
@@ -173,6 +176,9 @@ class CheckoutView(generics.GenericAPIView):
                     variant=variant,
                     quantity=qty,
                 ))
+        elif request.data.get('combos'):
+            # Combo-only checkout — no per-variant cart/items list.
+            cart_items = []
         else:
             return Response({"error": "cart_id or items is required"}, status=400)
 
@@ -222,10 +228,52 @@ class CheckoutView(generics.GenericAPIView):
         if cart_id and phantom:
             CartItem.objects.filter(id__in=[item.id for item in phantom]).delete()
         cart_items = [item for item in cart_items if item not in phantom]
-        if not cart_items:
+        # Empty is only an error when there are no combos to expand below
+        # (a combo-only checkout starts with an empty cart_items list).
+        if not cart_items and not request.data.get('combos'):
             return Response({"error": "Your cart is empty. Please add available products."}, status=400)
 
-        seller_buckets = {}  # seller_id → {seller, items, subtotal, has_heavy, has_light}
+        # ── Combos: expand each into its in-stock component variants ──────────
+        # A combo can span more sellers than the 3-seller cap and carries ONE
+        # flat shipping fee (not the per-seller split). Its components still flow
+        # into the normal per-seller SubOrders below, so stock decrement, seller
+        # notifications and fulfillment all reuse the existing machinery.
+        combo_shipping_total = 0.0
+        combo_entries = request.data.get('combos') or []
+        if combo_entries:
+            from combos.models import Combo
+            for entry in combo_entries:
+                cid = entry.get('combo_id')
+                try:
+                    cqty = int(entry.get('quantity', 1))
+                except (TypeError, ValueError):
+                    cqty = 1
+                if not cid or cqty < 1:
+                    continue
+                try:
+                    combo = Combo.objects.filter(is_active=True, is_draft=False).prefetch_related(
+                        'items__variant__product__seller'
+                    ).get(id=cid)
+                except Combo.DoesNotExist:
+                    return Response({"error": "One of the combos is no longer available."}, status=400)
+                added_any = False
+                for ci in combo.items.all():
+                    v = ci.variant
+                    needed = ci.quantity * cqty
+                    if not v or v.stock < needed:
+                        continue  # skip out-of-stock components (partial availability)
+                    cart_items.append(SimpleNamespace(
+                        product=v.product, variant=v, quantity=needed,
+                        is_combo=True, combo_id=str(combo.id), combo_name=combo.name,
+                    ))
+                    added_any = True
+                if added_any:
+                    combo_shipping_total += float(combo.shipping_fee or 0)
+
+        if not cart_items:
+            return Response({"error": "All items are out of stock. Please add available products."}, status=400)
+
+        seller_buckets = {}  # seller_id → {seller, items, subtotal, ship_subtotal, has_heavy, has_light}
         for item in cart_items:
             # The buyer wants this item (qty >= 1) but stock can't fulfil it:
             # alert and block. Distinguish fully out of stock from a partial
@@ -237,26 +285,34 @@ class CheckoutView(generics.GenericAPIView):
                     msg = f"Only {item.variant.stock} unit(s) of {item.product.name} are available. Please update the quantity to continue."
                 return Response({"error": msg}, status=400)
 
+            is_combo = getattr(item, 'is_combo', False)
             sid = str(item.product.seller_id)
             if sid not in seller_buckets:
                 seller_buckets[sid] = {
                     'seller': item.product.seller,
                     'items': [],
                     'subtotal': 0,
+                    'ship_subtotal': 0,   # excludes combo items — combo ships flat
                     'has_heavy': False,
                     'has_light': False,
+                    'has_normal': False,  # has at least one non-combo item
                 }
             price = float(item.variant.price) * item.quantity
             seller_buckets[sid]['items'].append(item)
             seller_buckets[sid]['subtotal'] += price
+            if not is_combo:
+                seller_buckets[sid]['ship_subtotal'] += price
+                seller_buckets[sid]['has_normal'] = True
             # Track both light and heavy items to detect hybrid carts
             if item.variant.item_category == 'heavy':
                 seller_buckets[sid]['has_heavy'] = True
             elif item.variant.item_category == 'light':
                 seller_buckets[sid]['has_light'] = True
 
-        # SHIP-003: max 3 sellers
-        if len(seller_buckets) > 3:
+        # SHIP-003: max 3 sellers — combos are exempt, so only count sellers
+        # contributing standalone (non-combo) items toward the cap.
+        normal_seller_count = sum(1 for b in seller_buckets.values() if b['has_normal'])
+        if normal_seller_count > 3:
             return Response({"error": "Cart supports up to 3 sellers. Please remove items."}, status=400)
 
         # Shipping availability: snapshot each seller's next dispatch date.
@@ -289,6 +345,28 @@ class CheckoutView(generics.GenericAPIView):
 
         # SHIP-003: min order check removed; accept all cart values
 
+        # ── Coupon ─────────────────────────────────────────────────────────
+        # Re-evaluated here from DB prices; the client only sends the code.
+        # Per-line discounts are kept alongside the items so each seller's
+        # SubOrder can carry exactly the share that landed on its lines.
+        coupon_result = None
+        if coupon_code:
+            try:
+                coupon_result = evaluate_coupon(
+                    coupon_code, cart_items,
+                    user=request.user if request.user.is_authenticated else None,
+                    guest_email=email,
+                )
+            except CouponError as e:
+                return Response({"error": e.message, "coupon_error": True}, status=400)
+        line_discounts = {
+            id(item): (coupon_result.item_discounts[i] if coupon_result else Decimal('0'))
+            for i, item in enumerate(cart_items)
+        }
+        for bucket in seller_buckets.values():
+            bucket['discount'] = sum((line_discounts[id(it)] for it in bucket['items']), Decimal('0'))
+        seller_funded = bool(coupon_result and coupon_result.coupon.funded_by == FundedBy.SELLER)
+
         # Resolve per-seller shipping configs in one query
         shipping_config_map = _build_shipping_config_map(seller_buckets.keys())
         for sid, bucket in seller_buckets.items():
@@ -304,18 +382,23 @@ class CheckoutView(generics.GenericAPIView):
 
         # Totals
         subtotal = sum(float(item.variant.price) * item.quantity for item in cart_items)
+        discount_total = float(coupon_result.discount_amount) if coupon_result else 0.0
+        # GST is inclusive in the listed price, so it is worked out on what the
+        # buyer actually pays for each line (after its share of the discount).
         gst_total = sum(
-            float(item.variant.price) * item.quantity *
+            (float(item.variant.price) * item.quantity - float(line_discounts[id(item)])) *
             (float(item.product.categories.first().gst_percentage) / (100 + float(item.product.categories.first().gst_percentage)))
             if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
-        # Master shipping = sum of per-seller fees (each seller has independent config)
+        # Master shipping = sum of per-seller fees (each seller has independent config).
+        # Slabs are read off the pre-discount subtotal so a coupon can't also
+        # bump a seller into a pricier shipping tier.
         total_shipping = sum(
-            _shipping_fee_for_seller(b['subtotal'], b['shipping_config'])
+            _shipping_fee_for_seller(b['ship_subtotal'], b['shipping_config']) if b['ship_subtotal'] > 0 else 0
             for b in seller_buckets.values()
-        )
-        total_amount = subtotal + total_shipping
+        ) + combo_shipping_total
+        total_amount = subtotal - discount_total + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
         order_number = _generate_order_number()
@@ -331,6 +414,9 @@ class CheckoutView(generics.GenericAPIView):
             subtotal=subtotal,
             shipping_fee=total_shipping,
             gst_total=gst_total,
+            coupon=coupon_result.coupon if coupon_result else None,
+            coupon_code=coupon_result.coupon.code if coupon_result else '',
+            discount_amount=discount_total,
             total_amount=total_amount,
             status='pending',
         )
@@ -340,7 +426,10 @@ class CheckoutView(generics.GenericAPIView):
         dispatch_deadline = now + timedelta(hours=48)
 
         for idx, (sid, bucket) in enumerate(seller_buckets.items()):
-            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['shipping_config'])
+            seller_shipping = (
+                _shipping_fee_for_seller(bucket['ship_subtotal'], bucket['shipping_config'])
+                if bucket['ship_subtotal'] > 0 else 0
+            )
             promised_ship = bucket.get('next_shipping_date')
             promised_min = (promised_ship + timedelta(days=min_transit)) if promised_ship else None
             promised_max = (promised_ship + timedelta(days=max_transit)) if promised_ship else None
@@ -350,7 +439,11 @@ class CheckoutView(generics.GenericAPIView):
                 seller=bucket['seller'],
                 subtotal=bucket['subtotal'],
                 shipping_fee=seller_shipping,
-                seller_total=bucket['subtotal'] + seller_shipping,
+                discount_amount=bucket['discount'],
+                seller_total=(
+                    Decimal(str(bucket['subtotal'])) + seller_shipping
+                    - (bucket['discount'] if seller_funded else Decimal('0'))
+                ),
                 status='pending',
                 dispatch_deadline=dispatch_deadline,
                 promised_ship_date=promised_ship,
@@ -370,7 +463,10 @@ class CheckoutView(generics.GenericAPIView):
                     unit_price=item.variant.price,
                     gst_percentage=gst_pct,
                     quantity=item.quantity,
+                    discount_amount=line_discounts[id(item)],
                     seller=bucket['seller'],
+                    combo_id=getattr(item, 'combo_id', None),
+                    combo_name=getattr(item, 'combo_name', '') or '',
                 )
 
         active_gateway = PaymentGatewaySettings.get_solo().active_gateway

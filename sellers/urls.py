@@ -1,6 +1,6 @@
 from django.urls import path
 from .views import (
-    GrowerDashboardView, SellerStoreView, SellerProfileListView,
+    GrowerDashboardView, SellerSalesReportCSVView, SellerStoreView, SellerProfileListView,
     CheckSellerApprovalView, CheckEmailAllowedView, AllowedSellerListCreateView, AllowedSellerDestroyView,
     PlatformStatsView, FeaturedCuratorView,
     SellerPromotionView, AdminSellerProfileEditView, BankDetailsView,
@@ -11,6 +11,7 @@ from .views import (
 
 urlpatterns = [
     path('dashboard/', GrowerDashboardView.as_view(), name='grower_dashboard'),
+    path('dashboard/sales-report.csv', SellerSalesReportCSVView.as_view(), name='seller_sales_report_csv'),
     path('store/<slug:slug>/', SellerStoreView.as_view(), name='seller_store'),
 
     # Main seller list — supports ?featured=true to filter by is_featured, ordered by sort_order
