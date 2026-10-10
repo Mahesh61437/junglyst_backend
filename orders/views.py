@@ -31,6 +31,8 @@ from .serializers import (
     SellerOrderSerializer, SellerSubOrderSerializer,
     OrderSuccessSerializer, OrderTrackingSerializer)
 from .email_utils import send_order_confirmation_emails
+from coupons.engine import evaluate_coupon, CouponError
+from coupons.models import FundedBy
 from .tasks import (
     send_order_confirmation_emails_task, create_order_notifications_task,
     clear_buyer_cart_task, clear_ordered_cart_items)
@@ -119,6 +121,7 @@ class CheckoutView(generics.GenericAPIView):
         raw_items = request.data.get('items')   # guest itemized checkout (no cart)
         item_ids = request.data.get('item_ids')  # explicit row selection within cart_id
         pincode = request.data.get('pincode', '')
+        coupon_code = (request.data.get('coupon_code') or '').strip()
 
         # ── Resolve cart items ──────────────────────────────────────────────
         if cart_id:
@@ -289,6 +292,28 @@ class CheckoutView(generics.GenericAPIView):
 
         # SHIP-003: min order check removed; accept all cart values
 
+        # ── Coupon ─────────────────────────────────────────────────────────
+        # Re-evaluated here from DB prices; the client only sends the code.
+        # Per-line discounts are kept alongside the items so each seller's
+        # SubOrder can carry exactly the share that landed on its lines.
+        coupon_result = None
+        if coupon_code:
+            try:
+                coupon_result = evaluate_coupon(
+                    coupon_code, cart_items,
+                    user=request.user if request.user.is_authenticated else None,
+                    guest_email=email,
+                )
+            except CouponError as e:
+                return Response({"error": e.message, "coupon_error": True}, status=400)
+        line_discounts = {
+            id(item): (coupon_result.item_discounts[i] if coupon_result else Decimal('0'))
+            for i, item in enumerate(cart_items)
+        }
+        for bucket in seller_buckets.values():
+            bucket['discount'] = sum((line_discounts[id(it)] for it in bucket['items']), Decimal('0'))
+        seller_funded = bool(coupon_result and coupon_result.coupon.funded_by == FundedBy.SELLER)
+
         # Resolve per-seller shipping configs in one query
         shipping_config_map = _build_shipping_config_map(seller_buckets.keys())
         for sid, bucket in seller_buckets.items():
@@ -304,18 +329,23 @@ class CheckoutView(generics.GenericAPIView):
 
         # Totals
         subtotal = sum(float(item.variant.price) * item.quantity for item in cart_items)
+        discount_total = float(coupon_result.discount_amount) if coupon_result else 0.0
+        # GST is inclusive in the listed price, so it is worked out on what the
+        # buyer actually pays for each line (after its share of the discount).
         gst_total = sum(
-            float(item.variant.price) * item.quantity *
+            (float(item.variant.price) * item.quantity - float(line_discounts[id(item)])) *
             (float(item.product.categories.first().gst_percentage) / (100 + float(item.product.categories.first().gst_percentage)))
             if item.product.categories.exists() and getattr(item.product.categories.first(), 'gst_percentage', None) else 0
             for item in cart_items
         )
-        # Master shipping = sum of per-seller fees (each seller has independent config)
+        # Master shipping = sum of per-seller fees (each seller has independent config).
+        # Slabs are read off the pre-discount subtotal so a coupon can't also
+        # bump a seller into a pricier shipping tier.
         total_shipping = sum(
             _shipping_fee_for_seller(b['subtotal'], b['shipping_config'])
             for b in seller_buckets.values()
         )
-        total_amount = subtotal + total_shipping
+        total_amount = subtotal - discount_total + total_shipping
 
         # Create master Order with new number format: JNG-YYYY-XXXXX
         order_number = _generate_order_number()
@@ -331,6 +361,9 @@ class CheckoutView(generics.GenericAPIView):
             subtotal=subtotal,
             shipping_fee=total_shipping,
             gst_total=gst_total,
+            coupon=coupon_result.coupon if coupon_result else None,
+            coupon_code=coupon_result.coupon.code if coupon_result else '',
+            discount_amount=discount_total,
             total_amount=total_amount,
             status='pending',
         )
@@ -350,7 +383,11 @@ class CheckoutView(generics.GenericAPIView):
                 seller=bucket['seller'],
                 subtotal=bucket['subtotal'],
                 shipping_fee=seller_shipping,
-                seller_total=bucket['subtotal'] + seller_shipping,
+                discount_amount=bucket['discount'],
+                seller_total=(
+                    Decimal(str(bucket['subtotal'])) + seller_shipping
+                    - (bucket['discount'] if seller_funded else Decimal('0'))
+                ),
                 status='pending',
                 dispatch_deadline=dispatch_deadline,
                 promised_ship_date=promised_ship,
@@ -370,6 +407,7 @@ class CheckoutView(generics.GenericAPIView):
                     unit_price=item.variant.price,
                     gst_percentage=gst_pct,
                     quantity=item.quantity,
+                    discount_amount=line_discounts[id(item)],
                     seller=bucket['seller'],
                 )
 
