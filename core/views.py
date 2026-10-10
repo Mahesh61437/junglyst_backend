@@ -1036,7 +1036,9 @@ class HomeDataView(generics.GenericAPIView):
             'products': ProductListSerializer(products_qs, many=True).data,
             'stats': stats,
         }
-        cache.set(self._CACHE_KEY, data, self._CACHE_TTL)
+        # Don't pin an empty product strip for the full TTL when products exist.
+        if products_qs or not stats['total_products']:
+            cache.set(self._CACHE_KEY, data, self._CACHE_TTL)
         return Response(data)
 
 from django.http import HttpResponse
