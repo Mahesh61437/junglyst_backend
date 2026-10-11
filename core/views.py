@@ -29,6 +29,7 @@ from .feed import (
 )
 from django.db.models import Q
 from sellers.models import REGION_SHIPS_FIELDS
+from sellers.delivery import exclude_category_blocked
 from shipping.regions import STATE_REGIONS
 
 User = get_user_model()
@@ -159,7 +160,7 @@ def _product_queryset():
     ).prefetch_related(
         'variants', 'images', 'categories',
         'categories__subcategories', 'tags', 'sub_categories', 'sub_categories__category',
-        'seller__seller_profile__excluded_states',
+        'seller__seller_profile__excluded_states', 'seller__seller_profile__category_regions',
     )
 
 
@@ -187,13 +188,15 @@ def _delivery_area_from_params(params):
 
 
 def _filter_by_delivery_area(queryset, region, state_code=None):
-    """Keep products whose seller ships to *region* and hasn't excluded *state_code*.
-    Sellers without a profile have no delivery limits, so they stay visible."""
+    """Keep products whose seller ships to *region* (store-wide and for the product's
+    categories) and hasn't excluded *state_code*. Sellers without a profile have
+    no delivery limits, so they stay visible."""
     ships_field = REGION_SHIPS_FIELDS.get(region)
     if ships_field:
         queryset = queryset.filter(
             Q(seller__seller_profile__isnull=True) | Q(**{f'seller__seller_profile__{ships_field}': True})
         )
+        queryset = exclude_category_blocked(queryset, region)
     if state_code:
         queryset = queryset.exclude(seller__seller_profile__excluded_states__state_code=state_code)
     return queryset

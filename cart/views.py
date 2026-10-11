@@ -9,6 +9,7 @@ from .serializers import CartSerializer
 
 # A cart holds at most 3 sellers; allow headroom but cap the lookup size.
 MAX_SHIPPING_CONFIG_SELLERS = 20
+MAX_SHIPPING_CONFIG_PRODUCTS = 100
 
 
 def _valid_uuids(raw_values):
@@ -150,30 +151,49 @@ class CartViewSet(viewsets.ModelViewSet):
     def shipping_configs(self, request):
         """Return per-seller shipping tier configs for the given seller IDs.
 
-        Query param: seller_ids=UUID1,UUID2,...
+        Query params: seller_ids=UUID1,UUID2,...  product_ids=UUID,... (optional)
         Response: { "seller_id": { "light": {...}, "heavy": {...},
                     "delivery": { "service_regions": [...], "excluded_states": [...],
-                                  "region_fees": {...} } }, ... }
+                                  "region_fees": {...},
+                                  "product_regions": { "product_id": [...] } } }, ... }
+        `product_regions` narrows `service_regions` for products whose category
+        the seller restricted (see sellers.delivery).
         """
+        from core.models import Product
+        from sellers.delivery import category_rule_map, product_regions
         from sellers.models import SellerShippingConfig, SellerProfile, REGION_FEE_FIELDS
         raw = request.query_params.get('seller_ids', '')
         seller_ids = _valid_uuids(raw.split(','))[:MAX_SHIPPING_CONFIG_SELLERS]
         if not seller_ids:
             return Response({})
+        product_ids = _valid_uuids(request.query_params.get('product_ids', '').split(','))[:MAX_SHIPPING_CONFIG_PRODUCTS]
 
         configs = SellerShippingConfig.objects.filter(seller_id__in=seller_ids)
         profiles = SellerProfile.objects.filter(user_id__in=seller_ids).only(
             'user_id', 'ships_to_south', 'ships_to_north', 'ships_to_north_east',
             *REGION_FEE_FIELDS.values(),
         ).prefetch_related('excluded_states')
+        rule_map = category_rule_map(seller_ids)
+        products = (
+            Product.objects.filter(id__in=product_ids, seller_id__in=seller_ids).prefetch_related('categories')
+            if product_ids and rule_map else []
+        )
         result = {}
         for profile in profiles:
-            result.setdefault(str(profile.user_id), {})['delivery'] = {
-                'service_regions': profile.service_regions,
+            seller_id = str(profile.user_id)
+            store_regions = profile.service_regions
+            result.setdefault(seller_id, {})['delivery'] = {
+                'service_regions': store_regions,
                 'excluded_states': profile.excluded_state_codes,
                 'region_fees': {
                     region: _optional_float(profile.delivery_fee_for(region))
                     for region in REGION_FEE_FIELDS
+                },
+                'product_regions': {
+                    str(product.id): product_regions(
+                        store_regions, seller_id, [c.id for c in product.categories.all()], rule_map,
+                    )
+                    for product in products if str(product.seller_id) == seller_id
                 },
             }
         for cfg in configs:

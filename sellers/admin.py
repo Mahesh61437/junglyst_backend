@@ -2,7 +2,7 @@ from django.contrib import admin
 from django import forms
 from .models import (
     SellerProfile, AllowedSeller, SellerShippingConfig,
-    ShippingDefaultConfig, SellerBlackoutDate, SellerExcludedState,
+    ShippingDefaultConfig, SellerBlackoutDate, SellerExcludedState, SellerCategoryRegion,
 )
 
 
@@ -43,6 +43,13 @@ class SellerBlackoutDateAdmin(admin.ModelAdmin):
 class SellerBlackoutInline(admin.TabularInline):
     model = SellerBlackoutDate
     extra = 0
+
+
+class SellerCategoryRegionInline(admin.TabularInline):
+    model = SellerCategoryRegion
+    extra = 0
+    verbose_name = 'Category delivery rule'
+    verbose_name_plural = 'Category delivery rules (narrow the store-wide regions for one category)'
 
 
 class SellerExcludedStateInline(admin.TabularInline):
@@ -123,7 +130,7 @@ class SellerProfileAdmin(admin.ModelAdmin):
     prepopulated_fields = {'slug': ('store_name',)}
     list_editable = ('is_featured', 'identity_verified', 'is_active')
     ordering = ('sort_order', '-created_at')
-    inlines = [SellerBlackoutInline, SellerExcludedStateInline]
+    inlines = [SellerBlackoutInline, SellerExcludedStateInline, SellerCategoryRegionInline]
 
     fieldsets = (
         ('Basic Information', {

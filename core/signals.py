@@ -2,7 +2,7 @@ from django.db.models.signals import pre_save, post_save, post_delete
 from django.dispatch import receiver
 from django.core.cache import cache
 
-from sellers.models import SellerProfile, SellerExcludedState, REGION_SHIPS_FIELDS
+from sellers.models import SellerProfile, SellerExcludedState, SellerCategoryRegion, REGION_SHIPS_FIELDS
 from .models import Product, Category, SubCategory, ProductVariant, ProductImage
 
 
@@ -114,6 +114,7 @@ def seller_regions_invalidate(sender, instance, created, **kwargs):
 
 
 @receiver([post_save, post_delete], sender=SellerExcludedState)
-def seller_excluded_state_invalidate(sender, **kwargs):
-    """A seller excluded / re-included a state (e.g. via Django admin) → state-filtered feeds change."""
+@receiver([post_save, post_delete], sender=SellerCategoryRegion)
+def seller_delivery_rule_invalidate(sender, **kwargs):
+    """A state exclusion or category rule changed (e.g. via Django admin) → region/state feeds change."""
     cache.clear()

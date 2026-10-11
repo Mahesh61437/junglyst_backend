@@ -19,6 +19,7 @@ from core.models import ProductVariant
 from shipping.models import ShippingAddress
 from shipping.serializers import ShippingAddressSerializer
 from shipping.pincode_zones import classify_pincode, transit_days_for_zone
+from sellers.delivery import blocking_category, category_rule_map
 from shipping.regions import (
     REGION_LABELS, STATE_NAMES, pincode_matches_state, resolve_address_region, state_code_for,
 )
@@ -288,6 +289,7 @@ class CheckoutView(generics.GenericAPIView):
                          "Please check the state and PIN code in your delivery address."
             }, status=400)
         delivery_region = resolve_address_region(state=address_state, pincode=effective_pincode)
+        category_rules = category_rule_map(seller_buckets.keys()) if delivery_region else {}
         for sid, bucket in seller_buckets.items():
             seller_user = bucket['seller']
             try:
@@ -303,6 +305,15 @@ class CheckoutView(generics.GenericAPIView):
                 return Response({
                     "error": f"{store} doesn't deliver to {REGION_LABELS[delivery_region]}. Please remove their items to continue."
                 }, status=400)
+            for item in bucket['items']:
+                blocked_category = blocking_category(
+                    sid, item.product.categories.all(), delivery_region, category_rules,
+                )
+                if blocked_category:
+                    return Response({
+                        "error": f"{store} doesn't deliver {blocked_category.name} to "
+                                 f"{REGION_LABELS[delivery_region]}. Please remove {item.product.name} to continue."
+                    }, status=400)
             excluded_states = seller_profile.excluded_state_codes if seller_profile else []
             if excluded_states and not delivery_state_code:
                 # Can't honour the seller's state exclusions without knowing the state

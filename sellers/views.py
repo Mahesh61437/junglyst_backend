@@ -15,6 +15,7 @@ from .serializers import (
     SellerDeliveryRegionsSerializer,
 )
 from .encryption import encrypt_field, decrypt_field, mask_account
+from core.permissions import IsAdminUser as IsSuperUser
 from django.utils.text import slugify
 
 class GrowerDashboardView(generics.GenericAPIView):
@@ -971,18 +972,43 @@ class SellerBlackoutDestroyView(generics.GenericAPIView):
 
 # ── Delivery regions — seller self-serve ─────────────────────────────────────
 
-class SellerDeliveryRegionsView(generics.GenericAPIView):
+class _DeliveryRegionsBaseView(generics.GenericAPIView):
+    """GET/PATCH a seller's delivery settings; subclasses decide whose profile."""
+    serializer_class = SellerDeliveryRegionsSerializer
+
+    def _profile_or_error(self, request, **kwargs):
+        raise NotImplementedError
+
+    def get(self, request, **kwargs):
+        profile, error = self._profile_or_error(request, **kwargs)
+        if error:
+            return error
+        return Response(self.get_serializer(profile).data)
+
+    def patch(self, request, **kwargs):
+        profile, error = self._profile_or_error(request, **kwargs)
+        if error:
+            return error
+        serializer = self.get_serializer(profile, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+class SellerDeliveryRegionsView(_DeliveryRegionsBaseView):
     """
-    GET   /api/sellers/delivery-regions/  — current seller's regions and regional fees
+    GET   /api/sellers/delivery-regions/  — current seller's delivery settings
     PATCH /api/sellers/delivery-regions/  — update them
         body: { ships_to_south?, ships_to_north?, ships_to_north_east?: bool,
-                delivery_fee_south?, delivery_fee_north?, delivery_fee_north_east?: number|null }
+                delivery_fee_south?, delivery_fee_north?, delivery_fee_north_east?: number|null,
+                excluded_states?: [state codes],
+                category_regions?: [{ category_id, regions: [region codes] }] }
     A null fee means "use the standard slab-based shipping fee" for that region.
     """
     permission_classes = (permissions.IsAuthenticated,)
-    serializer_class = SellerDeliveryRegionsSerializer
 
-    def _profile_or_error(self, user):
+    def _profile_or_error(self, request, **kwargs):
+        user = request.user
         if user.role not in ('grower', 'admin'):
             return None, Response({"error": "Access denied"}, status=403)
         try:
@@ -990,17 +1016,17 @@ class SellerDeliveryRegionsView(generics.GenericAPIView):
         except SellerProfile.DoesNotExist:
             return None, Response({"error": "Seller profile not found"}, status=404)
 
-    def get(self, request):
-        profile, error = self._profile_or_error(request.user)
-        if error:
-            return error
-        return Response(self.get_serializer(profile).data)
 
-    def patch(self, request):
-        profile, error = self._profile_or_error(request.user)
-        if error:
-            return error
-        serializer = self.get_serializer(profile, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(serializer.data)
+class SellerDeliveryRegionsAdminView(_DeliveryRegionsBaseView):
+    """
+    GET/PATCH /api/sellers/profiles/<pk>/delivery-regions/ — superadmin manages any
+    seller's delivery settings (same body as the seller endpoint). Superusers only:
+    sellers are flagged is_staff, so DRF's IsAdminUser would let them edit each other.
+    """
+    permission_classes = (IsSuperUser,)
+
+    def _profile_or_error(self, request, pk=None, **kwargs):
+        try:
+            return SellerProfile.objects.get(pk=pk), None
+        except SellerProfile.DoesNotExist:
+            return None, Response({"error": "Seller profile not found"}, status=404)

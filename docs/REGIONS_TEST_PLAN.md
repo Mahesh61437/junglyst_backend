@@ -1,6 +1,6 @@
 # Region-based shopping — test plan
 
-Covers buyer delivery location, seller delivery regions / excluded states / regional fees,
+Covers buyer delivery location, seller delivery regions / excluded states / category restrictions / regional fees,
 and the checkout address checks. Last run: 2026-10-11.
 
 ## How to run
@@ -30,6 +30,7 @@ npm test
 | Product feeds | `core/tests_regions.py` | `region` / `state` filters, state implies region, case-insensitive, unknown ignored, combined with category / sort / paging, home per-state caching, detail exposes delivery info, cache refresh on region change and on admin exclusion edits |
 | Cart delivery info | `core/tests_regions.py` | `delivery` block in shipping-configs, malformed seller ids ignored, query count does not grow with sellers |
 | Checkout | `orders/tests_regions.py` | Blocked region / excluded state (saved and one-time address), unrecognised state only blocks when exclusions exist, PIN-state mismatch rejected, saved address uses its own PIN, regional fee vs slab vs ₹0, multi-seller fees and blocked-seller message |
+| Category rules | `sellers/tests_category_regions.py` | Seller + superadmin API (rules set / replace / clear / keep, all-region rule dropped, invalid shapes incl. missing ids, cache refresh), access (staff seller 403 on admin endpoint, anonymous 401, unknown profile 404), feeds hide restricted categories only where blocked, rules can't widen store regions, multi-category products, other sellers unaffected, product detail and cart `product_regions`, checkout blocks / allows |
 | Location helpers | `src/utils/deliveryRegion.test.js` | State matching, saved selection (corrupt / blocked storage), query params, can-deliver label, location detection incl. denied / offline / outside India |
 | Cart rules | `src/utils/cartFinancials.test.js` | Region / state blocking, flags re-derived when location changes, never blocks on missing data, regional vs slab vs free fees, multi-seller totals, zone E, stock and quantity rules unchanged |
 
@@ -44,6 +45,8 @@ npm test
 7. Checkout: address state drives availability and fees; a PIN from another state shows an inline error and blocks Place Order; a different state from the navbar shows a notice with "Use … as my location".
 8. Editing a saved address at checkout switches to a one-time address with the "Save this address" option.
 9. Seller dashboard: untick a region or a state, see "Unsaved changes"; either save button persists it; unticking everything is refused.
+10. Category restrictions: limit a category (e.g. Aquatic Plants → South) — buyers elsewhere stop seeing those products but still see the seller's other categories; the product page says "doesn't deliver this product to …"; the cart flags only that item.
+11. Super admin → Sellers → Edit: the same panel shows the seller's rules; changes save with "Save Changes" and the seller sees them.
 
 ## Known gaps (not covered / not built)
 

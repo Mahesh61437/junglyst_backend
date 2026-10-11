@@ -1,7 +1,7 @@
 from datetime import date, datetime, time, timedelta
 from django.db import models
 from django.utils import timezone
-from core.models import User
+from core.models import User, Category
 from django.utils.text import slugify
 from shipping.regions import REGION_SOUTH, REGION_NORTH, REGION_NORTH_EAST, STATE_NAMES
 
@@ -242,6 +242,33 @@ class SellerExcludedState(models.Model):
 
     def __str__(self):
         return f'{self.seller.store_name} ✕ {STATE_NAMES.get(self.state_code, self.state_code)}'
+
+
+class SellerCategoryRegion(models.Model):
+    """
+    Narrows where a seller delivers one category, e.g. "Plants: South India only"
+    while the rest of the store ships all over India. Only ever restricts: a
+    product is deliverable to a region when the store serves it AND every rule
+    for the product's categories allows it. Categories without a rule follow the
+    store-wide regions.
+    """
+    seller = models.ForeignKey(SellerProfile, on_delete=models.CASCADE, related_name='category_regions')
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='seller_region_rules')
+    ships_to_south = models.BooleanField(default=True)
+    ships_to_north = models.BooleanField(default=True)
+    ships_to_north_east = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = ('seller', 'category')
+        verbose_name = 'Category Delivery Region'
+        verbose_name_plural = 'Category Delivery Regions'
+
+    @property
+    def regions(self) -> list:
+        return [region for region, field in REGION_SHIPS_FIELDS.items() if getattr(self, field)]
+
+    def __str__(self):
+        return f'{self.seller.store_name} / {self.category.name}: {", ".join(self.regions) or "nowhere"}'
 
 
 class SellerShippingConfig(models.Model):
