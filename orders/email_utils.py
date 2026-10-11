@@ -12,7 +12,13 @@ def send_order_confirmation_emails(order):
     1. Super admins
     2. Sellers (for their respective sub-orders)
     3. Customer/User
+
+    Product orders only — other order types send their own confirmations
+    from their orders.order_types handler.
     """
+    from orders.order_types import is_product_order
+    if not is_product_order(order):
+        return True
     try:
         # Get super admins
         super_admins = User.objects.filter(is_superuser=True, is_deleted=False)

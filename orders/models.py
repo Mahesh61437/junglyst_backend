@@ -14,6 +14,15 @@ class OrderStatus(models.TextChoices):
     CANCELLED = 'cancelled', _('Cancelled')
     RETURNED = 'returned', _('Returned')
 
+class OrderType(models.TextChoices):
+    """What an Order is buying. Product orders ship goods through SubOrders;
+    every other type is fulfilled by its own app, which registers a handler
+    in orders.order_types and links its booking rows to the Order."""
+    PRODUCT = 'product', _('Product')
+    WORKSHOP = 'workshop', _('Workshop')
+    SERVICE = 'service', _('Service')
+
+
 class PaymentStatus(models.TextChoices):
     PENDING = 'pending', _('Pending')
     FAILED = 'failed', _('Failed')
@@ -23,7 +32,12 @@ class PaymentStatus(models.TextChoices):
 class Order(SoftDeleteModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     order_number = models.CharField(max_length=20, unique=True)
-    
+    order_type = models.CharField(
+        max_length=20, choices=OrderType.choices, default=OrderType.PRODUCT,
+        # DB default too, so code that predates this column can still INSERT orders.
+        db_default=OrderType.PRODUCT, db_index=True,
+    )
+
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='orders')
     guest_email = models.EmailField(null=True, blank=True)
     guest_phone = models.CharField(max_length=15, null=True, blank=True)

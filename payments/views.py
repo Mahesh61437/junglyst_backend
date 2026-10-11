@@ -16,6 +16,7 @@ from cart.models import Cart
 from cart.models import CartItem
 from orders.models import Order
 from orders.email_utils import send_order_confirmation_emails
+from orders.order_types import is_product_order
 from .models import Payment, PaymentGatewaySettings, PaymentGateway
 from .cashfree_utils import verify_webhook_signature
 from .razorpay_utils import verify_razorpay_webhook_signature
@@ -115,7 +116,8 @@ class CashfreeWebhookView(APIView):
                 order.status = 'confirmed'  # reset even if previously 'failed'
                 order.save()
 
-                if order.user:
+                # Non-product orders notify through their order-type handler.
+                if order.user and is_product_order(order):
                     AppNotification.objects.create(
                         user=order.user,
                         title="Order Placed!",

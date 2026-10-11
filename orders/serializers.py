@@ -1,7 +1,16 @@
 from rest_framework import serializers
 from django.db import models
 from .models import Order, OrderItem, SubOrder
+from .order_types import summarize_booking
 from shipping.serializers import ShipmentSerializer
+
+
+class BookingSummaryMixin(serializers.Serializer):
+    """Adds `booking` — what a non-product order booked (null for products)."""
+    booking = serializers.SerializerMethodField()
+
+    def get_booking(self, obj):
+        return summarize_booking(obj)
 
 
 # ── Item serializers ──────────────────────────────────────────────────────────
@@ -73,7 +82,7 @@ class SubOrderListSerializer(serializers.ModelSerializer):
         return ShipmentSerializer(shipment).data
 
 
-class OrderListSerializer(serializers.ModelSerializer):
+class OrderListSerializer(BookingSummaryMixin, serializers.ModelSerializer):
     """Minimal serializer for GET /orders/ — only what the profile history tab needs."""
     items = OrderItemListSerializer(many=True, read_only=True)
     sub_orders = SubOrderListSerializer(many=True, read_only=True)
@@ -81,10 +90,10 @@ class OrderListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = (
-            'id', 'order_number', 'status', 'payment_status',
+            'id', 'order_number', 'order_type', 'status', 'payment_status',
             'subtotal', 'shipping_fee', 'discount_amount', 'total_amount',
             'is_paid', 'created_at', 'shipping_address',
-            'items', 'sub_orders',
+            'items', 'sub_orders', 'booking',
         )
 
 
@@ -132,7 +141,7 @@ class SubOrderSerializer(serializers.ModelSerializer):
         return max(0, round(delta.total_seconds() / 3600, 1))
 
 
-class OrderDetailSerializer(serializers.ModelSerializer):
+class OrderDetailSerializer(BookingSummaryMixin, serializers.ModelSerializer):
     """Full serializer for GET /orders/<pk>/ — all nested data."""
     items = OrderItemSerializer(many=True, read_only=True)
     sub_orders = SubOrderSerializer(many=True, read_only=True)
@@ -141,14 +150,14 @@ class OrderDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = (
-            'id', 'order_number', 'status', 'payment_status',
+            'id', 'order_number', 'order_type', 'status', 'payment_status',
             'user', 'guest_email', 'guest_phone',
             'shipping_address',
             'subtotal', 'shipping_fee', 'gst_total',
             'coupon_code', 'discount_amount', 'total_amount',
             'awb_number', 'courier_name', 'estimated_delivery',
             'is_paid', 'created_at', 'updated_at',
-            'items', 'sub_orders', 'shipments',
+            'items', 'sub_orders', 'shipments', 'booking',
         )
 
 
@@ -286,7 +295,7 @@ class SellerOrderSerializer(serializers.ModelSerializer):
         return obj.items.filter(seller=self._seller()).count()
 
 
-class OrderSuccessSerializer(serializers.ModelSerializer):
+class OrderSuccessSerializer(BookingSummaryMixin, serializers.ModelSerializer):
     """
     Lightweight serializer for success page — only includes essential data:
     order_number, total_quantity, and total_amount.
@@ -298,8 +307,9 @@ class OrderSuccessSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = (
-            'id', 'order_number', 'total_quantity', 'total_amount', 'is_paid',
-            'shipping_address', 'subtotal', 'shipping_fee', 'coupon_code', 'discount_amount', 'items'
+            'id', 'order_number', 'order_type', 'total_quantity', 'total_amount', 'is_paid',
+            'shipping_address', 'subtotal', 'shipping_fee', 'coupon_code', 'discount_amount', 'items',
+            'booking',
         )
 
     def get_total_quantity(self, obj):
