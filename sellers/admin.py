@@ -2,7 +2,7 @@ from django.contrib import admin
 from django import forms
 from .models import (
     SellerProfile, AllowedSeller, SellerShippingConfig,
-    ShippingDefaultConfig, SellerBlackoutDate,
+    ShippingDefaultConfig, SellerBlackoutDate, SellerExcludedState,
 )
 
 
@@ -43,6 +43,13 @@ class SellerBlackoutDateAdmin(admin.ModelAdmin):
 class SellerBlackoutInline(admin.TabularInline):
     model = SellerBlackoutDate
     extra = 0
+
+
+class SellerExcludedStateInline(admin.TabularInline):
+    model = SellerExcludedState
+    extra = 0
+    verbose_name = 'State not delivered to'
+    verbose_name_plural = 'States not delivered to (inside enabled regions)'
 
 
 @admin.register(AllowedSeller)
@@ -116,7 +123,7 @@ class SellerProfileAdmin(admin.ModelAdmin):
     prepopulated_fields = {'slug': ('store_name',)}
     list_editable = ('is_featured', 'identity_verified', 'is_active')
     ordering = ('sort_order', '-created_at')
-    inlines = [SellerBlackoutInline]
+    inlines = [SellerBlackoutInline, SellerExcludedStateInline]
 
     fieldsets = (
         ('Basic Information', {
@@ -131,6 +138,14 @@ class SellerProfileAdmin(admin.ModelAdmin):
         ('Shipping Schedule', {
             'fields': ('shipping_days', 'daily_cutoff_time'),
             'description': 'Select weekdays this seller ships. 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun. Example: [0, 2, 4] for Mon/Wed/Fri. Orders placed after daily_cutoff_time on a shipping day roll to the next shipping day.',
+        }),
+        ('Delivery Regions', {
+            'fields': (
+                ('ships_to_south', 'ships_to_north', 'ships_to_north_east'),
+                ('delivery_fee_south', 'delivery_fee_north', 'delivery_fee_north_east'),
+            ),
+            'description': 'Regions this seller ships to (all three = all over India). A regional delivery fee, '
+                           'when set, replaces the slab-based shipping fee for buyers in that region.',
         }),
         ('Operations', {
             'fields': ('location_city', 'location_pincode', 'gst_number', 'gst_document_url')

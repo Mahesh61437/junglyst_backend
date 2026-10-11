@@ -109,6 +109,43 @@ def _current_phase(now, launch_date, announcement_dt):
     return 'voting'
 
 
+DEFAULT_RESULTS_BANNER_DAYS = 7
+MAX_RESULTS_BANNER_DAYS = 365
+_FALSY_STRINGS = {'false', '0', 'no', 'off', ''}
+
+
+def _resolve_promo_enabled(settings_data):
+    """Master switch for site-wide competition promos (banner, hero slide, ticker)."""
+    raw = (settings_data or {}).get('promo_enabled', True)
+    if isinstance(raw, str):
+        return raw.strip().lower() not in _FALSY_STRINGS
+    return bool(raw)
+
+
+def _resolve_results_banner_days(settings_data):
+    """Days the winners promo stays up after the announcement date (0 = hide immediately)."""
+    raw = (settings_data or {}).get('results_banner_days')
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_RESULTS_BANNER_DAYS
+    return min(max(days, 0), MAX_RESULTS_BANNER_DAYS)
+
+
+def _promo_visible_until(announcement_dt, results_banner_days):
+    if announcement_dt is None:
+        return None
+    return announcement_dt + timedelta(days=results_banner_days)
+
+
+def _should_show_promo(now, phase, promo_enabled, promo_visible_until):
+    if not promo_enabled:
+        return False
+    if phase != 'results':
+        return True
+    return promo_visible_until is not None and now < promo_visible_until
+
+
 def _is_allowed_file(file_obj):
     """Check by both MIME type and extension — phones often send wrong MIME for HEIC."""
     ext = '.' + file_obj.name.rsplit('.', 1)[-1].lower() if '.' in file_obj.name else ''
@@ -201,7 +238,16 @@ class CompetitionStatusView(APIView):
             prize_tier__in=[c[0] for c in CompetitionEntry.PRIZE_CHOICES if c[0]],
         ).exists()
 
+        promo_visible_until = _promo_visible_until(
+            announcement_dt, _resolve_results_banner_days(settings_data),
+        )
+        show_promo = _should_show_promo(
+            now, phase, _resolve_promo_enabled(settings_data), promo_visible_until,
+        )
+
         payload = {
+            'show_promo': show_promo,
+            'promo_visible_until': promo_visible_until.isoformat() if promo_visible_until else None,
             'launch_date': launch_date.isoformat(),
             'is_open': is_open,
             'phase': phase,

@@ -27,6 +27,9 @@ from .feed import (
     get_ordered_product_ids, get_filtered_ordered_ids,
     get_sorted_feed, compute_sorted_feed, SORTABLE_FIELDS,
 )
+from django.db.models import Q
+from sellers.models import REGION_SHIPS_FIELDS
+from shipping.regions import STATE_REGIONS
 
 User = get_user_model()
 
@@ -155,7 +158,8 @@ def _product_queryset():
         'seller', 'seller__seller_profile',
     ).prefetch_related(
         'variants', 'images', 'categories',
-        'categories__subcategories', 'tags', 'sub_categories', 'sub_categories__category'
+        'categories__subcategories', 'tags', 'sub_categories', 'sub_categories__category',
+        'seller__seller_profile__excluded_states',
     )
 
 
@@ -167,6 +171,32 @@ def _product_list_queryset():
         'variants', 'images', 'categories',
         'sub_categories', 'sub_categories__category',
     )
+
+
+def _delivery_area_from_params(params):
+    """
+    Buyer's delivery area from query params → (region, state_code).
+    A known `state` code wins and implies its region; otherwise a known
+    `region` alone; anything unknown is ignored (no filtering).
+    """
+    state_code = (params.get('state') or '').upper()
+    if state_code in STATE_REGIONS:
+        return STATE_REGIONS[state_code], state_code
+    region = params.get('region')
+    return (region if region in REGION_SHIPS_FIELDS else None), None
+
+
+def _filter_by_delivery_area(queryset, region, state_code=None):
+    """Keep products whose seller ships to *region* and hasn't excluded *state_code*.
+    Sellers without a profile have no delivery limits, so they stay visible."""
+    ships_field = REGION_SHIPS_FIELDS.get(region)
+    if ships_field:
+        queryset = queryset.filter(
+            Q(seller__seller_profile__isnull=True) | Q(**{f'seller__seller_profile__{ships_field}': True})
+        )
+    if state_code:
+        queryset = queryset.exclude(seller__seller_profile__excluded_states__state_code=state_code)
+    return queryset
 
 
 class ProductListView(generics.ListAPIView):
@@ -222,6 +252,10 @@ class ProductListView(generics.ListAPIView):
             # Public shop: only published, non-draft products
             if is_active_param is None:
                 queryset = queryset.filter(is_active=True, is_draft=False)
+
+        # Buyer's delivery area — only sellers who deliver there
+        region, state_code = _delivery_area_from_params(params)
+        queryset = _filter_by_delivery_area(queryset, region, state_code)
 
         # In-stock filter
         if params.get('in_stock') in ('true', '1', 'True'):
@@ -282,7 +316,7 @@ class ProductListView(generics.ListAPIView):
     _FILTER_PARAMS = frozenset({
         'category', 'categories', 'sub_categories', 'sub_category_id',
         'care_level', 'in_stock', 'min_price', 'max_price', 'search', 'is_rare',
-        'stock_lt',
+        'stock_lt', 'region', 'state',
     })
 
     def filter_queryset(self, queryset):
@@ -1007,9 +1041,12 @@ class HomeDataView(generics.GenericAPIView):
         from sellers.serializers import SellerProfileSerializer
         from django.contrib.auth import get_user_model
         User = get_user_model()
-        print(f"debug: {User}")
 
-        cached = cache.get(self._CACHE_KEY)
+        # Buyer's delivery area narrows the product strip; unknown → all India
+        region, state_code = _delivery_area_from_params(request.query_params)
+        cache_key = f'{self._CACHE_KEY}:{region or "all"}:{state_code or "all"}'
+
+        cached = cache.get(cache_key)
         if cached is not None:
             return Response(cached)
 
@@ -1017,7 +1054,14 @@ class HomeDataView(generics.GenericAPIView):
             is_active=True, is_featured=True
         ).order_by('sort_order', '-rating')
 
-        home_ids = get_ordered_product_ids()[:8]
+        if region:
+            area_qs = _filter_by_delivery_area(
+                Product.objects.filter(is_active=True, is_draft=False), region, state_code
+            )
+            area_params = {'region': region, 'state': state_code} if state_code else {'region': region}
+            home_ids = get_filtered_ordered_ids(area_params, area_qs)[:8]
+        else:
+            home_ids = get_ordered_product_ids()[:8]
         id_to_pos = {pid: idx for idx, pid in enumerate(home_ids)}
         _home_products = list(
             _product_list_queryset().filter(is_active=True, is_draft=False, id__in=home_ids)
@@ -1038,7 +1082,7 @@ class HomeDataView(generics.GenericAPIView):
         }
         # Don't pin an empty product strip for the full TTL when products exist.
         if products_qs or not stats['total_products']:
-            cache.set(self._CACHE_KEY, data, self._CACHE_TTL)
+            cache.set(cache_key, data, self._CACHE_TTL)
         return Response(data)
 
 from django.http import HttpResponse

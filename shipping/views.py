@@ -11,6 +11,7 @@ from .models import ShippingAddress, Shipment, LogisticsProviderSettings, Logist
 from .serializers import ShippingAddressSerializer, ShipmentSerializer
 from .services import get_logistics_service, check_pincode_deliverable
 from .pincode_zones import classify_pincode
+from .regions import region_for_pincode, regions_payload, states_for_pincode, states_payload
 
 logger = logging.getLogger(__name__)
 
@@ -736,6 +737,23 @@ class PincodeCheckView(APIView):
             "deliverable": deliverable,
             "zone": zone_fallback["zone"] if deliverable else "E",
             "city": zone_fallback.get("city"),
+            "region": region_for_pincode(pincode),
+            "states": list(states_for_pincode(pincode)),
             "message": message,
         }
         return Response(result)
+
+
+class DeliveryRegionsView(APIView):
+    """
+    GET /api/shipping/regions/
+    Static list of delivery regions and the states in each, for the buyer's
+    region picker. Changes only with a deploy, so browsers may cache it.
+    """
+    permission_classes = (permissions.AllowAny,)
+    CACHE_SECONDS = 60 * 60 * 24
+
+    def get(self, request):
+        response = Response({"regions": regions_payload(), "states": states_payload()})
+        response['Cache-Control'] = f'public, max-age={self.CACHE_SECONDS}'
+        return response

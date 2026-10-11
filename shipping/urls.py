@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ShippingAddressViewSet, LogisticsViewSet, LogisticsProviderSettingsView,
     PackageImageUploadView, PincodeCheckView, NimbusPostWebhookView, ShiprocketWebhookView,
+    DeliveryRegionsView,
 )
 
 router = DefaultRouter()
@@ -14,6 +15,7 @@ urlpatterns = [
     path('provider-settings/', LogisticsProviderSettingsView.as_view(), name='logistics_provider_settings'),
     path('package-image/', PackageImageUploadView.as_view(), name='package_image_upload'),
     path('pincode-check/', PincodeCheckView.as_view(), name='pincode_check'),
+    path('regions/', DeliveryRegionsView.as_view(), name='delivery_regions'),
 
     # Webhook endpoints register both with and without trailing slash so
     # provider dashboards work either way. Django's APPEND_SLASH 301-redirect

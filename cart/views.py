@@ -1,3 +1,4 @@
+import uuid
 from rest_framework import viewsets, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -5,6 +6,24 @@ from django.db.models import Prefetch
 from core.models import ProductVariant
 from .models import Cart, CartItem
 from .serializers import CartSerializer
+
+# A cart holds at most 3 sellers; allow headroom but cap the lookup size.
+MAX_SHIPPING_CONFIG_SELLERS = 20
+
+
+def _valid_uuids(raw_values):
+    """Keep only well-formed UUID strings so bad input can't 500 a UUID filter."""
+    valid = []
+    for value in raw_values:
+        try:
+            valid.append(str(uuid.UUID(value.strip())))
+        except (ValueError, AttributeError):
+            continue
+    return valid
+
+
+def _optional_float(value):
+    return float(value) if value is not None else None
 
 
 def _cart_with_prefetch(cart):
@@ -132,16 +151,31 @@ class CartViewSet(viewsets.ModelViewSet):
         """Return per-seller shipping tier configs for the given seller IDs.
 
         Query param: seller_ids=UUID1,UUID2,...
-        Response: { "seller_id": { "light": {...}, "heavy": {...} }, ... }
+        Response: { "seller_id": { "light": {...}, "heavy": {...},
+                    "delivery": { "service_regions": [...], "excluded_states": [...],
+                                  "region_fees": {...} } }, ... }
         """
-        from sellers.models import SellerShippingConfig
+        from sellers.models import SellerShippingConfig, SellerProfile, REGION_FEE_FIELDS
         raw = request.query_params.get('seller_ids', '')
-        seller_ids = [s.strip() for s in raw.split(',') if s.strip()]
+        seller_ids = _valid_uuids(raw.split(','))[:MAX_SHIPPING_CONFIG_SELLERS]
         if not seller_ids:
             return Response({})
 
         configs = SellerShippingConfig.objects.filter(seller_id__in=seller_ids)
+        profiles = SellerProfile.objects.filter(user_id__in=seller_ids).only(
+            'user_id', 'ships_to_south', 'ships_to_north', 'ships_to_north_east',
+            *REGION_FEE_FIELDS.values(),
+        ).prefetch_related('excluded_states')
         result = {}
+        for profile in profiles:
+            result.setdefault(str(profile.user_id), {})['delivery'] = {
+                'service_regions': profile.service_regions,
+                'excluded_states': profile.excluded_state_codes,
+                'region_fees': {
+                    region: _optional_float(profile.delivery_fee_for(region))
+                    for region in REGION_FEE_FIELDS
+                },
+            }
         for cfg in configs:
             sid = str(cfg.seller_id)
             result.setdefault(sid, {})[cfg.item_category] = {

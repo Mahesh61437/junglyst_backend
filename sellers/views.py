@@ -10,7 +10,10 @@ from .models import (
     SellerProfile, AllowedSeller, SellerShippingConfig,
     ShippingDefaultConfig, SellerBlackoutDate,
 )
-from .serializers import SellerProfileSerializer, SellerBlackoutDateSerializer, AdminSellerProfileSerializer
+from .serializers import (
+    SellerProfileSerializer, SellerBlackoutDateSerializer, AdminSellerProfileSerializer,
+    SellerDeliveryRegionsSerializer,
+)
 from .encryption import encrypt_field, decrypt_field, mask_account
 from django.utils.text import slugify
 
@@ -964,3 +967,40 @@ class SellerBlackoutDestroyView(generics.GenericAPIView):
             return Response({"error": "Blackout not found"}, status=404)
         blackout.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── Delivery regions — seller self-serve ─────────────────────────────────────
+
+class SellerDeliveryRegionsView(generics.GenericAPIView):
+    """
+    GET   /api/sellers/delivery-regions/  — current seller's regions and regional fees
+    PATCH /api/sellers/delivery-regions/  — update them
+        body: { ships_to_south?, ships_to_north?, ships_to_north_east?: bool,
+                delivery_fee_south?, delivery_fee_north?, delivery_fee_north_east?: number|null }
+    A null fee means "use the standard slab-based shipping fee" for that region.
+    """
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = SellerDeliveryRegionsSerializer
+
+    def _profile_or_error(self, user):
+        if user.role not in ('grower', 'admin'):
+            return None, Response({"error": "Access denied"}, status=403)
+        try:
+            return user.seller_profile, None
+        except SellerProfile.DoesNotExist:
+            return None, Response({"error": "Seller profile not found"}, status=404)
+
+    def get(self, request):
+        profile, error = self._profile_or_error(request.user)
+        if error:
+            return error
+        return Response(self.get_serializer(profile).data)
+
+    def patch(self, request):
+        profile, error = self._profile_or_error(request.user)
+        if error:
+            return error
+        serializer = self.get_serializer(profile, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)

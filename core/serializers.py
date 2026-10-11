@@ -51,6 +51,8 @@ class PublicSellerProfileSerializer(serializers.Serializer):
     is_featured = serializers.BooleanField()
     rating = serializers.CharField()
     shipping_days = serializers.JSONField()
+    service_regions = serializers.ListField(read_only=True)
+    excluded_states = serializers.ListField(source='excluded_state_codes', read_only=True)
     daily_cutoff_time = serializers.SerializerMethodField()
     blackout_dates = serializers.SerializerMethodField()
     next_shipping_date = serializers.SerializerMethodField()
