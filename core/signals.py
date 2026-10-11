@@ -1,7 +1,8 @@
-from django.db.models.signals import post_save, post_delete
+from django.db.models.signals import pre_save, post_save, post_delete
 from django.dispatch import receiver
 from django.core.cache import cache
 
+from sellers.models import SellerProfile, SellerExcludedState, SellerCategoryRegion, REGION_SHIPS_FIELDS
 from .models import Product, Category, SubCategory, ProductVariant, ProductImage
 
 
@@ -74,3 +75,46 @@ def variant_stock_invalidate(sender, instance, **kwargs):
     """
     from .tasks import rebuild_feed_cache
     rebuild_feed_cache.apply_async(countdown=5)
+
+
+# ---------------------------------------------------------------------------
+# Seller delivery regions — region-filtered shop/home responses are cached
+# ---------------------------------------------------------------------------
+
+def _region_flags(values) -> tuple:
+    return tuple(values[field] for field in REGION_SHIPS_FIELDS.values())
+
+
+@receiver(pre_save, sender=SellerProfile)
+def remember_seller_regions(sender, instance, **kwargs):
+    """Snapshot the stored region flags so post_save can tell if they changed."""
+    previous = None
+    if instance.pk:
+        previous = (
+            SellerProfile.objects.filter(pk=instance.pk)
+            .values(*REGION_SHIPS_FIELDS.values())
+            .first()
+        )
+    instance._previous_region_flags = _region_flags(previous) if previous else None
+
+
+@receiver(post_save, sender=SellerProfile)
+def seller_regions_invalidate(sender, instance, created, **kwargs):
+    """
+    A seller started or stopped shipping to a region → their products enter or
+    leave that region's shop and home feeds. A new profile ships everywhere by
+    default, which changes nothing.
+    """
+    previous = getattr(instance, '_previous_region_flags', None)
+    if created or previous is None:
+        return
+    current = tuple(getattr(instance, field) for field in REGION_SHIPS_FIELDS.values())
+    if current != previous:
+        cache.clear()
+
+
+@receiver([post_save, post_delete], sender=SellerExcludedState)
+@receiver([post_save, post_delete], sender=SellerCategoryRegion)
+def seller_delivery_rule_invalidate(sender, **kwargs):
+    """A state exclusion or category rule changed (e.g. via Django admin) → region/state feeds change."""
+    cache.clear()

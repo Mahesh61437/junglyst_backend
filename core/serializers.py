@@ -51,6 +51,8 @@ class PublicSellerProfileSerializer(serializers.Serializer):
     is_featured = serializers.BooleanField()
     rating = serializers.CharField()
     shipping_days = serializers.JSONField()
+    service_regions = serializers.ListField(read_only=True)
+    excluded_states = serializers.ListField(source='excluded_state_codes', read_only=True)
     daily_cutoff_time = serializers.SerializerMethodField()
     blackout_dates = serializers.SerializerMethodField()
     next_shipping_date = serializers.SerializerMethodField()
@@ -269,6 +271,9 @@ class ProductSerializer(serializers.ModelSerializer):
     seller_id = serializers.UUIDField(write_only=True, required=False)
     image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
+    # Regions this product can be delivered to: the store's regions narrowed by
+    # the seller's rules for its categories. None when the seller has no profile.
+    delivery_regions = serializers.SerializerMethodField()
     
     # Helper fields for the first variant (read-only for compatibility).
     # commission_rate and gst_rate are intentionally NOT exposed — those are
@@ -296,6 +301,18 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_category(self, obj):
         categories = obj.categories.all()
         return categories[0].name if categories else None
+
+    def get_delivery_regions(self, obj):
+        try:
+            profile = obj.seller.seller_profile
+        except Exception:
+            return None
+        from sellers.delivery import product_regions
+        seller_id = str(profile.user_id)
+        rule_map = {(seller_id, rule.category_id): rule.regions for rule in profile.category_regions.all()}
+        return product_regions(
+            profile.service_regions, seller_id, [c.id for c in obj.categories.all()], rule_map,
+        )
 
     def get_sub_category(self, obj):
         subcategories = obj.sub_categories.all()

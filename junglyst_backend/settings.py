@@ -246,11 +246,16 @@ if REDISHOST and not REDIS_URL:
     else:
         REDIS_URL = f"redis://{REDISHOST}:{REDISPORT}/0"
 
+# Namespace cache keys per environment so environments that share a Redis
+# instance can never read each other's entries (e.g. the product feed IDs).
+CACHE_KEY_PREFIX = config('CACHE_KEY_PREFIX', default=RAILWAY_ENV or 'local')
+
 if REDIS_URL:
     CACHES = {
         "default": {
             "BACKEND": "django_redis.cache.RedisCache",
             "LOCATION": REDIS_URL,
+            "KEY_PREFIX": CACHE_KEY_PREFIX,
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
             }

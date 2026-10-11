@@ -6,7 +6,8 @@ from .views import (
     SellerPromotionView, AdminSellerProfileEditView, BankDetailsView,
     SellerShippingConfigListCreateView, SellerShippingConfigDetailView,
     ShippingDefaultConfigView, SellerPickupAddressView, SellerPickupOTPView,
-    SellerBlackoutListCreateView, SellerBlackoutDestroyView,
+    SellerBlackoutListCreateView, SellerBlackoutDestroyView, SellerDeliveryRegionsView,
+    SellerDeliveryRegionsAdminView,
 )
 
 urlpatterns = [
@@ -23,6 +24,7 @@ urlpatterns = [
     path('pickup-address/otp/', SellerPickupOTPView.as_view(), name='seller_pickup_otp'),
     path('blackouts/', SellerBlackoutListCreateView.as_view(), name='seller_blackouts'),
     path('blackouts/<int:pk>/', SellerBlackoutDestroyView.as_view(), name='seller_blackout_delete'),
+    path('delivery-regions/', SellerDeliveryRegionsView.as_view(), name='seller_delivery_regions'),
     path('check-approval/', CheckSellerApprovalView.as_view(), name='check_seller_approval'),
     path('check-email/', CheckEmailAllowedView.as_view(), name='check_email_allowed'),
     path('platform-stats/', PlatformStatsView.as_view(), name='platform_stats'),
@@ -31,6 +33,7 @@ urlpatterns = [
     # Admin: seller promotion control
     path('profiles/<int:pk>/promote/', SellerPromotionView.as_view(), name='seller_promote'),
     path('profiles/<int:pk>/admin-edit/', AdminSellerProfileEditView.as_view(), name='admin_seller_edit'),
+    path('profiles/<int:pk>/delivery-regions/', SellerDeliveryRegionsAdminView.as_view(), name='admin_seller_delivery_regions'),
     path('profiles/admin/allowed/', AllowedSellerListCreateView.as_view(), name='admin_allowed_list'),
     path('profiles/admin/allowed/<int:pk>/', AllowedSellerDestroyView.as_view(), name='admin_allowed_delete'),
 

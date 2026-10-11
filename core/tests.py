@@ -183,3 +183,51 @@ class ProductFairnessTests(APITestCase):
         for s_id, count in seller_counts.items():
             self.assertTrue(count <= 2, f"Seller {s_id} has {count} products on homepage (limit is 2)")
 
+
+
+import uuid
+
+from django.core.cache import cache
+
+from core.feed import FEED_CACHE_KEY, get_ordered_product_ids
+
+
+class StaleFeedCacheTests(APITestCase):
+    """The cached feed must rebuild when it doesn't match this database."""
+
+    def setUp(self):
+        cache.clear()
+        self.seller = User.objects.create_user(
+            email="feed_seller@example.com", username="feed_seller", password="Password123", role="grower"
+        )
+        self.products = []
+        for i in range(3):
+            p = Product.objects.create(
+                name=f"Feed Plant {i}", description="d", seller=self.seller, is_active=True, is_draft=False
+            )
+            ProductVariant.objects.create(product=p, name="Standard", stock=5, price=100.0)
+            self.products.append(p)
+        self.live_ids = {p.id for p in self.products}
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_feed_from_another_database_is_rebuilt(self):
+        cache.set(FEED_CACHE_KEY, [str(uuid.uuid4()) for _ in range(5)], 3600)
+        self.assertEqual(set(get_ordered_product_ids()), self.live_ids)
+
+    def test_empty_cached_feed_is_rebuilt_when_products_exist(self):
+        cache.set(FEED_CACHE_KEY, [], 3600)
+        self.assertEqual(set(get_ordered_product_ids()), self.live_ids)
+
+    def test_valid_cached_feed_is_kept(self):
+        cached = [str(p.id) for p in reversed(self.products)]
+        cache.set(FEED_CACHE_KEY, cached, 3600)
+        self.assertEqual([str(i) for i in get_ordered_product_ids()], cached)
+
+    def test_home_and_shop_recover_from_stale_feed(self):
+        cache.set(FEED_CACHE_KEY, [str(uuid.uuid4()) for _ in range(5)], 3600)
+        home = self.client.get(reverse('home_data'))
+        self.assertEqual(len(home.data['products']), 3)
+        shop = self.client.get(reverse('product_list'))
+        self.assertEqual(shop.data['count'], 3)
