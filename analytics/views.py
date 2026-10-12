@@ -43,7 +43,8 @@ class SuperAdminDashboardView(generics.GenericAPIView):
     permission_classes = (IsAdminUser,)
 
     def get(self, request):
-        from orders.models import SubOrder, SubOrderStatus, OrderStatus, PaymentStatus
+        from orders.bookings import PAID_BOOKING_STATUSES
+        from orders.models import SubOrder, SubOrderStatus, OrderStatus, OrderType, PaymentStatus
 
         rng = self._resolve_range(request)
 
@@ -51,7 +52,13 @@ class SuperAdminDashboardView(generics.GenericAPIView):
         # Revenue counts only orders whose payment actually completed, and
         # excludes cancelled/returned orders. Summing every order (including
         # abandoned/failed checkouts) was inflating the figure.
-        orders_in_range = self._apply_range(Order.objects.all(), rng, 'created_at')
+        # Product figures only: the Orders tab below lists product sub-orders,
+        # so the headline numbers must match it. Workshops get their own line.
+        orders_in_range = self._apply_range(Order.objects.filter(order_type=OrderType.PRODUCT), rng, 'created_at')
+        workshop_paid = self._apply_range(
+            Order.objects.filter(order_type=OrderType.WORKSHOP, workshop_booking__status__in=PAID_BOOKING_STATUSES),
+            rng, 'created_at',
+        ).aggregate(count=Count('id'), revenue=Sum('total_amount'))
         paid_orders = orders_in_range.filter(
             payment_status=PaymentStatus.COMPLETED
         ).exclude(status__in=[OrderStatus.CANCELLED, OrderStatus.RETURNED])
@@ -168,6 +175,8 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 "total_users": total_users,
                 "unpaid_orders": unpaid_count,
                 "unpaid_value": unpaid_value,
+                "workshop_bookings": workshop_paid['count'] or 0,
+                "workshop_revenue": workshop_paid['revenue'] or 0,
             },
             "sellers": sellers_data,
             "status_choices": [{"value": v, "label": l} for v, l in SubOrderStatus.choices],

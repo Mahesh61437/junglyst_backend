@@ -1,3 +1,4 @@
+import re
 from decimal import Decimal
 
 from django.db import transaction
@@ -6,13 +7,16 @@ from rest_framework import serializers
 from core.models import User
 from orders.bookings import PAID_BOOKING_STATUSES
 from .models import (
-    Workshop, WorkshopBooking, WorkshopOption, WorkshopOrganiser, WorkshopPayout, WorkshopSession,
+    RegistrationState, Workshop, WorkshopBooking, WorkshopOption, WorkshopOrganiser, WorkshopPayout, WorkshopSession,
 )
-from .services import organiser_terms, paid_booking_count, recalculate_unsettled, unsettled_bookings
+from .services import (
+    organiser_contact, organiser_terms, paid_booking_count, recalculate_unsettled, unsettled_bookings,
+)
 
 MAX_LIST_ITEMS = 20
 MAX_LIST_ITEM_LENGTH = 200
 MAX_IMAGES = 12
+PHONE_PATTERN = re.compile(r'^\+?[0-9 ]{10,15}$')
 
 
 def _store_name(user):
@@ -88,14 +92,15 @@ class WorkshopCardSerializer(OrganiserMixin, serializers.ModelSerializer):
     seats_left = serializers.SerializerMethodField()
     upcoming_session_count = serializers.SerializerMethodField()
     registration_open = serializers.SerializerMethodField()
+    registration_state = serializers.SerializerMethodField()
 
     class Meta:
         model = Workshop
         fields = (
             'id', 'slug', 'title', 'tagline', 'category', 'cover_image', 'city', 'venue_name',
             'duration_minutes', 'skill_level', 'is_featured', 'price_from', 'next_session_date',
-            'seats_left', 'upcoming_session_count', 'registration_open', 'registration_closes_at',
-            'organiser', 'organisers',
+            'seats_left', 'upcoming_session_count', 'registration_open', 'registration_state',
+            'registration_opens_at', 'registration_closes_at', 'organiser', 'organisers',
         )
 
     def get_seats_left(self, obj):
@@ -105,14 +110,18 @@ class WorkshopCardSerializer(OrganiserMixin, serializers.ModelSerializer):
     def get_upcoming_session_count(self, obj):
         return len(getattr(obj, 'upcoming_sessions', []))
 
+    def get_registration_state(self, obj):
+        return obj.registration_state(getattr(obj, 'upcoming_sessions', []))
+
     def get_registration_open(self, obj):
-        return obj.is_registration_open()
+        return self.get_registration_state(obj) == RegistrationState.OPEN
 
 
 class WorkshopDetailSerializer(OrganiserMixin, serializers.ModelSerializer):
     options = serializers.SerializerMethodField()
     sessions = serializers.SerializerMethodField()
     registration_open = serializers.SerializerMethodField()
+    registration_state = serializers.SerializerMethodField()
 
     class Meta:
         model = Workshop
@@ -120,12 +129,15 @@ class WorkshopDetailSerializer(OrganiserMixin, serializers.ModelSerializer):
             'id', 'slug', 'title', 'tagline', 'category', 'description', 'highlights', 'what_to_bring',
             'images', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes', 'skill_level',
             'min_age', 'max_seats_per_booking', 'cancellation_policy', 'registration_opens_at',
-            'registration_closes_at', 'registration_open', 'status', 'options', 'sessions', 'organiser',
-            'organisers',
+            'registration_closes_at', 'registration_open', 'registration_state', 'status', 'options',
+            'sessions', 'organiser', 'organisers',
         )
 
+    def get_registration_state(self, obj):
+        return obj.registration_state(getattr(obj, 'upcoming_sessions', []))
+
     def get_registration_open(self, obj):
-        return obj.is_registration_open()
+        return self.get_registration_state(obj) == RegistrationState.OPEN
 
     def get_options(self, obj):
         return PublicOptionSerializer([o for o in obj.options.all() if o.is_active], many=True).data
@@ -140,7 +152,7 @@ class BookingRequestSerializer(serializers.Serializer):
     option_id = serializers.IntegerField()
     participants = serializers.IntegerField(min_value=1, max_value=50)
     attendee_name = serializers.CharField(max_length=120, trim_whitespace=True)
-    attendee_phone = serializers.RegexField(r'^\+?[0-9 ]{10,15}$', error_messages={
+    attendee_phone = serializers.RegexField(PHONE_PATTERN, error_messages={
         'invalid': 'Enter a valid 10-digit mobile number.',
     })
     attendee_email = serializers.EmailField()
@@ -154,6 +166,7 @@ class BookingSerializer(serializers.ModelSerializer):
     order_id = serializers.UUIDField(read_only=True)
     workshop_slug = serializers.CharField(source='workshop.slug', read_only=True)
     venue = serializers.SerializerMethodField()
+    organiser_contact = serializers.SerializerMethodField()
     status_label = serializers.CharField(source='get_status_display', read_only=True)
 
     class Meta:
@@ -162,12 +175,15 @@ class BookingSerializer(serializers.ModelSerializer):
             'id', 'reference', 'order_id', 'status', 'status_label', 'workshop', 'workshop_title',
             'workshop_slug', 'option_name', 'session', 'session_date', 'session_start', 'session_end',
             'participants', 'attendee_name', 'attendee_phone', 'attendee_email', 'notes',
-            'unit_price', 'total_amount', 'venue', 'confirmed_at', 'created_at',
+            'unit_price', 'total_amount', 'venue', 'organiser_contact', 'confirmed_at', 'created_at',
         )
 
     def get_venue(self, obj):
         w = obj.workshop
         return {'name': w.venue_name, 'city': w.city, 'address': w.address, 'map_url': w.map_url}
+
+    def get_organiser_contact(self, obj):
+        return organiser_contact(obj.workshop)
 
 
 class SellerBookingSerializer(BookingSerializer):
@@ -320,7 +336,7 @@ class AdminWorkshopSerializer(serializers.ModelSerializer):
             'images', 'seller', 'organiser_name', 'status', 'is_featured', 'registration_opens_at',
             'registration_closes_at', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes',
             'skill_level', 'min_age', 'max_seats_per_booking', 'cancellation_policy', 'commission_percent',
-            'organisers', 'options', 'sessions', 'session_inputs', 'recalculate_unsettled',
+            'contact_name', 'contact_phone', 'organisers', 'options', 'sessions', 'session_inputs', 'recalculate_unsettled',
             'paid_booking_count', 'recalculable_booking_count', 'created_at', 'updated_at',
         )
         read_only_fields = ('id', 'slug', 'created_at', 'updated_at')
@@ -333,6 +349,12 @@ class AdminWorkshopSerializer(serializers.ModelSerializer):
 
     def get_recalculable_booking_count(self, obj):
         return unsettled_bookings(obj).count()
+
+    def validate_contact_phone(self, value):
+        value = (value or '').strip()
+        if value and not PHONE_PATTERN.match(value):
+            raise serializers.ValidationError("Enter a valid 10-digit mobile number.")
+        return value
 
     def validate_organisers(self, rows):
         if not rows:
@@ -444,7 +466,10 @@ class AdminWorkshopSerializer(serializers.ModelSerializer):
         existing = {s.id: s for s in workshop.sessions.with_seats_taken()}
         for row in rows:
             session = existing.get(row.get('id'))
-            if session and row.get('capacity') is not None and row['capacity'] < session.seats_booked:
+            # Only block *lowering* below seats sold; an already-overbooked
+            # session (late payment) must not lock the rest of the form.
+            if (session and row.get('capacity') is not None and row['capacity'] < session.seats_booked
+                    and row['capacity'] < session.capacity):
                 raise serializers.ValidationError({'session_inputs': (
                     f"{session.date:%d %b} {session.start_time:%H:%M} already has {session.seats_booked} "
                     f"seats sold, so its capacity can't be lower than that."
@@ -513,11 +538,12 @@ class AdminWorkshopListSerializer(serializers.ModelSerializer):
     session_count = serializers.IntegerField(read_only=True)
     seats_booked = serializers.IntegerField(read_only=True)
     capacity = serializers.IntegerField(read_only=True)
+    has_overbooked_session = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Workshop
         fields = (
-            'id', 'slug', 'title', 'category', 'status', 'is_featured', 'cover_image', 'city',
+            'id', 'slug', 'title', 'category', 'status', 'is_featured', 'cover_image', 'city', 'has_overbooked_session',
             'organiser_name', 'commission_percent', 'registration_opens_at', 'registration_closes_at',
             'next_session_date', 'session_count', 'seats_booked', 'capacity', 'updated_at',
         )

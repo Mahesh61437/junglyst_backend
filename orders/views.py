@@ -30,7 +30,7 @@ from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payme
 from payments.models import PaymentGatewaySettings, PaymentGateway
 from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
 from .models import Order, OrderItem, SubOrder, SellerSettlement
-from .order_types import booking_select_related
+from .order_types import booking_prefetch_related, booking_select_related
 from .serializers import (
     OrderSerializer, OrderListSerializer, OrderDetailSerializer,
     SellerOrderSerializer, SellerSubOrderSerializer,
@@ -924,7 +924,7 @@ class OrderListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        qs = Order.objects.filter(user=user).select_related(*booking_select_related())
+        qs = Order.objects.filter(user=user).select_related(*booking_select_related()).prefetch_related(*booking_prefetch_related())
 
         # Single query for items + their product images — eliminates all N+1
         items_qs = OrderItem.objects.select_related('product').prefetch_related('product__images')
@@ -950,7 +950,7 @@ class OrderDetailView(generics.RetrieveAPIView):
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
-        qs = qs.select_related(*booking_select_related())
+        qs = qs.select_related(*booking_select_related()).prefetch_related(*booking_prefetch_related())
 
         items_qs = OrderItem.objects.select_related('product', 'variant').prefetch_related('product__images')
         sub_orders_qs = SubOrder.objects.select_related(
@@ -994,10 +994,11 @@ class OrderTrackView(APIView):
         ).prefetch_related(
             Prefetch('items', queryset=items_qs),
         )
-        qs = Order.objects.select_related('payment').prefetch_related(
+        qs = Order.objects.select_related('payment', *booking_select_related()).prefetch_related(
             Prefetch('items', queryset=items_qs),
             Prefetch('sub_orders', queryset=sub_orders_qs),
             'shipments',
+            *booking_prefetch_related(),
         )
 
         if order_uuid:

@@ -10,7 +10,9 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import connection
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -778,3 +780,213 @@ class CoHostAdminEditTests(TestCase):
         self.assertEqual(self.session.capacity, 10)
         res = self.client.patch(self.url, self._session_payload(capacity=3), format="json")
         self.assertEqual(res.status_code, 200, res.content)
+
+
+@override_settings(**TEST_SETTINGS)
+class RegistrationWindowTests(TestCase):
+    """Registrations open and close on their own: by time, and when seats run out."""
+
+    def setUp(self):
+        self.seller = make_seller("org@test.com", "Moss Lab")
+        self.workshop, self.option, self.session = make_workshop(self.seller, capacity=2)
+        self.client = APIClient()
+
+    def _state(self):
+        return self.client.get(f"/api/workshops/{self.workshop.slug}/").data["registration_state"]
+
+    def test_opens_automatically_at_the_configured_time(self):
+        opens = timezone.now() + timedelta(hours=2)
+        self.workshop.registration_opens_at = opens
+        self.workshop.save()
+        self.assertEqual(self._state(), "opens_later")
+        self.assertFalse(self.client.get("/api/workshops/").data["results"][0]["registration_open"])
+        with self.assertRaisesMessage(BookingError, "closed"):
+            create_pending_booking(booking_request(self.workshop, self.option, self.session, participants=1))
+        with patch("django.utils.timezone.now", return_value=opens + timedelta(minutes=1)):
+            self.assertEqual(self._state(), "open")
+            create_pending_booking(booking_request(self.workshop, self.option, self.session, participants=1))
+
+    def test_closes_automatically_at_the_configured_time(self):
+        closes = timezone.now() + timedelta(hours=1)
+        self.workshop.registration_closes_at = closes
+        self.workshop.save()
+        self.assertEqual(self._state(), "open")
+        with patch("django.utils.timezone.now", return_value=closes + timedelta(seconds=1)):
+            self.assertEqual(self._state(), "closed")
+            with self.assertRaisesMessage(BookingError, "closed"):
+                create_pending_booking(booking_request(self.workshop, self.option, self.session, participants=1))
+
+    def test_closes_automatically_when_every_session_is_full(self):
+        booking = create_pending_booking(booking_request(self.workshop, self.option, self.session, participants=2))
+        WorkshopBooking.objects.filter(pk=booking.pk).update(status=BookingStatus.CONFIRMED)
+        self.assertEqual(self._state(), "sold_out")
+        card = self.client.get("/api/workshops/").data["results"][0]
+        self.assertEqual((card["registration_state"], card["registration_open"], card["seats_left"]), ("sold_out", False, 0))
+        # A new session reopens registrations straight away.
+        WorkshopSession.objects.create(workshop=self.workshop, date=timezone.localdate() + timedelta(days=9),
+                                       start_time=time(10), end_time=time(12), capacity=5)
+        self.assertEqual(self._state(), "open")
+
+    def test_cancelled_seat_reopens_a_full_session(self):
+        booking = create_pending_booking(booking_request(self.workshop, self.option, self.session, participants=2))
+        WorkshopBooking.objects.filter(pk=booking.pk).update(status=BookingStatus.CONFIRMED)
+        self.assertEqual(self._state(), "sold_out")
+        WorkshopBooking.objects.filter(pk=booking.pk).update(status=BookingStatus.CANCELLED)
+        self.assertEqual(self._state(), "open")
+
+    def test_no_upcoming_sessions(self):
+        self.session.date = timezone.localdate() - timedelta(days=1)
+        self.session.save()
+        self.assertEqual(self._state(), "no_dates")
+
+
+@override_settings(**TEST_SETTINGS)
+class OrganiserContactTests(TestCase):
+    def setUp(self):
+        self.seller = make_seller("org@test.com", "Moss Lab")
+        self.seller.phone = "9000000001"
+        self.seller.save()
+        self.buyer = User.objects.create_user(email="buyer@test.com", username="buyer", password="x")
+        self.workshop, self.option, self.session = make_workshop(self.seller)
+        self.booking = create_pending_booking(booking_request(self.workshop, self.option, self.session, user=self.buyer))
+
+    def test_contact_defaults_to_lead_organiser_phone(self):
+        client = APIClient()
+        client.force_authenticate(self.buyer)
+        data = client.get(f"/api/workshops/bookings/by-order/{self.booking.order.order_number}/").data
+        self.assertEqual(data["organiser_contact"], {"name": "Moss Lab", "phone": "9000000001", "hosts": ["Moss Lab"]})
+
+    def test_configured_contact_appears_in_orders_ticket_and_email(self):
+        self.workshop.contact_name = "Priya (host)"
+        self.workshop.contact_phone = "9876500000"
+        self.workshop.save()
+        client = APIClient()
+        client.force_authenticate(self.buyer)
+        orders = client.get("/api/orders/").data
+        order = orders["results"][0] if "results" in orders else orders[0]
+        self.assertEqual(order["booking"]["organiser_contact"]["phone"], "9876500000")
+        ticket = client.get(f"/api/workshops/bookings/by-order/{self.booking.order.order_number}/").data
+        self.assertEqual(ticket["organiser_contact"]["name"], "Priya (host)")
+
+        from django.core import mail
+        from .tasks import send_workshop_booking_emails_task
+        send_workshop_booking_emails_task(str(self.booking.id))
+        attendee_mail = next(m for m in mail.outbox if "asha@example.com" in m.to)
+        self.assertIn("9876500000", attendee_mail.alternatives[0][0])
+        self.assertIn("Priya (host)", attendee_mail.alternatives[0][0])
+
+    def test_contact_is_not_public(self):
+        self.workshop.contact_phone = "9876500000"
+        self.workshop.save()
+        detail = APIClient().get(f"/api/workshops/{self.workshop.slug}/").content.decode()
+        listing = APIClient().get("/api/workshops/").content.decode()
+        self.assertNotIn("9876500000", detail)
+        self.assertNotIn("9876500000", listing)
+        self.assertNotIn("9000000001", detail)
+
+    def test_admin_contact_phone_validation(self):
+        admin = User.objects.create_superuser(email="admin@junglyst.com", username="admin", password="x")
+        client = APIClient()
+        client.force_authenticate(admin)
+        url = f"/api/workshops/admin/workshops/{self.workshop.id}/"
+        self.assertEqual(client.patch(url, {"contact_phone": "12ab"}, format="json").status_code, 400)
+        res = client.patch(url, {"contact_name": "Priya", "contact_phone": " 98765 00000 "}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(res.data["contact_phone"], "98765 00000")
+
+    def test_order_list_query_count_is_flat(self):
+        for _ in range(3):
+            create_pending_booking(booking_request(self.workshop, self.option, self.session, participants=1, user=self.buyer))
+        client = APIClient()
+        client.force_authenticate(self.buyer)
+        with CaptureQueriesContext(connection) as few:
+            client.get("/api/orders/")
+        for _ in range(3):
+            create_pending_booking(booking_request(self.workshop, self.option, self.session, participants=1, user=self.buyer))
+        with CaptureQueriesContext(connection) as more:
+            client.get("/api/orders/")
+        self.assertEqual(len(few), len(more), "order list must not query per workshop booking")
+
+
+@override_settings(**TEST_SETTINGS)
+class GapFixTests(TestCase):
+    def setUp(self):
+        self.admin = User.objects.create_superuser(email="admin@junglyst.com", username="admin", password="x")
+        self.seller = make_seller("org@test.com", "Moss Lab")
+        self.seller.phone = "9000000001"
+        self.seller.save()
+        self.workshop, self.option, self.session = make_workshop(self.seller, capacity=2)
+        self.workshop.contact_phone = "9876500000"
+        self.workshop.save()
+
+    def _paid(self, participants, created_ago_minutes=0):
+        booking = create_pending_booking(booking_request(self.workshop, self.option, self.session, participants))
+        if created_ago_minutes:
+            WorkshopBooking.objects.filter(pk=booking.pk).update(
+                created_at=timezone.now() - timedelta(minutes=created_ago_minutes))
+        return booking
+
+    @patch("workshops.tasks.send_workshop_booking_emails_task.delay")
+    def test_late_payment_overbooking_is_flagged_and_admins_alerted(self, _email):
+        stale = self._paid(2, created_ago_minutes=SEAT_HOLD_MINUTES + 5)   # hold expired
+        fresh = self._paid(2)                                               # took the seats
+        with self.captureOnCommitCallbacks(execute=True):
+            fresh.order.is_paid = True
+            fresh.order.save()
+        self.assertFalse(AppNotification.objects.filter(title="Workshop session overbooked").exists())
+        with self.captureOnCommitCallbacks(execute=True):
+            stale.order.is_paid = True
+            stale.order.save()
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, BookingStatus.CONFIRMED, "a paid buyer is never silently dropped")
+        self.assertIn("Overbooked", stale.admin_note)
+        alert = AppNotification.objects.get(title="Workshop session overbooked")
+        self.assertEqual(alert.user, self.admin)
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        self.assertTrue(client.get("/api/workshops/admin/workshops/").data[0]["has_overbooked_session"])
+        # The rest of the form still saves while the session is overbooked.
+        res = client.patch(f"/api/workshops/admin/workshops/{self.workshop.id}/", {"tagline": "Still editable"}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+
+    def test_public_tracking_shows_safe_booking_summary(self):
+        booking = self._paid(1)
+        res = APIClient().get("/api/orders/track/", {"order_number": booking.order.order_number})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["order_type"], "workshop")
+        self.assertEqual(res.data["booking"]["title"], "Terrarium Basics")
+        self.assertIsNone(res.data["shipping_address"], "attendee name/phone/email must not leak")
+        body = res.content.decode()
+        for private in ("asha@example.com", "9876543210", "9876500000", "Asha"):
+            self.assertNotIn(private, body)
+
+    def test_product_tracking_unchanged(self):
+        from orders.models import Order
+        order = Order.objects.create(order_number="JNG-2026-PRD01", shipping_address={"full_name": "Buyer"},
+                                     subtotal=100, total_amount=100)
+        res = APIClient().get("/api/orders/track/", {"order_number": "JNG-2026-PRD01"})
+        self.assertEqual(res.data["shipping_address"], {"full_name": "Buyer"})
+        self.assertIsNone(res.data["booking"])
+        self.assertEqual(order.order_type, "product")
+
+    def test_dashboard_separates_product_and_workshop_numbers(self):
+        from orders.models import Order, PaymentStatus
+        Order.objects.create(order_number="JNG-2026-PRD02", shipping_address={}, subtotal=500, total_amount=500,
+                             payment_status=PaymentStatus.COMPLETED, is_paid=True, status="confirmed")
+        booking = self._paid(1)
+        WorkshopBooking.objects.filter(pk=booking.pk).update(status=BookingStatus.CONFIRMED)
+        Order.objects.filter(pk=booking.order_id).update(payment_status=PaymentStatus.COMPLETED, is_paid=True)
+        client = APIClient()
+        client.force_authenticate(self.admin)
+        stats = client.get("/api/analytics/super-admin/dashboard/", {"period": "all"}).data["overall_analytics"]
+        self.assertEqual(stats["orders_this_month"], 1)
+        self.assertEqual(stats["revenue_this_month"], Decimal("500"))
+        self.assertEqual(stats["workshop_bookings"], 1)
+        self.assertEqual(stats["workshop_revenue"], Decimal("899.00"))
+
+    def test_sitemap_lists_public_workshops_only(self):
+        draft, *_ = make_workshop(self.seller, title="Secret Draft", status=WorkshopStatus.DRAFT)
+        xml = APIClient().get("/sitemap.xml").content.decode()
+        self.assertIn("/workshops</loc>", xml)
+        self.assertIn(f"/workshops/{self.workshop.slug}</loc>", xml)
+        self.assertNotIn(draft.slug, xml)

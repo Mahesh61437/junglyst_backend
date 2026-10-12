@@ -231,3 +231,50 @@ class StaleFeedCacheTests(APITestCase):
         self.assertEqual(len(home.data['products']), 3)
         shop = self.client.get(reverse('product_list'))
         self.assertEqual(shop.data['count'], 3)
+
+
+from core.views import HomeDataView
+
+
+class ProductStripSizeTests(APITestCase):
+    """Home shows HOME_PRODUCT_LIMIT products; the shop honours page_size=24."""
+
+    SHOP_PAGE_SIZE = 24  # mirrors SHOP_PAGE_SIZE in junglyst_ui/src/pages/Shop.jsx
+
+    def setUp(self):
+        cache.clear()
+        # One product per seller so seller-fair ordering can't hide any of them
+        for i in range(30):
+            seller = User.objects.create_user(
+                email=f"strip_seller_{i}@example.com", username=f"strip_seller_{i}",
+                password="Password123", role="grower",
+            )
+            product = Product.objects.create(
+                name=f"Strip Plant {i}", description="d", seller=seller, is_active=True, is_draft=False
+            )
+            ProductVariant.objects.create(product=product, name="Standard", stock=5, price=100.0)
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_home_returns_up_to_limit_products(self):
+        response = self.client.get(reverse('home_data'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(HomeDataView.HOME_PRODUCT_LIMIT, 24)
+        self.assertEqual(len(response.data['products']), HomeDataView.HOME_PRODUCT_LIMIT)
+
+    def test_home_returns_all_when_fewer_than_limit(self):
+        Product.objects.filter(name__in=[f"Strip Plant {i}" for i in range(20)]).update(is_active=False)
+        cache.clear()
+        response = self.client.get(reverse('home_data'))
+        self.assertEqual(len(response.data['products']), 10)
+
+    def test_shop_page_size_24_paginates(self):
+        first = self.client.get(reverse('product_list'), {'page': 1, 'page_size': self.SHOP_PAGE_SIZE})
+        second = self.client.get(reverse('product_list'), {'page': 2, 'page_size': self.SHOP_PAGE_SIZE})
+        self.assertEqual(first.data['count'], 30)
+        self.assertEqual(len(first.data['results']), self.SHOP_PAGE_SIZE)
+        self.assertEqual(len(second.data['results']), 30 - self.SHOP_PAGE_SIZE)
+        first_ids = {p['id'] for p in first.data['results']}
+        second_ids = {p['id'] for p in second.data['results']}
+        self.assertFalse(first_ids & second_ids)

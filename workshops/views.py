@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from django.db.models import Count, Min, OuterRef, Prefetch, Q, Subquery, Sum
+from django.db.models import Count, Exists, F, Min, OuterRef, Prefetch, Q, Subquery, Sum
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -185,7 +185,9 @@ class MyBookingsView(generics.ListAPIView):
     def get_queryset(self):
         return (WorkshopBooking.objects.filter(user=self.request.user)
                 .exclude(status=BookingStatus.PAYMENT_FAILED)
-                .select_related('workshop', 'order').order_by('-session_date', '-created_at'))
+                .select_related('workshop__seller__seller_profile', 'order')
+                .prefetch_related(Prefetch('workshop__organisers', queryset=WorkshopOrganiser.objects.select_related('seller__seller_profile')))
+                .order_by('-session_date', '-created_at'))
 
 
 # ── Seller (organiser) ───────────────────────────────────────────────────────
@@ -199,8 +201,8 @@ class SellerBookingListView(generics.ListAPIView):
         own_split = WorkshopBookingSplit.objects.filter(seller=self.request.user)
         qs = (WorkshopBooking.objects
               .filter(status__in=PAID_BOOKING_STATUSES, id__in=own_split.values('booking'))
-              .select_related('workshop', 'order')
-              .prefetch_related(Prefetch('splits', queryset=own_split, to_attr='my_splits')))
+              .select_related('workshop__seller__seller_profile', 'order')
+              .prefetch_related(Prefetch('splits', queryset=own_split, to_attr='my_splits'), Prefetch('workshop__organisers', queryset=WorkshopOrganiser.objects.select_related('seller__seller_profile'))))
         params = self.request.query_params
         if params.get('workshop'):
             qs = qs.filter(workshop_id=params['workshop'])
@@ -244,6 +246,12 @@ class AdminWorkshopListCreateView(generics.ListCreateAPIView):
                 capacity=Coalesce(Sum('sessions__capacity', filter=Q(sessions__is_active=True)), 0),
                 next_session_date=Subquery(next_session),
                 seats_booked=Coalesce(Subquery(booked), 0),
+                has_overbooked_session=Exists(
+                    WorkshopSession.objects.filter(workshop=OuterRef('pk'))
+                    .annotate(booked=Coalesce(Sum('bookings__participants',
+                                                  filter=Q(bookings__status__in=PAID_BOOKING_STATUSES)), 0))
+                    .filter(booked__gt=F('capacity'))
+                ),
             )
             .order_by('-created_at')
         )
@@ -300,8 +308,9 @@ class AdminBookingListView(generics.ListAPIView):
     filter_backends = ()
 
     def get_queryset(self):
-        qs = (WorkshopBooking.objects.select_related('workshop', 'order', 'seller__seller_profile')
-              .prefetch_related(Prefetch('splits', queryset=WorkshopBookingSplit.objects.select_related('seller__seller_profile'))))
+        qs = (WorkshopBooking.objects.select_related('workshop__seller__seller_profile', 'order', 'seller__seller_profile')
+              .prefetch_related(Prefetch('splits', queryset=WorkshopBookingSplit.objects.select_related('seller__seller_profile')),
+                                Prefetch('workshop__organisers', queryset=WorkshopOrganiser.objects.select_related('seller__seller_profile'))))
         params = self.request.query_params
         status_filter = params.get('status')
         if status_filter == 'paid':

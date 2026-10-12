@@ -50,6 +50,14 @@ class SkillLevel(models.TextChoices):
     ADVANCED = 'advanced', _('Advanced')
 
 
+class RegistrationState(models.TextChoices):
+    OPENS_LATER = 'opens_later', _('Opens later')
+    OPEN = 'open', _('Open')
+    SOLD_OUT = 'sold_out', _('Sold out')
+    CLOSED = 'closed', _('Closed')
+    NO_DATES = 'no_dates', _('No upcoming dates')
+
+
 class WorkshopStatus(models.TextChoices):
     DRAFT = 'draft', _('Draft')
     PUBLISHED = 'published', _('Published')
@@ -108,6 +116,11 @@ class Workshop(SoftDeleteModel):
     )
     cancellation_policy = models.TextField(blank=True, default='')
 
+    # Who attendees call about the session. Shown only to people who booked
+    # (ticket, My Orders, confirmation email), never on the public page.
+    contact_name = models.CharField(max_length=120, blank=True, default='', db_default='')
+    contact_phone = models.CharField(max_length=15, blank=True, default='', db_default='')
+
     # Default commission for newly added co-hosts. Each WorkshopOrganiser row
     # carries the commission actually applied to that seller's share.
     commission_percent = models.DecimalField(
@@ -137,6 +150,7 @@ class Workshop(SoftDeleteModel):
         return self.images[0] if self.images else ''
 
     def is_registration_open(self, now=None):
+        """Time window only. Seat availability is per session (see registration_state)."""
         now = now or timezone.now()
         if self.status != WorkshopStatus.PUBLISHED or self.is_deleted:
             return False
@@ -145,6 +159,26 @@ class Workshop(SoftDeleteModel):
         if self.registration_closes_at and now > self.registration_closes_at:
             return False
         return True
+
+    def registration_state(self, upcoming_sessions, now=None):
+        """Where registrations stand right now, worked out on every request so
+        they open and close on their own: at the configured times, and as soon
+        as every upcoming session is full.
+
+        `upcoming_sessions` must carry the `seats_taken` annotation.
+        """
+        now = now or timezone.now()
+        if self.status != WorkshopStatus.PUBLISHED or self.is_deleted:
+            return RegistrationState.CLOSED
+        if self.registration_closes_at and now > self.registration_closes_at:
+            return RegistrationState.CLOSED
+        if not upcoming_sessions:
+            return RegistrationState.NO_DATES
+        if all(s.capacity - s.seats_taken <= 0 for s in upcoming_sessions):
+            return RegistrationState.SOLD_OUT
+        if self.registration_opens_at and now < self.registration_opens_at:
+            return RegistrationState.OPENS_LATER
+        return RegistrationState.OPEN
 
 
 class WorkshopOrganiser(models.Model):

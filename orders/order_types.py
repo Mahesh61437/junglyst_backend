@@ -35,9 +35,12 @@ class OrderTypeHandler:
     # Reverse relations from Order to this type's booking row, select_related
     # by order list/detail views so summarize() costs no extra queries.
     order_select_related = ()
+    order_prefetch_related = ()
 
-    def summarize(self, order):
-        """Compact dict describing what was booked, embedded in order APIs."""
+    def summarize(self, order, public=False):
+        """Compact dict describing what was booked, embedded in order APIs.
+        `public=True` is for the unauthenticated tracking page: no personal or
+        contact details."""
         return None
 
     def on_paid(self, order):
@@ -67,11 +70,16 @@ def booking_select_related():
     return [path for handler in _handlers.values() for path in handler.order_select_related]
 
 
-def summarize_booking(order):
+def booking_prefetch_related():
+    """prefetch_related paths summarize() needs, for every registered type."""
+    return [path for handler in _handlers.values() for path in handler.order_prefetch_related]
+
+
+def summarize_booking(order, public=False):
     if is_product_order(order):
         return None
     handler = get_order_type_handler(order.order_type)
-    return handler.summarize(order) if handler else None
+    return handler.summarize(order, public=public) if handler else None
 
 
 @receiver(post_save, sender=Order)

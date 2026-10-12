@@ -10,8 +10,16 @@ logger = logging.getLogger(__name__)
 
 
 def _booking_summary_html(booking):
+    from .services import organiser_contact
+
     workshop = booking.workshop
     venue = ', '.join(part for part in (workshop.venue_name, workshop.city) if part)
+    contact = organiser_contact(workshop)
+    contact_html = (
+        f'<p><strong>Organiser contact:</strong> {escape(contact["name"])}'
+        + (f' · <a href="tel:{escape(contact["phone"])}">{escape(contact["phone"])}</a>' if contact['phone'] else '')
+        + '</p>'
+    )
     map_link = (
         f'<p><a href="{escape(workshop.map_url)}">Open venue in Maps</a></p>' if workshop.map_url else ''
     )
@@ -25,6 +33,7 @@ def _booking_summary_html(booking):
         <p><strong>Attendee:</strong> {escape(booking.attendee_name)} · {escape(booking.attendee_phone)}
            · {escape(booking.attendee_email)}</p>
         <p><strong>Seats:</strong> {booking.participants} &nbsp; <strong>Paid:</strong> ₹{booking.total_amount}</p>
+        {contact_html}
     """
 
 

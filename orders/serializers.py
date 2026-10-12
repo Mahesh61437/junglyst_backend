@@ -327,9 +327,24 @@ class OrderTrackingSerializer(serializers.ModelSerializer):
     items = serializers.SerializerMethodField()
     sub_orders = serializers.SerializerMethodField()
 
+    booking = serializers.SerializerMethodField()
+
     class Meta:
         model = Order
-        fields = ('id', 'order_number', 'total_quantity', 'status', 'payment_status', 'shipping_address', 'items', 'sub_orders', 'created_at')
+        fields = ('id', 'order_number', 'order_type', 'total_quantity', 'status', 'payment_status',
+                  'shipping_address', 'items', 'sub_orders', 'booking', 'created_at')
+
+    def get_booking(self, obj):
+        # Public endpoint: only what the order number alone should reveal.
+        return summarize_booking(obj, public=True)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if data.get('booking') is not None:
+            # A workshop order's "address" is the attendee's name, phone and
+            # email; never hand that to whoever holds the order number.
+            data['shipping_address'] = None
+        return data
 
     def get_total_quantity(self, obj):
         """Calculate total items ordered from pre-fetched items."""

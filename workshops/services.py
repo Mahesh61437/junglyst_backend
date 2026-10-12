@@ -223,6 +223,32 @@ def _organiser_notification(booking, seller_id, payout):
     )
 
 
+def _overbooking_alerts(booking):
+    """A payment that lands after its seat hold expired can push a session past
+    capacity. The buyer has paid, so the booking stays confirmed; flag it and
+    tell the super admins so they can move or refund someone."""
+    from core.models import User
+
+    seats_booked = (WorkshopBooking.objects
+                    .filter(session_id=booking.session_id, status__in=PAID_BOOKING_STATUSES)
+                    .aggregate(total=Coalesce(Sum('participants'), 0))['total'])
+    capacity = WorkshopSession.objects.values_list('capacity', flat=True).get(pk=booking.session_id)
+    over_by = seats_booked - capacity
+    if over_by <= 0:
+        return []
+    note = f"Overbooked: session over capacity by {over_by} seat(s) when this payment was confirmed."
+    WorkshopBooking.objects.filter(pk=booking.pk).update(
+        admin_note="\n".join(part for part in (booking.admin_note, note) if part))
+    logger.warning("Workshop session %s overbooked by %d (booking %s)", booking.session_id, over_by, booking.reference)
+    message = (f"{booking.workshop_title} on {booking.session_date:%d %b %Y}, {booking.session_start:%I:%M %p} "
+               f"has {seats_booked} seats sold for {capacity}. Booking {booking.reference} was paid after its "
+               f"hold expired. Move an attendee to another session or refund them.")
+    return [
+        AppNotification(user_id=admin_id, title="Workshop session overbooked", message=message)
+        for admin_id in User.objects.filter(is_superuser=True, is_deleted=False).values_list('id', flat=True)
+    ]
+
+
 def confirm_paid_booking(order):
     """Idempotent: flip the booking to confirmed once its order is paid."""
     now = timezone.now()
@@ -246,6 +272,7 @@ def confirm_paid_booking(order):
                 f"{booking.session_start:%I:%M %p}. Booking ref {booking.reference}."
             ),
         ))
+    notifications += _overbooking_alerts(booking)
     AppNotification.objects.bulk_create(notifications)
 
     from .tasks import send_workshop_booking_emails_task
@@ -319,13 +346,35 @@ def release_abandoned_hold(booking):
     return booking.status
 
 
-class WorkshopOrderHandler(OrderTypeHandler):
-    order_select_related = ('workshop_booking__workshop',)
+def organiser_contact(workshop):
+    """Contact shown to attendees after booking: the configured contact, else
+    the lead organiser's account phone."""
+    names = [_store_name(o.seller) for o in workshop.organisers.all()] or [_store_name(workshop.seller)]
+    return {
+        'name': workshop.contact_name or ' & '.join(names),
+        'phone': workshop.contact_phone or (workshop.seller.phone or ''),
+        'hosts': names,
+    }
 
-    def summarize(self, order):
+
+class WorkshopOrderHandler(OrderTypeHandler):
+    order_select_related = ('workshop_booking__workshop__seller__seller_profile',)
+    order_prefetch_related = ('workshop_booking__workshop__organisers__seller__seller_profile',)
+
+    PRIVATE_SUMMARY_FIELDS = ('attendee_name', 'organiser_contact')  # venue is public on the workshop page
+
+    def summarize(self, order, public=False):
         booking = getattr(order, 'workshop_booking', None)
         if booking is None:
             return None
+        summary = self._summary(booking)
+        if public:
+            for field in self.PRIVATE_SUMMARY_FIELDS:
+                summary.pop(field, None)
+        return summary
+
+    @staticmethod
+    def _summary(booking):
         workshop = booking.workshop
         return {
             'type': 'workshop',
@@ -345,6 +394,7 @@ class WorkshopOrderHandler(OrderTypeHandler):
             'city': workshop.city,
             'address': workshop.address,
             'map_url': workshop.map_url,
+            'organiser_contact': organiser_contact(workshop),
         }
 
     def on_paid(self, order):

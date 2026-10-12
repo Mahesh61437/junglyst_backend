@@ -202,6 +202,9 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             'stock', 'is_active', 'created_at',
         )
         read_only_fields = ['product', 'price', 'created_at']
+        # The size/label is optional in the seller form; a blank one falls back
+        # to the variant type in validate() so the storefront never shows "".
+        extra_kwargs = {'name': {'required': False, 'allow_blank': True}}
 
     def get_chargeable_weight(self, obj):
         return obj.chargeable_weight
@@ -216,6 +219,9 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             val = attrs.get(dim_key)
             if val is not None and val <= 0:
                 raise serializers.ValidationError({dim_key: "Box dimensions must be positive."})
+        if 'name' in attrs and not (attrs['name'] or '').strip():
+            variant_type = attrs.get('variant_type') or getattr(self.instance, 'variant_type', None)
+            attrs['name'] = variant_type or ProductVariant._meta.get_field('name').default
         return attrs
 
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -290,6 +296,19 @@ class ProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = '__all__'
         read_only_fields = ['slug']
+        # Drafts may be saved before the description is written; validate()
+        # still requires it for anything buyers can see.
+        extra_kwargs = {'description': {'required': False, 'allow_blank': True}}
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        is_draft = attrs.get('is_draft', getattr(self.instance, 'is_draft', False))
+        publishing_draft = getattr(self.instance, 'is_draft', False) and not is_draft
+        description_touched = self.instance is None or 'description' in attrs or publishing_draft
+        description = attrs.get('description', getattr(self.instance, 'description', '')) or ''
+        if not is_draft and description_touched and not description.strip():
+            raise serializers.ValidationError({'description': 'Description is required to publish a listing.'})
+        return attrs
 
     def get_image(self, obj):
         images = obj.images.all()
