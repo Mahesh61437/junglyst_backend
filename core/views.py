@@ -1,6 +1,7 @@
 import uuid
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
@@ -488,7 +489,7 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_update(self, serializer):
         product = self.get_object()
         if self.request.user != product.seller and self.request.user.role != 'admin':
-            raise permissions.PermissionDenied("You do not have permission to edit this specimen.")
+            raise PermissionDenied("You do not have permission to edit this specimen.")
         instance = serializer.save()
         if not instance.is_active:
             instance.variants.all().update(stock=0)
@@ -499,7 +500,7 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def perform_destroy(self, instance):
         if self.request.user != instance.seller and self.request.user.role != 'admin':
-            raise permissions.PermissionDenied("You do not have permission to archive this specimen.")
+            raise PermissionDenied("You do not have permission to archive this specimen.")
         instance.is_active = False
         instance.variants.all().update(stock=0)
         instance.save()
@@ -511,7 +512,7 @@ class GrowerProductCreateView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         if self.request.user.role not in ['grower', 'admin']:
-            raise permissions.PermissionDenied("Only growers can list products")
+            raise PermissionDenied("Only growers can list products")
         serializer.save(seller=self.request.user)
 
 
@@ -962,6 +963,13 @@ class ProductBulkActionView(generics.GenericAPIView):
             return Response({'error': 'No matching products found'}, status=404)
 
         if action == 'publish':
+            # Drafts may be saved without a description; buyers must never see one.
+            missing_description = list(qs.filter(description__regex=r'^\s*$').values_list('name', flat=True)[:5])
+            if missing_description:
+                return Response(
+                    {'error': f'Add a description before publishing: {", ".join(missing_description)}'},
+                    status=400,
+                )
             qs.update(is_active=True, is_draft=False)
         elif action == 'archive':
             ProductVariant.objects.filter(product_id__in=ids).update(stock=0)
@@ -1032,11 +1040,12 @@ class BulkStockUpdateView(generics.GenericAPIView):
 class HomeDataView(generics.GenericAPIView):
     """
     Single aggregate endpoint for the home page.
-    Returns featured sellers, latest 8 products, and platform stats in one round trip.
+    Returns featured sellers, the top HOME_PRODUCT_LIMIT feed products, and platform stats in one round trip.
     """
     permission_classes = (permissions.AllowAny,)
 
-    _CACHE_KEY = 'home_data_v2'
+    HOME_PRODUCT_LIMIT = 24
+    _CACHE_KEY = 'home_data_v3'  # bumped when the response shape/size changes
     _CACHE_TTL = 60 * 10  # 10 minutes
 
     def get(self, request):
@@ -1062,9 +1071,9 @@ class HomeDataView(generics.GenericAPIView):
                 Product.objects.filter(is_active=True, is_draft=False), region, state_code
             )
             area_params = {'region': region, 'state': state_code} if state_code else {'region': region}
-            home_ids = get_filtered_ordered_ids(area_params, area_qs)[:8]
+            home_ids = get_filtered_ordered_ids(area_params, area_qs)[:self.HOME_PRODUCT_LIMIT]
         else:
-            home_ids = get_ordered_product_ids()[:8]
+            home_ids = get_ordered_product_ids()[:self.HOME_PRODUCT_LIMIT]
         id_to_pos = {pid: idx for idx, pid in enumerate(home_ids)}
         _home_products = list(
             _product_list_queryset().filter(is_active=True, is_draft=False, id__in=home_ids)
@@ -1120,7 +1129,24 @@ def sitemap_xml(request):
       <changefreq>weekly</changefreq>
       <priority>0.8</priority>
    </url>""")
-        
+
+    # Workshops: the listing plus every public workshop page.
+    from workshops.models import Workshop, WorkshopStatus
+    xml.append(f"""   <url>
+      <loc>{frontend_url}/workshops</loc>
+      <changefreq>weekly</changefreq>
+      <priority>0.7</priority>
+   </url>""")
+    public_workshops = (Workshop.objects.filter(status__in=[WorkshopStatus.PUBLISHED, WorkshopStatus.COMPLETED])
+                        .only('slug', 'updated_at').order_by('-updated_at')[:500])
+    for workshop in public_workshops:
+        xml.append(f"""   <url>
+      <loc>{frontend_url}/workshops/{workshop.slug}</loc>
+      <lastmod>{workshop.updated_at:%Y-%m-%d}</lastmod>
+      <changefreq>weekly</changefreq>
+      <priority>0.7</priority>
+   </url>""")
+
     xml.append('</urlset>')
     return HttpResponse("\n".join(xml), content_type="application/xml")
 
