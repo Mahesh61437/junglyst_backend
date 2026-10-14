@@ -183,3 +183,98 @@ class ProductFairnessTests(APITestCase):
         for s_id, count in seller_counts.items():
             self.assertTrue(count <= 2, f"Seller {s_id} has {count} products on homepage (limit is 2)")
 
+
+
+import uuid
+
+from django.core.cache import cache
+
+from core.feed import FEED_CACHE_KEY, get_ordered_product_ids
+
+
+class StaleFeedCacheTests(APITestCase):
+    """The cached feed must rebuild when it doesn't match this database."""
+
+    def setUp(self):
+        cache.clear()
+        self.seller = User.objects.create_user(
+            email="feed_seller@example.com", username="feed_seller", password="Password123", role="grower"
+        )
+        self.products = []
+        for i in range(3):
+            p = Product.objects.create(
+                name=f"Feed Plant {i}", description="d", seller=self.seller, is_active=True, is_draft=False
+            )
+            ProductVariant.objects.create(product=p, name="Standard", stock=5, price=100.0)
+            self.products.append(p)
+        self.live_ids = {p.id for p in self.products}
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_feed_from_another_database_is_rebuilt(self):
+        cache.set(FEED_CACHE_KEY, [str(uuid.uuid4()) for _ in range(5)], 3600)
+        self.assertEqual(set(get_ordered_product_ids()), self.live_ids)
+
+    def test_empty_cached_feed_is_rebuilt_when_products_exist(self):
+        cache.set(FEED_CACHE_KEY, [], 3600)
+        self.assertEqual(set(get_ordered_product_ids()), self.live_ids)
+
+    def test_valid_cached_feed_is_kept(self):
+        cached = [str(p.id) for p in reversed(self.products)]
+        cache.set(FEED_CACHE_KEY, cached, 3600)
+        self.assertEqual([str(i) for i in get_ordered_product_ids()], cached)
+
+    def test_home_and_shop_recover_from_stale_feed(self):
+        cache.set(FEED_CACHE_KEY, [str(uuid.uuid4()) for _ in range(5)], 3600)
+        home = self.client.get(reverse('home_data'))
+        self.assertEqual(len(home.data['products']), 3)
+        shop = self.client.get(reverse('product_list'))
+        self.assertEqual(shop.data['count'], 3)
+
+
+from core.views import HomeDataView
+
+
+class ProductStripSizeTests(APITestCase):
+    """Home shows HOME_PRODUCT_LIMIT products; the shop honours page_size=24."""
+
+    SHOP_PAGE_SIZE = 24  # mirrors SHOP_PAGE_SIZE in junglyst_ui/src/pages/Shop.jsx
+
+    def setUp(self):
+        cache.clear()
+        # One product per seller so seller-fair ordering can't hide any of them
+        for i in range(30):
+            seller = User.objects.create_user(
+                email=f"strip_seller_{i}@example.com", username=f"strip_seller_{i}",
+                password="Password123", role="grower",
+            )
+            product = Product.objects.create(
+                name=f"Strip Plant {i}", description="d", seller=seller, is_active=True, is_draft=False
+            )
+            ProductVariant.objects.create(product=product, name="Standard", stock=5, price=100.0)
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_home_returns_up_to_limit_products(self):
+        response = self.client.get(reverse('home_data'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(HomeDataView.HOME_PRODUCT_LIMIT, 24)
+        self.assertEqual(len(response.data['products']), HomeDataView.HOME_PRODUCT_LIMIT)
+
+    def test_home_returns_all_when_fewer_than_limit(self):
+        Product.objects.filter(name__in=[f"Strip Plant {i}" for i in range(20)]).update(is_active=False)
+        cache.clear()
+        response = self.client.get(reverse('home_data'))
+        self.assertEqual(len(response.data['products']), 10)
+
+    def test_shop_page_size_24_paginates(self):
+        first = self.client.get(reverse('product_list'), {'page': 1, 'page_size': self.SHOP_PAGE_SIZE})
+        second = self.client.get(reverse('product_list'), {'page': 2, 'page_size': self.SHOP_PAGE_SIZE})
+        self.assertEqual(first.data['count'], 30)
+        self.assertEqual(len(first.data['results']), self.SHOP_PAGE_SIZE)
+        self.assertEqual(len(second.data['results']), 30 - self.SHOP_PAGE_SIZE)
+        first_ids = {p['id'] for p in first.data['results']}
+        second_ids = {p['id'] for p in second.data['results']}
+        self.assertFalse(first_ids & second_ids)

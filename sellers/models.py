@@ -1,8 +1,21 @@
 from datetime import date, datetime, time, timedelta
 from django.db import models
 from django.utils import timezone
-from core.models import User
+from core.models import User, Category
 from django.utils.text import slugify
+from shipping.regions import REGION_SOUTH, REGION_NORTH, REGION_NORTH_EAST, STATE_NAMES
+
+# Region code → SellerProfile field, kept in one place for filters and serializers
+REGION_SHIPS_FIELDS = {
+    REGION_SOUTH: 'ships_to_south',
+    REGION_NORTH: 'ships_to_north',
+    REGION_NORTH_EAST: 'ships_to_north_east',
+}
+REGION_FEE_FIELDS = {
+    REGION_SOUTH: 'delivery_fee_south',
+    REGION_NORTH: 'delivery_fee_north',
+    REGION_NORTH_EAST: 'delivery_fee_north_east',
+}
 
 WEEKDAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
@@ -93,10 +106,41 @@ class SellerProfile(models.Model):
         help_text='Daily order cut-off (IST). Orders placed on a shipping day after this time roll to next shipping day.',
     )
 
+    # Delivery regions (see shipping.regions). All three on = ships all over India.
+    ships_to_south = models.BooleanField(default=True, help_text='Ships to South India (AP, TS, TN, KA, KL)')
+    ships_to_north = models.BooleanField(default=True, help_text='Ships to North India (all except South and North East)')
+    ships_to_north_east = models.BooleanField(default=True, help_text='Ships to North East India')
+
+    # Optional flat delivery fee per region. When blank, the seller's slab-based
+    # SellerShippingConfig fee applies instead.
+    delivery_fee_south = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    delivery_fee_north = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    delivery_fee_north_east = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SellerProfileManager()
+
+    def ships_to(self, region) -> bool:
+        """Whether this seller delivers to the region. Unknown region → True (don't block)."""
+        field = REGION_SHIPS_FIELDS.get(region)
+        return getattr(self, field) if field else True
+
+    @property
+    def service_regions(self) -> list:
+        return [region for region, field in REGION_SHIPS_FIELDS.items() if getattr(self, field)]
+
+    def delivery_fee_for(self, region):
+        """Flat delivery fee configured for the region, or None to fall back to slabs."""
+        field = REGION_FEE_FIELDS.get(region)
+        return getattr(self, field) if field else None
+
+    @property
+    def excluded_state_codes(self) -> list:
+        """State codes inside served regions that this seller won't deliver to.
+        Uses prefetched `excluded_states` when present (prefetch it for lists)."""
+        return sorted(e.state_code for e in self.excluded_states.all())
 
     def _blackout_dates(self):
         """Set of all individual dates currently blacked out for this seller."""
@@ -181,6 +225,50 @@ class SellerBlackoutDate(models.Model):
         from django.core.exceptions import ValidationError
         if self.end_date < self.start_date:
             raise ValidationError({'end_date': 'end_date must be on or after start_date'})
+
+
+class SellerExcludedState(models.Model):
+    """A state the seller won't deliver to, even though its region is enabled."""
+    STATE_CHOICES = sorted(STATE_NAMES.items(), key=lambda item: item[1])
+
+    seller = models.ForeignKey(SellerProfile, on_delete=models.CASCADE, related_name='excluded_states')
+    state_code = models.CharField(max_length=2, choices=STATE_CHOICES)
+
+    class Meta:
+        unique_together = ('seller', 'state_code')
+        indexes = [models.Index(fields=['state_code'])]
+        verbose_name = 'Excluded Delivery State'
+        verbose_name_plural = 'Excluded Delivery States'
+
+    def __str__(self):
+        return f'{self.seller.store_name} ✕ {STATE_NAMES.get(self.state_code, self.state_code)}'
+
+
+class SellerCategoryRegion(models.Model):
+    """
+    Narrows where a seller delivers one category, e.g. "Plants: South India only"
+    while the rest of the store ships all over India. Only ever restricts: a
+    product is deliverable to a region when the store serves it AND every rule
+    for the product's categories allows it. Categories without a rule follow the
+    store-wide regions.
+    """
+    seller = models.ForeignKey(SellerProfile, on_delete=models.CASCADE, related_name='category_regions')
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='seller_region_rules')
+    ships_to_south = models.BooleanField(default=True)
+    ships_to_north = models.BooleanField(default=True)
+    ships_to_north_east = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = ('seller', 'category')
+        verbose_name = 'Category Delivery Region'
+        verbose_name_plural = 'Category Delivery Regions'
+
+    @property
+    def regions(self) -> list:
+        return [region for region, field in REGION_SHIPS_FIELDS.items() if getattr(self, field)]
+
+    def __str__(self):
+        return f'{self.seller.store_name} / {self.category.name}: {", ".join(self.regions) or "nowhere"}'
 
 
 class SellerShippingConfig(models.Model):

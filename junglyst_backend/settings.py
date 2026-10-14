@@ -102,6 +102,7 @@ INSTALLED_APPS = [
     'analytics',
     'competition',
     'community',
+    'workshops',
     'django_celery_results',
     'django_celery_beat',
 ]
@@ -246,11 +247,16 @@ if REDISHOST and not REDIS_URL:
     else:
         REDIS_URL = f"redis://{REDISHOST}:{REDISPORT}/0"
 
+# Namespace cache keys per environment so environments that share a Redis
+# instance can never read each other's entries (e.g. the product feed IDs).
+CACHE_KEY_PREFIX = config('CACHE_KEY_PREFIX', default=RAILWAY_ENV or 'local')
+
 if REDIS_URL:
     CACHES = {
         "default": {
             "BACKEND": "django_redis.cache.RedisCache",
             "LOCATION": REDIS_URL,
+            "KEY_PREFIX": CACHE_KEY_PREFIX,
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
             }
@@ -315,6 +321,8 @@ REST_FRAMEWORK = {
         'anon': '200/minute',   # stops scrapers/bots; casual browsing is ~5-15 req/page
         'user': '600/minute',   # authenticated users won't hit this under normal use
         'auth': '10/minute',    # keep tight for brute-force protection
+        'workshop_booking': '10/minute',  # each attempt creates an order + gateway order
+        'workshop_lookup': '30/minute',   # guest booking lookup by order number + email
     },
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }

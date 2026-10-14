@@ -51,6 +51,8 @@ class PublicSellerProfileSerializer(serializers.Serializer):
     is_featured = serializers.BooleanField()
     rating = serializers.CharField()
     shipping_days = serializers.JSONField()
+    service_regions = serializers.ListField(read_only=True)
+    excluded_states = serializers.ListField(source='excluded_state_codes', read_only=True)
     daily_cutoff_time = serializers.SerializerMethodField()
     blackout_dates = serializers.SerializerMethodField()
     next_shipping_date = serializers.SerializerMethodField()
@@ -200,6 +202,9 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             'stock', 'is_active', 'created_at',
         )
         read_only_fields = ['product', 'price', 'created_at']
+        # The size/label is optional in the seller form; a blank one falls back
+        # to the variant type in validate() so the storefront never shows "".
+        extra_kwargs = {'name': {'required': False, 'allow_blank': True}}
 
     def get_chargeable_weight(self, obj):
         return obj.chargeable_weight
@@ -214,6 +219,9 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             val = attrs.get(dim_key)
             if val is not None and val <= 0:
                 raise serializers.ValidationError({dim_key: "Box dimensions must be positive."})
+        if 'name' in attrs and not (attrs['name'] or '').strip():
+            variant_type = attrs.get('variant_type') or getattr(self.instance, 'variant_type', None)
+            attrs['name'] = variant_type or ProductVariant._meta.get_field('name').default
         return attrs
 
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -269,6 +277,9 @@ class ProductSerializer(serializers.ModelSerializer):
     seller_id = serializers.UUIDField(write_only=True, required=False)
     image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
+    # Regions this product can be delivered to: the store's regions narrowed by
+    # the seller's rules for its categories. None when the seller has no profile.
+    delivery_regions = serializers.SerializerMethodField()
     
     # Helper fields for the first variant (read-only for compatibility).
     # commission_rate and gst_rate are intentionally NOT exposed — those are
@@ -285,6 +296,19 @@ class ProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = '__all__'
         read_only_fields = ['slug']
+        # Drafts may be saved before the description is written; validate()
+        # still requires it for anything buyers can see.
+        extra_kwargs = {'description': {'required': False, 'allow_blank': True}}
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        is_draft = attrs.get('is_draft', getattr(self.instance, 'is_draft', False))
+        publishing_draft = getattr(self.instance, 'is_draft', False) and not is_draft
+        description_touched = self.instance is None or 'description' in attrs or publishing_draft
+        description = attrs.get('description', getattr(self.instance, 'description', '')) or ''
+        if not is_draft and description_touched and not description.strip():
+            raise serializers.ValidationError({'description': 'Description is required to publish a listing.'})
+        return attrs
 
     def get_image(self, obj):
         images = obj.images.all()
@@ -296,6 +320,18 @@ class ProductSerializer(serializers.ModelSerializer):
     def get_category(self, obj):
         categories = obj.categories.all()
         return categories[0].name if categories else None
+
+    def get_delivery_regions(self, obj):
+        try:
+            profile = obj.seller.seller_profile
+        except Exception:
+            return None
+        from sellers.delivery import product_regions
+        seller_id = str(profile.user_id)
+        rule_map = {(seller_id, rule.category_id): rule.regions for rule in profile.category_regions.all()}
+        return product_regions(
+            profile.service_regions, seller_id, [c.id for c in obj.categories.all()], rule_map,
+        )
 
     def get_sub_category(self, obj):
         subcategories = obj.sub_categories.all()

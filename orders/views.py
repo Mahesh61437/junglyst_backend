@@ -19,6 +19,10 @@ from core.models import ProductVariant
 from shipping.models import ShippingAddress
 from shipping.serializers import ShippingAddressSerializer
 from shipping.pincode_zones import classify_pincode, transit_days_for_zone
+from sellers.delivery import blocking_category, category_rule_map
+from shipping.regions import (
+    REGION_LABELS, STATE_NAMES, pincode_matches_state, resolve_address_region, state_code_for,
+)
 from shipping.services import check_pincode_deliverable
 from notifications.models import AppNotification
 from payments.models import Payment
@@ -26,6 +30,7 @@ from payments.cashfree_utils import create_cashfree_order, verify_cashfree_payme
 from payments.models import PaymentGatewaySettings, PaymentGateway
 from payments.razorpay_utils import create_razorpay_order, verify_razorpay_signature
 from .models import Order, OrderItem, SubOrder, SellerSettlement
+from .order_types import booking_prefetch_related, booking_select_related
 from .serializers import (
     OrderSerializer, OrderListSerializer, OrderDetailSerializer,
     SellerOrderSerializer, SellerSubOrderSerializer,
@@ -60,8 +65,13 @@ def _build_shipping_config_map(seller_ids):
     return {(str(c.seller_id), c.item_category): c for c in configs}
 
 
-def _shipping_fee_for_seller(subtotal: float, config) -> int:
-    """Return shipping fee using DB config. Returns 0 (free) when no config set."""
+def _shipping_fee_for_seller(subtotal: float, config, region_fee=None) -> int:
+    """Return the seller's shipping fee for this sub-order.
+
+    A flat fee the seller set for the buyer's delivery region wins; otherwise
+    the slab config applies, and no config at all means free shipping."""
+    if region_fee is not None:
+        return int(region_fee)
     if config is None:
         return 0
     return config.fee_for(subtotal)
@@ -204,8 +214,10 @@ class CheckoutView(generics.GenericAPIView):
             email = guest_info.get('email') or (request.user.email if request.user.is_authenticated else None)
             phone = guest_info.get('phone') or (request.user.phone if request.user.is_authenticated else None)
 
-        # Pincode deliverability check — verified against the active logistics provider API
-        effective_pincode = str(pincode or (shipping_address or {}).get('pincode', '') or '')
+        # Pincode deliverability check — verified against the active logistics provider API.
+        # The order ships to `shipping_address`, so its own pincode wins; the separate
+        # `pincode` field is only a fallback for addresses that lack one.
+        effective_pincode = str((shipping_address or {}).get('pincode') or pincode or '').strip()
         if effective_pincode:
             is_deliverable, delivery_msg = check_pincode_deliverable(effective_pincode)
             if not is_deliverable:
@@ -268,6 +280,17 @@ class CheckoutView(generics.GenericAPIView):
         # case where every upcoming day is blacked out, since that means the
         # seller genuinely can't ship anything for the next 90 days.
         from sellers.models import _default_shipping_days
+        address_state = (shipping_address or {}).get('state')
+        delivery_state_code = state_code_for(address_state)
+        # A PIN code from another state would route the order (and its seller
+        # region checks) somewhere other than the address the buyer chose.
+        if not pincode_matches_state(effective_pincode, delivery_state_code):
+            return Response({
+                "error": f"PIN code {effective_pincode} doesn't belong to {STATE_NAMES[delivery_state_code]}. "
+                         "Please check the state and PIN code in your delivery address."
+            }, status=400)
+        delivery_region = resolve_address_region(state=address_state, pincode=effective_pincode)
+        category_rules = category_rule_map(seller_buckets.keys()) if delivery_region else {}
         for sid, bucket in seller_buckets.items():
             seller_user = bucket['seller']
             try:
@@ -279,6 +302,33 @@ class CheckoutView(generics.GenericAPIView):
                 # Belt-and-braces — if somehow still empty in the DB, fall back to defaults
                 seller_profile.shipping_days = _default_shipping_days()
                 seller_profile.save(update_fields=['shipping_days'])
+            if seller_profile and delivery_region and not seller_profile.ships_to(delivery_region):
+                return Response({
+                    "error": f"{store} doesn't deliver to {REGION_LABELS[delivery_region]}. Please remove their items to continue."
+                }, status=400)
+            for item in bucket['items']:
+                blocked_category = blocking_category(
+                    sid, item.product.categories.all(), delivery_region, category_rules,
+                )
+                if blocked_category:
+                    return Response({
+                        "error": f"{store} doesn't deliver {blocked_category.name} to "
+                                 f"{REGION_LABELS[delivery_region]}. Please remove {item.product.name} to continue."
+                    }, status=400)
+            excluded_states = seller_profile.excluded_state_codes if seller_profile else []
+            if excluded_states and not delivery_state_code:
+                # Can't honour the seller's state exclusions without knowing the state
+                return Response({
+                    "error": "Please select a valid state in your delivery address."
+                }, status=400)
+            if delivery_state_code in excluded_states:
+                return Response({
+                    "error": f"{store} doesn't deliver to {STATE_NAMES[delivery_state_code]}. Please remove their items to continue."
+                }, status=400)
+            bucket['region_fee'] = (
+                seller_profile.delivery_fee_for(delivery_region)
+                if seller_profile and delivery_region else None
+            )
             next_ship = seller_profile.get_next_shipping_date() if seller_profile else None
             if not next_ship:
                 return Response({
@@ -342,7 +392,7 @@ class CheckoutView(generics.GenericAPIView):
         # Slabs are read off the pre-discount subtotal so a coupon can't also
         # bump a seller into a pricier shipping tier.
         total_shipping = sum(
-            _shipping_fee_for_seller(b['subtotal'], b['shipping_config'])
+            _shipping_fee_for_seller(b['subtotal'], b['shipping_config'], b['region_fee'])
             for b in seller_buckets.values()
         )
         total_amount = subtotal - discount_total + total_shipping
@@ -373,7 +423,9 @@ class CheckoutView(generics.GenericAPIView):
         dispatch_deadline = now + timedelta(hours=48)
 
         for idx, (sid, bucket) in enumerate(seller_buckets.items()):
-            seller_shipping = _shipping_fee_for_seller(bucket['subtotal'], bucket['shipping_config'])
+            seller_shipping = _shipping_fee_for_seller(
+                bucket['subtotal'], bucket['shipping_config'], bucket['region_fee'],
+            )
             promised_ship = bucket.get('next_shipping_date')
             promised_min = (promised_ship + timedelta(days=min_transit)) if promised_ship else None
             promised_max = (promised_ship + timedelta(days=max_transit)) if promised_ship else None
@@ -872,7 +924,7 @@ class OrderListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        qs = Order.objects.filter(user=user)
+        qs = Order.objects.filter(user=user).select_related(*booking_select_related()).prefetch_related(*booking_prefetch_related())
 
         # Single query for items + their product images — eliminates all N+1
         items_qs = OrderItem.objects.select_related('product').prefetch_related('product__images')
@@ -898,6 +950,7 @@ class OrderDetailView(generics.RetrieveAPIView):
             qs = Order.objects.all()
         else:
             qs = Order.objects.filter(user=user)
+        qs = qs.select_related(*booking_select_related()).prefetch_related(*booking_prefetch_related())
 
         items_qs = OrderItem.objects.select_related('product', 'variant').prefetch_related('product__images')
         sub_orders_qs = SubOrder.objects.select_related(
@@ -941,10 +994,11 @@ class OrderTrackView(APIView):
         ).prefetch_related(
             Prefetch('items', queryset=items_qs),
         )
-        qs = Order.objects.select_related('payment').prefetch_related(
+        qs = Order.objects.select_related('payment', *booking_select_related()).prefetch_related(
             Prefetch('items', queryset=items_qs),
             Prefetch('sub_orders', queryset=sub_orders_qs),
             'shipments',
+            *booking_prefetch_related(),
         )
 
         if order_uuid:

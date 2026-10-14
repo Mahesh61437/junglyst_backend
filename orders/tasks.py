@@ -20,11 +20,14 @@ def send_order_confirmation_emails_task(order_id):
 @shared_task(name='orders.tasks.create_order_notifications_task')
 def create_order_notifications_task(order_id):
     from orders.models import Order
+    from orders.order_types import is_product_order
     from notifications.models import AppNotification
     try:
         order = Order.objects.select_related('user').prefetch_related(
             'sub_orders__seller', 'sub_orders__items'
         ).get(id=order_id)
+        if not is_product_order(order):
+            return  # non-product orders notify through their order-type handler
 
         if order.user:
             AppNotification.objects.create(
@@ -64,7 +67,11 @@ def clear_ordered_cart_items(order):
     from cart.models import Cart, CartItem
     from django.utils import timezone
 
-    if not order.user_id:
+    from orders.order_types import is_product_order
+
+    # A booking-type order has no product lines; the full-clear fallback below
+    # would otherwise wipe a cart the order never touched.
+    if not order.user_id or not is_product_order(order):
         return
     Cart.objects.filter(user_id=order.user_id).update(updated_at=timezone.now())
     ordered_variant_ids = [

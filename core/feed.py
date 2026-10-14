@@ -249,15 +249,43 @@ def prewarm_sorted_feeds(master_ids: list) -> dict:
     return summary
 
 
+# How many leading feed IDs to probe when checking the cached feed is still
+# backed by the database. One indexed PK lookup per call.
+_STALE_PROBE_SIZE = 20
+
+
+def _feed_is_stale(ids: list) -> bool:
+    """
+    True when the cached feed no longer describes this database: it is empty
+    while live products exist, or none of its leading IDs are live products.
+
+    That happens when the feed was built against another database (e.g. a
+    Redis instance shared between environments) or before products were
+    re-imported with new IDs. The feed only expires at midnight, so without
+    this check the home page and shop would render empty until then.
+    """
+    from .models import Product
+
+    live = Product.objects.filter(is_active=True, is_draft=False)
+    if not ids:
+        return live.exists()
+    return not live.filter(id__in=ids[:_STALE_PROBE_SIZE]).exists()
+
+
 def get_ordered_product_ids() -> list:
-    """Return the master feed, computing it if the cache is cold."""
+    """Return the master feed, computing it if the cache is cold or stale."""
     ids = cache.get(FEED_CACHE_KEY)
-    if ids is None:
-        ids = compute_ordered_ids()
-        cache.set(FEED_CACHE_KEY, ids, _ttl_until_midnight())
-    else:
+    if ids is not None:
         import uuid
         ids = [uuid.UUID(pid) if isinstance(pid, str) else pid for pid in ids]
+        if not _feed_is_stale(ids):
+            return ids
+        # Bump the version too, so filtered/sorted feeds built from the stale
+        # master expire with it.
+        invalidate_feed_cache()
+
+    ids = compute_ordered_ids()
+    cache.set(FEED_CACHE_KEY, ids, _ttl_until_midnight())
     return ids
 
 

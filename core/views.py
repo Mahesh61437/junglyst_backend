@@ -1,6 +1,7 @@
 import uuid
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from rest_framework_simplejwt.views import TokenObtainPairView
 from django.contrib.auth import get_user_model
 from rest_framework.filters import SearchFilter, OrderingFilter
@@ -27,6 +28,10 @@ from .feed import (
     get_ordered_product_ids, get_filtered_ordered_ids,
     get_sorted_feed, compute_sorted_feed, SORTABLE_FIELDS,
 )
+from django.db.models import Q
+from sellers.models import REGION_SHIPS_FIELDS
+from sellers.delivery import exclude_category_blocked
+from shipping.regions import STATE_REGIONS
 
 User = get_user_model()
 
@@ -155,7 +160,8 @@ def _product_queryset():
         'seller', 'seller__seller_profile',
     ).prefetch_related(
         'variants', 'images', 'categories',
-        'categories__subcategories', 'tags', 'sub_categories', 'sub_categories__category'
+        'categories__subcategories', 'tags', 'sub_categories', 'sub_categories__category',
+        'seller__seller_profile__excluded_states', 'seller__seller_profile__category_regions',
     )
 
 
@@ -167,6 +173,34 @@ def _product_list_queryset():
         'variants', 'images', 'categories',
         'sub_categories', 'sub_categories__category',
     )
+
+
+def _delivery_area_from_params(params):
+    """
+    Buyer's delivery area from query params → (region, state_code).
+    A known `state` code wins and implies its region; otherwise a known
+    `region` alone; anything unknown is ignored (no filtering).
+    """
+    state_code = (params.get('state') or '').upper()
+    if state_code in STATE_REGIONS:
+        return STATE_REGIONS[state_code], state_code
+    region = params.get('region')
+    return (region if region in REGION_SHIPS_FIELDS else None), None
+
+
+def _filter_by_delivery_area(queryset, region, state_code=None):
+    """Keep products whose seller ships to *region* (store-wide and for the product's
+    categories) and hasn't excluded *state_code*. Sellers without a profile have
+    no delivery limits, so they stay visible."""
+    ships_field = REGION_SHIPS_FIELDS.get(region)
+    if ships_field:
+        queryset = queryset.filter(
+            Q(seller__seller_profile__isnull=True) | Q(**{f'seller__seller_profile__{ships_field}': True})
+        )
+        queryset = exclude_category_blocked(queryset, region)
+    if state_code:
+        queryset = queryset.exclude(seller__seller_profile__excluded_states__state_code=state_code)
+    return queryset
 
 
 class ProductListView(generics.ListAPIView):
@@ -222,6 +256,10 @@ class ProductListView(generics.ListAPIView):
             # Public shop: only published, non-draft products
             if is_active_param is None:
                 queryset = queryset.filter(is_active=True, is_draft=False)
+
+        # Buyer's delivery area — only sellers who deliver there
+        region, state_code = _delivery_area_from_params(params)
+        queryset = _filter_by_delivery_area(queryset, region, state_code)
 
         # In-stock filter
         if params.get('in_stock') in ('true', '1', 'True'):
@@ -282,7 +320,7 @@ class ProductListView(generics.ListAPIView):
     _FILTER_PARAMS = frozenset({
         'category', 'categories', 'sub_categories', 'sub_category_id',
         'care_level', 'in_stock', 'min_price', 'max_price', 'search', 'is_rare',
-        'stock_lt',
+        'stock_lt', 'region', 'state',
     })
 
     def filter_queryset(self, queryset):
@@ -451,7 +489,7 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_update(self, serializer):
         product = self.get_object()
         if self.request.user != product.seller and self.request.user.role != 'admin':
-            raise permissions.PermissionDenied("You do not have permission to edit this specimen.")
+            raise PermissionDenied("You do not have permission to edit this specimen.")
         instance = serializer.save()
         if not instance.is_active:
             instance.variants.all().update(stock=0)
@@ -462,7 +500,7 @@ class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
 
     def perform_destroy(self, instance):
         if self.request.user != instance.seller and self.request.user.role != 'admin':
-            raise permissions.PermissionDenied("You do not have permission to archive this specimen.")
+            raise PermissionDenied("You do not have permission to archive this specimen.")
         instance.is_active = False
         instance.variants.all().update(stock=0)
         instance.save()
@@ -474,7 +512,7 @@ class GrowerProductCreateView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         if self.request.user.role not in ['grower', 'admin']:
-            raise permissions.PermissionDenied("Only growers can list products")
+            raise PermissionDenied("Only growers can list products")
         serializer.save(seller=self.request.user)
 
 
@@ -925,6 +963,13 @@ class ProductBulkActionView(generics.GenericAPIView):
             return Response({'error': 'No matching products found'}, status=404)
 
         if action == 'publish':
+            # Drafts may be saved without a description; buyers must never see one.
+            missing_description = list(qs.filter(description__regex=r'^\s*$').values_list('name', flat=True)[:5])
+            if missing_description:
+                return Response(
+                    {'error': f'Add a description before publishing: {", ".join(missing_description)}'},
+                    status=400,
+                )
             qs.update(is_active=True, is_draft=False)
         elif action == 'archive':
             ProductVariant.objects.filter(product_id__in=ids).update(stock=0)
@@ -995,11 +1040,12 @@ class BulkStockUpdateView(generics.GenericAPIView):
 class HomeDataView(generics.GenericAPIView):
     """
     Single aggregate endpoint for the home page.
-    Returns featured sellers, latest 8 products, and platform stats in one round trip.
+    Returns featured sellers, the top HOME_PRODUCT_LIMIT feed products, and platform stats in one round trip.
     """
     permission_classes = (permissions.AllowAny,)
 
-    _CACHE_KEY = 'home_data_v2'
+    HOME_PRODUCT_LIMIT = 24
+    _CACHE_KEY = 'home_data_v3'  # bumped when the response shape/size changes
     _CACHE_TTL = 60 * 10  # 10 minutes
 
     def get(self, request):
@@ -1007,9 +1053,12 @@ class HomeDataView(generics.GenericAPIView):
         from sellers.serializers import SellerProfileSerializer
         from django.contrib.auth import get_user_model
         User = get_user_model()
-        print(f"debug: {User}")
 
-        cached = cache.get(self._CACHE_KEY)
+        # Buyer's delivery area narrows the product strip; unknown → all India
+        region, state_code = _delivery_area_from_params(request.query_params)
+        cache_key = f'{self._CACHE_KEY}:{region or "all"}:{state_code or "all"}'
+
+        cached = cache.get(cache_key)
         if cached is not None:
             return Response(cached)
 
@@ -1017,7 +1066,14 @@ class HomeDataView(generics.GenericAPIView):
             is_active=True, is_featured=True
         ).order_by('sort_order', '-rating')
 
-        home_ids = get_ordered_product_ids()[:8]
+        if region:
+            area_qs = _filter_by_delivery_area(
+                Product.objects.filter(is_active=True, is_draft=False), region, state_code
+            )
+            area_params = {'region': region, 'state': state_code} if state_code else {'region': region}
+            home_ids = get_filtered_ordered_ids(area_params, area_qs)[:self.HOME_PRODUCT_LIMIT]
+        else:
+            home_ids = get_ordered_product_ids()[:self.HOME_PRODUCT_LIMIT]
         id_to_pos = {pid: idx for idx, pid in enumerate(home_ids)}
         _home_products = list(
             _product_list_queryset().filter(is_active=True, is_draft=False, id__in=home_ids)
@@ -1036,7 +1092,9 @@ class HomeDataView(generics.GenericAPIView):
             'products': ProductListSerializer(products_qs, many=True).data,
             'stats': stats,
         }
-        cache.set(self._CACHE_KEY, data, self._CACHE_TTL)
+        # Don't pin an empty product strip for the full TTL when products exist.
+        if products_qs or not stats['total_products']:
+            cache.set(cache_key, data, self._CACHE_TTL)
         return Response(data)
 
 from django.http import HttpResponse
@@ -1071,7 +1129,24 @@ def sitemap_xml(request):
       <changefreq>weekly</changefreq>
       <priority>0.8</priority>
    </url>""")
-        
+
+    # Workshops: the listing plus every public workshop page.
+    from workshops.models import Workshop, WorkshopStatus
+    xml.append(f"""   <url>
+      <loc>{frontend_url}/workshops</loc>
+      <changefreq>weekly</changefreq>
+      <priority>0.7</priority>
+   </url>""")
+    public_workshops = (Workshop.objects.filter(status__in=[WorkshopStatus.PUBLISHED, WorkshopStatus.COMPLETED])
+                        .only('slug', 'updated_at').order_by('-updated_at')[:500])
+    for workshop in public_workshops:
+        xml.append(f"""   <url>
+      <loc>{frontend_url}/workshops/{workshop.slug}</loc>
+      <lastmod>{workshop.updated_at:%Y-%m-%d}</lastmod>
+      <changefreq>weekly</changefreq>
+      <priority>0.7</priority>
+   </url>""")
+
     xml.append('</urlset>')
     return HttpResponse("\n".join(xml), content_type="application/xml")
 

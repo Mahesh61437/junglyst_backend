@@ -272,6 +272,8 @@ Public, paginated.
 | `care_level` | string | `easy`, `medium`, `hard` |
 | `search` | string | Searches name + description |
 | `ordering` | string | e.g. `-created_at`, `price`, `-price` |
+| `region` | string | `south`, `north`, `north_east` — only sellers who deliver there. Unknown values are ignored. Also accepted by `GET /api/core/home/`. |
+| `state` | string | State code, e.g. `KL`. Implies its region and also drops sellers who excluded that state. Case-insensitive; unknown codes are ignored. Also accepted by `GET /api/core/home/`. |
 | `page`, `page_size` | int | Pagination |
 
 #### `GET /api/core/products/id/{uuid}/` — Product detail by ID
@@ -759,6 +761,18 @@ Public.
 { "is_deliverable": true, "zone": "B" }
 ```
 
+#### `GET /api/shipping/regions/` — Delivery regions and states
+
+Public, browser-cacheable for 24h. Drives the buyer's region picker.
+
+**Response (abridged)**
+```json
+{
+  "regions": [{ "code": "south", "label": "South India" }, { "code": "north", "label": "North India" }, { "code": "north_east", "label": "North East India" }],
+  "states": [{ "code": "AP", "name": "Andhra Pradesh", "region": "south", "aliases": [] }]
+}
+```
+
 #### `POST /api/shipping/package-image/` — Upload package image
 
 Auth required. Seller. `multipart/form-data` field `image`. Used for the packaging photo on a sub-order.
@@ -882,6 +896,26 @@ Days the seller is unavailable to ship.
 ```
 
 #### `DELETE /api/sellers/blackouts/{id}/` — Remove blackout
+
+#### `GET /api/sellers/delivery-regions/` — Delivery regions and regional fees
+
+#### `PATCH /api/sellers/delivery-regions/` — Update delivery regions and regional fees
+
+`excluded_states` is the full list of state codes (from `GET /api/shipping/regions/`) the seller won't deliver to inside enabled regions; sending it replaces the list, omitting it keeps it. At least one region, and at least one state in it, must stay deliverable. A `null` fee means the standard slab-based shipping fee applies for that region; a set fee (whole rupees, ₹0–5000) replaces it. Checkout rejects sellers who don't deliver to the address's region (pincode first, then state).
+
+```json
+{ "ships_to_south": true, "ships_to_north": true, "ships_to_north_east": false, "excluded_states": ["KL"],
+  "category_regions": [{ "category_id": 3, "regions": ["south"] }],
+  "delivery_fee_south": 40, "delivery_fee_north": null }
+```
+
+`category_regions` narrows the store-wide regions for one category (e.g. plants to South India only) and replaces the whole list on write; a rule allowing every region is dropped. Responses also include `seller_categories` (categories the seller lists products in), `all_categories` (any category can carry a rule, even before products are listed) and each rule's `category_name`. Product feeds, the product page (`delivery_regions` on product detail), the cart (`product_regions` in shipping-configs when `product_ids` is passed) and checkout all apply these rules.
+
+#### `GET/PATCH /api/sellers/profiles/{id}/delivery-regions/` — Superadmin: any seller's delivery settings
+
+Superusers only (sellers are staff, so staff alone is not enough). Same body and response as the seller endpoint.
+
+Checkout rejects an address whose PIN code can't belong to its state (e.g. PIN `517128` with state Himachal Pradesh); `GET /api/shipping/pincode-check/` returns the PIN code's possible states as `states` so the UI can flag this early. Checkout also rejects a seller whose excluded states include the address's state, and asks for a valid state when the address state isn't recognised and a seller in the cart has exclusions.
 
 #### `GET /api/analytics/seller/gst-invoice/` — Seller GST report
 
@@ -1025,4 +1059,8 @@ Public. `multipart/form-data`.
 
 ## Changelog
 
+- **1.4.0** (2026-10-11) — Per-category delivery regions (`category_regions`), superadmin delivery-settings endpoint, `delivery_regions` on product detail, `product_regions` in cart shipping-configs.
+- **1.3.0** (2026-10-11) — Checkout rejects PIN code / state mismatches; `states` in pincode-check.
+- **1.2.0** (2026-10-11) — Seller `excluded_states`; `state` filter on products/home; `excluded_states` in cart shipping-configs and product seller profile.
+- **1.1.0** (2026-10-11) — Region-based shopping: `region` filter on products/home, `GET /api/shipping/regions/`, seller `delivery-regions` endpoints, `region` in pincode-check and `delivery` in cart shipping-configs.
 - **1.0.0** (2026-05-28) — Initial public reference covering buyer + seller user-facing routes.
