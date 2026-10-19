@@ -8,9 +8,12 @@ API directly and uses analytics/himadri_scraper.py for Himadri.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
+from html import unescape
 from html.parser import HTMLParser
+from urllib.parse import urlparse
 import re
 
 import requests
@@ -103,6 +106,17 @@ _DELIST_ENABLED = {
     'petkadai': True,
     'himadri':  False,
 }
+
+
+def find_seller_by_email(seller_email: str):
+    """The seller account for an email typed in the sync form, or None.
+
+    Emails are stored with whatever case the user signed up with
+    ("Support@petkadai.com"), so an exact match rejects the same address typed in
+    lower case. Returns None when no account matches or the match is ambiguous."""
+    from core.models import User
+    matches = list(User.objects.filter(email__iexact=(seller_email or '').strip())[:2])
+    return matches[0] if len(matches) == 1 else None
 
 
 # Delisting only runs when at least this share of the seller's in-stock SKUs showed up
@@ -208,9 +222,47 @@ def _extract_petkadai(item: dict) -> dict | None:
     }
 
 
+# WooCommerce shows a placeholder count (e.g. "99998347 in stock") for products whose
+# stock is not tracked. At or above this it is not a real quantity.
+_UNTRACKED_STOCK_THRESHOLD = 5000
+
+# New products shown as in stock but without a usable count are offered with this
+# stock. The preview marks it as an estimate so it can be reviewed.
+_UNKNOWN_COUNT_IMPORT_STOCK = 5
+
+_SKU_MAX_LENGTH = 100
+
+
+def _himadri_stock(rec: dict) -> int | None:
+    """0 when out of stock, the real count when shown, None when in stock without a usable count.
+
+    None means "leave the stored stock alone" — an in-stock product with no count must
+    not be written as 0, which is what reading a blank stock label as a number did."""
+    status = (rec.get('stock_status') or '').lower()
+    if 'out of stock' in status:
+        return 0
+    match = re.search(r'(\d+)', status)
+    if not match:
+        return None
+    count = int(match.group(1))
+    return count if 0 < count < _UNTRACKED_STOCK_THRESHOLD else None
+
+
+def _himadri_key_sku(rec: dict) -> str:
+    """The product's SKU, or HIM-<url-slug> when Himadri lists it without one.
+
+    About two thirds of Himadri's products have no SKU. The URL slug is stable and
+    unique, so it stands in as the key; products imported with it match next time."""
+    sku = (rec.get('sku') or '').strip()
+    if sku:
+        return sku
+    slug = (rec.get('slug') or urlparse(rec.get('url') or '').path.strip('/').rsplit('/', 1)[-1]).strip()
+    return f'HIM-{slug}'[:_SKU_MAX_LENGTH] if slug else ''
+
+
 def _extract_himadri(rec: dict, markup: Decimal) -> dict | None:
-    """Extract sync fields from a raw Himadri scraped dict."""
-    sku = rec.get('sku') or ''
+    """Extract sync fields from a raw Himadri record (page scraper or Store API)."""
+    sku = _himadri_key_sku(rec)
     if not sku:
         return None
     # Use the minimum of sale_price and regular_price — in WooCommerce the current
@@ -223,8 +275,9 @@ def _extract_himadri(rec: dict, markup: Decimal) -> dict | None:
     return {
         'sku': sku,
         'name': (rec.get('name') or '')[:80],
+        'full_name': rec.get('name') or '',
         'new_base': new_base,
-        'new_stock': _parse_stock(rec.get('stock')),
+        'new_stock': _himadri_stock(rec),
     }
 
 
@@ -301,49 +354,147 @@ def scrape_live_petkadai(progress_cb=None) -> ScrapeResult:
     return ScrapeResult(records, incomplete)
 
 
-def scrape_live_himadri(progress_cb=None) -> ScrapeResult:
-    """Scrape Himadri product pages from the live site.
+# Himadri category pages to crawl. Parent pages already list their sub-category
+# products, so "plants/" alone covers every plant type; the rest are the non-plant
+# and cross-listed categories. Fish, other livestock and live food are not listed —
+# and are also filtered per product below, because they turn up inside "combo" and
+# "uncategorized" too.
+_HIMADRI_CATEGORY_URLS = [
+    'https://himadriaquatics.com/product-category/plants/',
+    'https://himadriaquatics.com/product-category/landscape/',
+    'https://himadriaquatics.com/product-category/combo/',
+    'https://himadriaquatics.com/product-category/alocasia/',
+    'https://himadriaquatics.com/product-category/pond-plants/',
+    'https://himadriaquatics.com/product-category/aquarium-accessories/',
+    'https://himadriaquatics.com/product-category/accessories/',
+    'https://himadriaquatics.com/product-category/decor/',
+    'https://himadriaquatics.com/product-category/fish-foods/dry-foods/',
+    'https://himadriaquatics.com/product-category/fish-medicines-and-water-conditioners/',
+    'https://himadriaquatics.com/product-category/uncategorized/',
+]
 
-    We use only the two parent category URLs (aquatic-plants, floating-plants) because
-    the parent pages already include all sub-category products. Scraping parent + every
-    sub-category would visit the same 500+ product URLs multiple times.
-    """
+# Product pages are fetched in parallel: a serial crawl of ~1,500 pages would not
+# finish inside the Celery task time limit. Each worker pauses after a request so
+# the site is not hammered.
+_HIMADRI_WORKERS = 4
+_HIMADRI_PAGE_DELAY_SECONDS = 0.3
+_HIMADRI_PROGRESS_EVERY = 50
+
+
+def _norm_category(name: str) -> str:
+    return re.sub(r'\s+', ' ', unescape(name or '')).strip().lower()
+
+
+# Himadri categories Junglyst does not list: fish (and every fish sub-category),
+# snails / shrimps / crayfish, and live food. A product tagged with any of these is
+# dropped, wherever the crawl found it.
+HIMADRI_EXCLUDED_CATEGORIES = frozenset(_norm_category(name) for name in [
+    'Fishes', 'Algae Eater', 'Angels', 'Cray fish', 'fishes in kerala', 'Gaurami', 'Guppies',
+    'oscars', 'other aquarium fishes', 'platy', 'Siamese fighting fish (Betta splendens)',
+    'sword tail', 'Tetras', 'planted tank fishes', 'Snails , shrimps and crayfish', 'live foods',
+])
+
+
+def is_excluded_himadri_product(record: dict) -> bool:
+    return any(_norm_category(name) in HIMADRI_EXCLUDED_CATEGORIES for name in record.get('categories') or [])
+
+
+def scrape_live_himadri(progress_cb=None) -> ScrapeResult:
+    """Himadri's catalogue minus fish and live food.
+
+    Read from the public Store API (about 18 requests). If that cannot deliver the whole
+    catalogue, fall back to loading the category and product pages."""
+    from analytics import himadri_api
+
+    try:
+        products = himadri_api.fetch_all_products(progress_cb=progress_cb)
+        records = [himadri_api.to_record(product) for product in products]
+    except himadri_api.HimadriApiError as exc:
+        if progress_cb:
+            progress_cb(f'Himadri API unavailable ({exc}); reading the site pages instead…')
+        return _scrape_himadri_pages(progress_cb)
+    kept = [record for record in records if not is_excluded_himadri_product(record)]
+    if progress_cb:
+        progress_cb(f'Himadri: {len(kept)} products kept, {len(records) - len(kept)} fish/live-food skipped.')
+    return ScrapeResult(kept, [])
+
+
+def _scrape_himadri_pages(progress_cb=None) -> ScrapeResult:
+    """Fallback: crawl the Himadri category pages and every product page."""
     from analytics.himadri_scraper import get_all_product_urls, scrape_product
 
-    # Parent categories only — sub-categories are a superset of their children
-    _HIMADRI_PARENT_URLS = [
-        'https://himadriaquatics.com/product-category/plants/aquatic-plants/',
-        'https://himadriaquatics.com/product-category/plants/floating-plants/',
-    ]
-
+    urls: list[str] = []
     seen: set[str] = set()
-    records = []
-    incomplete = []
-    failed_pages = 0
-    total = len(_HIMADRI_PARENT_URLS)
-    for i, cat_url in enumerate(_HIMADRI_PARENT_URLS):
-        category = cat_url.split("/product-category/")[-1]
+    incomplete: list[str] = []
+    total = len(_HIMADRI_CATEGORY_URLS)
+    for i, cat_url in enumerate(_HIMADRI_CATEGORY_URLS):
+        category = cat_url.split('/product-category/')[-1].strip('/')
         if progress_cb:
-            progress_cb(f'Scraping Himadri: {category} ({i + 1}/{total})…')
+            progress_cb(f'Listing Himadri: {category} ({i + 1}/{total})…')
         try:
-            urls = get_all_product_urls(cat_url)
+            found = get_all_product_urls(cat_url)
         except Exception:
             incomplete.append(category)
             continue
-        for url in urls:
-            if url in seen:
-                continue
-            seen.add(url)
-            try:
-                product = scrape_product(url)
-                if product:
-                    records.append(product)
-            except Exception:
+        for url in found:
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+    def fetch(url: str):
+        try:
+            product = scrape_product(url)
+        except Exception:
+            return None, True
+        time.sleep(_HIMADRI_PAGE_DELAY_SECONDS)
+        return product, False
+
+    records: list[dict] = []
+    failed_pages = excluded = 0
+    with ThreadPoolExecutor(max_workers=_HIMADRI_WORKERS) as pool:
+        for done, (product, failed) in enumerate(pool.map(fetch, urls), start=1):
+            if progress_cb and done % _HIMADRI_PROGRESS_EVERY == 0:
+                progress_cb(f'Scraping Himadri products ({done}/{len(urls)})…')
+            if failed:
                 failed_pages += 1
-            time.sleep(0.3)
+            elif product and is_excluded_himadri_product(product):
+                excluded += 1
+            elif product:
+                records.append(product)
+    if progress_cb:
+        progress_cb(f'Himadri: {len(records)} products kept, {excluded} fish/live-food skipped.')
     if failed_pages:
         incomplete.append(f'{failed_pages} product page(s)')
     return ScrapeResult(records, incomplete)
+
+
+# Himadri lists most products without a SKU. Until a product has been imported
+# under its generated HIM-<slug> key, its existing record is found by product name.
+_NAME_FALLBACK_SOURCES = {'himadri'}
+
+
+def _name_key(name: str | None) -> str:
+    return re.sub(r'[^a-z0-9]', '', (name or '').lower())
+
+
+def _skuless_variants_by_name(seller_email: str) -> dict:
+    """The seller's SKU-less variants keyed by product name; names shared by two products are left out."""
+    from django.db.models import Q
+    from core.models import ProductVariant
+
+    by_name: dict = {}
+    ambiguous: set = set()
+    for variant in (ProductVariant.objects
+                    .filter(product__seller__email__iexact=seller_email)
+                    .filter(Q(sku__isnull=True) | Q(sku=''))
+                    .select_related('product')):
+        key = _name_key(variant.product.name)
+        if key in by_name:
+            ambiguous.add(key)
+        by_name[key] = variant
+    for key in ambiguous:
+        del by_name[key]
+    return by_name
 
 
 # ── Core diff + stock-apply logic ─────────────────────────────────────────────
@@ -372,37 +523,43 @@ def compute_diff(
     extractor = _extract_petkadai if source == 'petkadai' else lambda rec: _extract_himadri(rec, markup)
 
     stock_updated = stock_unchanged = not_found = delisted = 0
+    skipped_out_of_stock = matched_by_name = 0
     price_changes = []
     new_products = []  # scraped products not found in DB — candidates for import
 
     if progress_cb:
         progress_cb(f'Comparing {len(records)} scraped products against DB…')
 
-    # Build a set of all SKUs seen in this scrape so we can zero-out delisted items
-    scraped_skus: set[str] = set()
-    for rec in records:
-        parsed_sku = extractor(rec)
-        if parsed_sku:
-            scraped_skus.add(parsed_sku['sku'])
+    parsed_records = [(rec, parsed) for rec in records if (parsed := extractor(rec))]
+    # Every SKU seen in this scrape, so delisted items can be zeroed afterwards
+    scraped_skus: set[str] = {parsed['sku'] for _, parsed in parsed_records}
 
-    for rec in records:
-        parsed = extractor(rec)
-        if not parsed:
-            continue
+    # One query for all SKUs in the scrape (not one per record); the oldest wins a clash.
+    variants_by_sku: dict[str, ProductVariant] = {}
+    for existing in (ProductVariant.objects.filter(sku__in=scraped_skus)
+                     .select_related('product').order_by('created_at')):
+        variants_by_sku.setdefault(existing.sku, existing)
+    skuless_by_name = (_skuless_variants_by_name(seller_email) if source in _NAME_FALLBACK_SOURCES else {})
 
-        try:
-            variant = (
-                ProductVariant.objects
-                .select_related('product')
-                .get(sku=parsed['sku'])
-            )
-        except ProductVariant.DoesNotExist:
+    for rec, parsed in parsed_records:
+        variant = variants_by_sku.get(parsed['sku'])
+        if variant is None:
+            variant = skuless_by_name.get(_name_key(parsed.get('full_name')))
+            if variant is not None:
+                matched_by_name += 1
+
+        if variant is None:
+            new_stock = parsed['new_stock']
+            if new_stock == 0:
+                skipped_out_of_stock += 1  # not in the DB and out of stock — not worth importing
+                continue
             not_found += 1
             new_products.append({
                 'sku':       parsed['sku'],
                 'name':      parsed['name'],
                 'new_base':  float(parsed['new_base']),
-                'new_stock': parsed['new_stock'] or 0,
+                'new_stock': new_stock if new_stock is not None else _UNKNOWN_COUNT_IMPORT_STOCK,
+                'stock_known': new_stock is not None,
                 'source':    source,
                 '_raw': {
                     'description':       rec.get('description', ''),
@@ -418,13 +575,6 @@ def compute_diff(
                 },
             })
             continue
-        except ProductVariant.MultipleObjectsReturned:
-            variant = (
-                ProductVariant.objects
-                .filter(sku=parsed['sku'])
-                .select_related('product')
-                .first()
-            )
 
         # ── Stock: apply immediately ───────────────────────────────────────────
         new_stock = parsed['new_stock']
@@ -481,7 +631,7 @@ def compute_diff(
     if seller_email and scraped_skus and _DELIST_ENABLED.get(source, False):
         in_stock_skus = set(
             ProductVariant.objects
-            .filter(product__seller__email=seller_email, stock__gt=0)
+            .filter(product__seller__email__iexact=seller_email, stock__gt=0)
             .exclude(sku__isnull=True)   # can't delist what we can't identify
             .values_list('sku', flat=True)
         )
@@ -489,7 +639,7 @@ def compute_diff(
         if delist_skipped is None:
             delisted_qs = (
                 ProductVariant.objects
-                .filter(product__seller__email=seller_email, stock__gt=0)
+                .filter(product__seller__email__iexact=seller_email, stock__gt=0)
                 .exclude(sku__isnull=True)
                 .exclude(sku__in=scraped_skus)
             )
@@ -518,11 +668,18 @@ def compute_diff(
         'stock_updated': stock_updated,
         'stock_unchanged': stock_unchanged,
         'not_found': not_found,
+        'skipped_out_of_stock': skipped_out_of_stock,
+        'matched_by_name': matched_by_name,
         'delisted': delisted,
         'delist_skipped': delist_skipped,
         'scrape_incomplete': scrape_incomplete or [],
         'price_changes': sorted(price_changes, key=lambda x: abs(x['change_pct']), reverse=True),
-        'new_products': sorted(new_products, key=lambda x: x['name']),
+        # The scraped detail (_raw) stays in the saved session for the import step;
+        # sending it to the browser too would be megabytes once Himadri lists ~1,000 new products.
+        'new_products': [
+            {key: value for key, value in product.items() if key != '_raw'}
+            for product in sorted(new_products, key=lambda x: x['name'])
+        ],
     }
 
 
@@ -601,6 +758,145 @@ SUBCAT_REFINE = {
 }
 
 
+# ── Himadri category mapping ──────────────────────────────────────────────────
+# Himadri tags a product with many category names and a product can belong to several
+# Junglyst categories. The plant keywords are the original Himadri import's rules
+# (category-name substring → (category, subcategory)); everything else is new.
+_PLANTS = 'Plants'
+HIMADRI_PLANT_RULES = [
+    ('tissue culture', [(_PLANTS, 'Tissue Culture')]), ('tc cups', [(_PLANTS, 'Tissue Culture')]),
+    ('anubias', [(_PLANTS, 'Epiphytes')]), ('bucephalandra', [(_PLANTS, 'Epiphytes')]),
+    ('lagenandra', [(_PLANTS, 'Epiphytes')]),
+    ('aquatic fern', [(_PLANTS, 'Ferns'), (_PLANTS, 'Aquatic Moss')]),
+    ('java fern', [(_PLANTS, 'Ferns'), (_PLANTS, 'Epiphytes')]),
+    ('bolbitis', [(_PLANTS, 'Ferns'), (_PLANTS, 'Epiphytes')]),
+    ('moss', [(_PLANTS, 'Aquatic Moss'), (_PLANTS, 'Mosses')]),
+    ('cryptocoryn', [(_PLANTS, 'Aquatic Plants')]), ('echinodor', [(_PLANTS, 'Aquatic Plants')]),
+    ('sword', [(_PLANTS, 'Aquatic Plants')]),
+    ('aquatic rhizome', [(_PLANTS, 'Aquatic Plants'), (_PLANTS, 'Epiphytes')]),
+    ('stem plant', [(_PLANTS, 'Aquatic Plants')]),
+    ('carpet', [(_PLANTS, 'Carpet Plants')]), ('foreground', [(_PLANTS, 'Carpet Plants')]),
+    ('lilli', [(_PLANTS, 'Lily')]), ('lotus', [(_PLANTS, 'Lily')]), ('waterlil', [(_PLANTS, 'Lily')]),
+    ('floating', [(_PLANTS, 'Floating Plants')]), ('pond plant', [(_PLANTS, 'Floating Plants')]),
+    ('low tech', [(_PLANTS, 'Beginner Friendly'), (_PLANTS, 'Aquatic Plants')]),
+    ('aquatic plant', [(_PLANTS, 'Aquatic Plants')]),
+]
+# A category name containing one of these marks an aquatic / floating / pond plant.
+HIMADRI_AQUATIC_MARKERS = (
+    'aquatic', 'aquarium plants', 'tissue culture', 'tc cups', 'floating', 'lillies',
+    'lotus', 'waterlilies', 'carpet', 'low tech', 'pond plants',
+)
+_PLANT_SPECIFIC_MARKERS = (
+    'anubias', 'cryptocoryn', 'echinodor', 'stem plant', 'carpet', 'tissue culture', 'tc cups',
+    'floating', 'lillies', 'lotus', 'waterlil', 'low tech', 'aquatic plants', 'pond plants',
+)
+_INDOOR_TAGS = frozenset(_norm_category(name) for name in [
+    'Indoor Plants/ Air Purifying Plants', 'Foliage plants', 'Aglaonema', 'Air Plants',
+    'Anthurium and Orchids', 'Caladiums', 'Calathea', 'Croton', 'Flowering Plants', 'Helicornias',
+    'Hoya', 'Lucky bamboos (Dracenas) and Massangeanas', 'Money plants (Pothos)', 'Monstera varieties',
+    'Philodendrons', 'Sansevieria', 'Syngoniums', 'Alocasia', 'Cactus and Succulents',
+    'Hangable pot plant varieties', 'Herbs, Spices And Medicinal Plant', 'Fruit Plants', 'Garden Ferns',
+    'Garden Plants (outdoor plant varieties)', 'Climbers & Creepers', 'landscape',
+])
+_SUPPLY_TAGS = frozenset({
+    'aquarium accessories & rocks', 'accessories', 'decor', 'aquascaping rocks', 'aquascaping soils',
+})
+
+
+def _words(*words: str):
+    return re.compile(r'\b(' + '|'.join(words) + ')', re.IGNORECASE)
+
+
+_FERTILISER = _words('fertliser', 'fertilizer', 'root tab', 'plant magic', 'nutrient')
+_CONDITIONER = _words('conditioner', 'chlor', 'benebacter', 'microlife', 'bacter', 'indicator', 'test')
+_FILTER = _words('filter')
+_SOIL = _words('soil', 'sand', 'substrate')
+_ROCK = _words('rock', 'stone', 'lava', 'seiryu', 'gravel', 'chips', 'pebble')
+_WOOD = _words('driftwood', 'drift wood', 'wood', 'cholla')
+_TERRARIUM_GEAR = _words('terraplanter', 'wabi', 'kusa')
+
+
+def _himadri_supply_pair(name: str) -> tuple[str, str]:
+    if _FILTER.search(name):
+        return 'Aquarium Filters', 'Hang On Filters' if 'hang' in name.lower() else 'Accessories & Spares'
+    if _SOIL.search(name):
+        return 'Aquascaping', 'Aqua Soil'
+    if _ROCK.search(name):
+        return 'Aquascaping', 'Rocks & Stones'
+    if _WOOD.search(name):
+        return 'Aquascaping', 'Driftwood'
+    if _TERRARIUM_GEAR.search(name):
+        return 'Terrarium & Paludarium', 'Terrarium Accessories'
+    return 'Aquarium Accessories', 'Tank Accessories'
+
+
+def himadri_category_pairs(categories: list[str], name: str) -> list[tuple[str, str | None]]:
+    """(Junglyst category name, subcategory name or None) pairs for a Himadri product.
+
+    The product's own Himadri categories decide; the name only separates what shares a
+    category (rocks vs soil vs wood in "accessories", conditioners vs medicines).
+    A product tagged only "All Plants" says nothing about its type and falls back to
+    Aquatic Plants, which is what almost all of them are."""
+    names = {_norm_category(c) for c in categories or []}
+    # aquatic: a generic aquatic/floating/pond tag, or any tag the plant rules recognise
+    # (a product tagged only "Anubias, Bucephalandras & Lagenandras" is still aquatic)
+    aquatic = (any(marker in n for n in names for marker in HIMADRI_AQUATIC_MARKERS)
+               or any(keyword in n for n in names for keyword, _ in HIMADRI_PLANT_RULES))
+    pairs: list[tuple[str, str | None]] = []
+
+    def add(pair):
+        if pair not in pairs:
+            pairs.append(pair)
+
+    if aquatic:
+        for category in categories:
+            for keyword, mapped in HIMADRI_PLANT_RULES:
+                if keyword in category.lower():
+                    for pair in mapped:
+                        add(pair)
+        add((_PLANTS, 'Aquatic Plants'))
+    is_supply = bool(names & _SUPPLY_TAGS) and 'all plants' not in names \
+        and not any(marker in n for n in names for marker in _PLANT_SPECIFIC_MARKERS)
+    if is_supply:
+        pairs.clear()  # e.g. dried sphagnum moss is a supply, not a plant
+        add(_himadri_supply_pair(name))
+    if 'terrarium plants' in names:
+        add(('Terrarium & Paludarium', None))
+    if not aquatic and names & _INDOOR_TAGS:
+        add(('Indoor Plants', None))
+    if names & {'fish foods', 'dry foods (pellets and flakes)'}:
+        add(('Fish & Aquarium Care', 'Fish Food'))
+    if 'medicines, water conditioners and test kits' in names:
+        if _FERTILISER.search(name):
+            add(('Aquascaping', 'Fertilizers'))
+        elif _CONDITIONER.search(name):
+            add(('Fish & Aquarium Care', 'Water Conditioners'))
+        elif 'accessories' in names:
+            add(('Aquarium Accessories', 'Tank Accessories'))
+        else:
+            add(('Fish & Aquarium Care', 'Aquarium Medicines'))
+    return pairs or [(_PLANTS, 'Aquatic Plants')]
+
+
+def resolve_himadri_categories(categories: list[str], name: str) -> list:
+    """himadri_category_pairs as (Category, SubCategory | None) objects; unknown names are skipped."""
+    from core.models import Category, SubCategory
+
+    pairs = himadri_category_pairs(categories, name)
+    category_names = {category for category, _ in pairs}
+    sub_names = {sub for _, sub in pairs if sub}
+    found_categories = {c.name: c for c in Category.objects.filter(name__in=category_names)}
+    found_subs = {
+        (s.category.name, s.name): s
+        for s in SubCategory.objects.select_related('category').filter(
+            category__name__in=category_names, name__in=sub_names)
+    }
+    return [
+        (found_categories[category], found_subs.get((category, sub)) if sub else None)
+        for category, sub in pairs if category in found_categories
+    ]
+
+
 def resolve_category(scraped_cats: list[str], name: str = ''):
     """Return (Category, SubCategory | None) best matching scraped category list."""
     from core.models import Category, SubCategory
@@ -651,7 +947,7 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
     categories/subcategories and sets sensible defaults per plant type.
     """
     from django.db import transaction
-    from core.models import Product, ProductVariant, ProductImage, User, VariantType, Category, SubCategory, Tag
+    from core.models import Product, ProductVariant, ProductImage, VariantType, Category, SubCategory, Tag
     from core.feed import invalidate_feed_cache
     from analytics.models import StockSyncSession
 
@@ -660,9 +956,8 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
         return {'imported': 0, 'errors': ['Sync session not found. Run preview again.']}
     pending = session.new_products or {}
 
-    try:
-        seller = User.objects.get(email=seller_email)
-    except User.DoesNotExist:
+    seller = find_seller_by_email(seller_email)
+    if seller is None:
         return {'imported': 0, 'errors': [f'Seller not found: {seller_email}']}
 
     # The rate the admin typed only reaches the buyer-facing price through the
@@ -738,8 +1033,12 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
             # the shop would happily render.
             with transaction.atomic():
                 scraped_cats = raw.get('categories') or []
-                category, sub_category = resolve_category(scraped_cats, item['name'])
-                sub_slug = sub_category.slug if sub_category else None
+                if session.source == 'himadri':
+                    placements = resolve_himadri_categories(scraped_cats, item['name'])
+                else:
+                    category, sub_category = resolve_category(scraped_cats, item['name'])
+                    placements = [(category, sub_category)] if category else []
+                sub_slug = next((sub.slug for _, sub in placements if sub), None)
                 care_level, light_req, growth_rate, co2_req = _CARE_DEFAULTS.get(sub_slug, _DEFAULT_CARE)
 
                 # Never fall back to the product name here — an empty description lets
@@ -763,10 +1062,10 @@ def import_new_products(session_key: str, approved_skus: list[str], seller_email
                 )
                 product.save()
 
-                if category:
+                for category, sub_category in placements:
                     product.categories.add(category)
-                if sub_category:
-                    product.sub_categories.add(sub_category)
+                    if sub_category:
+                        product.sub_categories.add(sub_category)
 
                 # Tags
                 for tag_name in (raw.get('tags') or [])[:10]:

@@ -572,6 +572,10 @@ class StockSyncPreviewView(APIView):
         if not seller_email:
             return Response({'error': 'seller_email is required.'}, status=400)
 
+        from analytics.sync_utils import find_seller_by_email
+        if find_seller_by_email(seller_email) is None:
+            return Response({'error': f'No seller account found for {seller_email}.'}, status=400)
+
         try:
             source_markup     = float(request.data['source_markup'])     if 'source_markup'     in request.data else None
             seller_commission = float(request.data['seller_commission']) if 'seller_commission' in request.data else None
