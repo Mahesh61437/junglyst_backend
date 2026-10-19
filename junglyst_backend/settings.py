@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from datetime import timedelta
 from decouple import config, Csv
+from celery.schedules import crontab
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -222,6 +223,12 @@ if config('DB_HOST', default=None):
             'PASSWORD': config('DB_PASSWORD'),
             'HOST': config('DB_HOST'),
             'PORT': config('DB_PORT', default='5432'),
+            # DB is reached through Railway's TCP proxy, which silently drops
+            # idle connections. Without this, a connection that died between
+            # two queries in the same request raises "SSL SYSCALL error: EOF
+            # detected" instead of transparently reconnecting — hit by the
+            # stock-sync job-status poll during long (multi-minute) scrapes.
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 else:
@@ -428,6 +435,13 @@ CELERY_BEAT_SCHEDULE = {
     'sync-shipment-statuses': {
         'task': 'shipping.tasks.sync_all_shipment_statuses',
         'schedule': 3600.0,  # every hour
+    },
+    'purge-stock-sync-sessions': {
+        'task': 'analytics.purge_stock_sync_sessions',
+        # Once a day at a fixed quiet hour (CELERY_TIMEZONE = Asia/Kolkata), not
+        # a 24h interval — a fixed time is predictable and does not depend on
+        # when beat last started.
+        'schedule': crontab(hour=3, minute=30),
     },
     # Payment reconciliation is on-demand (not periodic).
     # 4 delayed checks are scheduled per-payment at checkout time.
