@@ -20,6 +20,10 @@ def _booking_summary_html(booking):
         + (f' · <a href="tel:{escape(contact["phone"])}">{escape(contact["phone"])}</a>' if contact['phone'] else '')
         + '</p>'
     )
+    shared_note = (
+        f' sharing {booking.builds} terrarium{"s" if booking.builds != 1 else ""}'
+        if booking.builds < booking.participants else ''
+    )
     map_link = (
         f'<p><a href="{escape(workshop.map_url)}">Open venue in Maps</a></p>' if workshop.map_url else ''
     )
@@ -32,7 +36,7 @@ def _booking_summary_html(booking):
         {map_link}
         <p><strong>Attendee:</strong> {escape(booking.attendee_name)} · {escape(booking.attendee_phone)}
            · {escape(booking.attendee_email)}</p>
-        <p><strong>Seats:</strong> {booking.participants} &nbsp; <strong>Paid:</strong> ₹{booking.total_amount}</p>
+        <p><strong>People:</strong> {booking.participants}{shared_note} &nbsp; <strong>Paid:</strong> ₹{booking.total_amount}</p>
         {contact_html}
     """
 

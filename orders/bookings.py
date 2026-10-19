@@ -89,10 +89,11 @@ class AbstractBooking(models.Model):
     def is_paid(self):
         return self.status in PAID_BOOKING_STATUSES
 
-    def price(self, unit_price, participants, commission_percent):
-        """Fill the money snapshot fields."""
+    def price(self, unit_price, participants, commission_percent, quantity=None):
+        """Fill the money snapshot fields. `quantity` is what the unit price is
+        charged per (defaults to one per participant)."""
         self.unit_price = Decimal(unit_price)
         self.participants = participants
-        self.total_amount = self.unit_price * participants
+        self.total_amount = self.unit_price * (participants if quantity is None else quantity)
         self.commission_percent = Decimal(commission_percent)
         self.commission_amount, self.seller_payout = split_commission(self.total_amount, self.commission_percent)

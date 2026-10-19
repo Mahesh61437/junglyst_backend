@@ -16,8 +16,8 @@ from orders.serializers import OrderSuccessSerializer
 from payments.checkout import GatewayUnavailable, PaymentCustomer, start_gateway_payment
 
 from .models import (
-    Workshop, WorkshopBooking, WorkshopBookingSplit, WorkshopOrganiser, WorkshopPayout, WorkshopSession,
-    WorkshopStatus,
+    OptionPricing, Workshop, WorkshopBooking, WorkshopBookingSplit, WorkshopOption, WorkshopOrganiser,
+    WorkshopPayout, WorkshopSession, WorkshopStatus,
 )
 from .serializers import (
     AdminBookingSerializer, AdminBookingUpdateSerializer, AdminWorkshopListSerializer,
@@ -58,6 +58,8 @@ class WorkshopListView(generics.ListAPIView):
     def get_queryset(self):
         next_session = (WorkshopSession.objects.upcoming().filter(workshop=OuterRef('pk'))
                         .order_by('date', 'start_time').values('date')[:1])
+        active_options = WorkshopOption.objects.filter(workshop=OuterRef('pk'), is_active=True)
+        cheapest_option = active_options.order_by('price')
         qs = (
             Workshop.objects.filter(status__in=PUBLIC_STATUSES)
             .select_related('seller__seller_profile')
@@ -67,6 +69,9 @@ class WorkshopListView(generics.ListAPIView):
             )
             .annotate(
                 price_from=Min('options__price', filter=Q(options__is_active=True)),
+                # Is the "from" price per person or per shared terrarium?
+                price_from_pricing=Subquery(cheapest_option.values('pricing')[:1]),
+                has_group_option=Exists(active_options.filter(pricing=OptionPricing.PER_BUILD)),
                 next_session_date=Subquery(next_session),
             )
         )
@@ -237,7 +242,7 @@ class AdminWorkshopListCreateView(generics.ListCreateAPIView):
         next_session = (WorkshopSession.objects.filter(workshop=OuterRef('pk'), is_active=True, date__gte=today)
                         .order_by('date', 'start_time').values('date')[:1])
         booked = (WorkshopBooking.objects.filter(workshop=OuterRef('pk'), status__in=PAID_BOOKING_STATUSES)
-                  .values('workshop').annotate(total=Sum('participants')).values('total'))
+                  .values('workshop').annotate(total=Sum('builds')).values('total'))
         return (
             Workshop.objects.select_related('seller__seller_profile')
             .prefetch_related(Prefetch('organisers', queryset=WorkshopOrganiser.objects.select_related('seller__seller_profile')))
@@ -248,7 +253,7 @@ class AdminWorkshopListCreateView(generics.ListCreateAPIView):
                 seats_booked=Coalesce(Subquery(booked), 0),
                 has_overbooked_session=Exists(
                     WorkshopSession.objects.filter(workshop=OuterRef('pk'))
-                    .annotate(booked=Coalesce(Sum('bookings__participants',
+                    .annotate(booked=Coalesce(Sum('bookings__builds',
                                                   filter=Q(bookings__status__in=PAID_BOOKING_STATUSES)), 0))
                     .filter(booked__gt=F('capacity'))
                 ),
