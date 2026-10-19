@@ -50,6 +50,28 @@ class BookingRequest:
     attendee_email: str
     notes: str = ''
     user: object = None
+    builds: int = None  # shared (group) options: terrariums being built
+
+
+def resolve_builds(option, participants, builds):
+    """How many terrariums this booking pays for.
+
+    Per-person options: one each. Shared options: the buyer picks how many;
+    every terrarium needs at least one person and holds at most
+    `max_people_per_build`.
+    """
+    if not option.is_shared:
+        return participants
+    builds = builds or 1
+    if builds < 1:
+        raise BookingError("Choose at least one terrarium.")
+    if participants < builds:
+        raise BookingError("Each shared terrarium needs at least one person.")
+    if participants > builds * option.max_people_per_build:
+        raise BookingError(
+            f"{option.name} is shared by up to {option.max_people_per_build} people. "
+            f"Add another terrarium for {participants} people.")
+    return builds
 
 
 # ── Co-host split ────────────────────────────────────────────────────────────
@@ -156,12 +178,16 @@ def create_pending_booking(req):
     workshop = req.workshop
     if not workshop.is_registration_open():
         raise BookingError("Registrations for this workshop are closed.")
-    if req.participants < 1 or req.participants > workshop.max_seats_per_booking:
-        raise BookingError(f"You can book between 1 and {workshop.max_seats_per_booking} seats at a time.")
+    if req.participants < 1:
+        raise BookingError("Book at least one seat.")
 
     option = workshop.options.filter(id=req.option_id, is_active=True).first()
     if option is None:
         raise BookingError("Please choose an available workshop option.")
+    # One seat per terrarium: a shared terrarium's group takes a single seat.
+    seats = resolve_builds(option, req.participants, req.builds)
+    if seats > workshop.max_seats_per_booking:
+        raise BookingError(f"You can book between 1 and {workshop.max_seats_per_booking} seats at a time.")
 
     # Row lock serialises concurrent bookings for the same session.
     session = (WorkshopSession.objects.select_for_update()
@@ -174,7 +200,7 @@ def create_pending_booking(req):
 
     seats_taken = WorkshopSession.objects.with_seats_taken().get(pk=session.pk).seats_taken
     seats_left = session.capacity - seats_taken
-    if req.participants > seats_left:
+    if seats > seats_left:
         if seats_left <= 0:
             raise BookingError("This session is fully booked. Please pick another date.")
         raise BookingError(f"Only {seats_left} seat(s) left in this session.")
@@ -185,11 +211,11 @@ def create_pending_booking(req):
         user=req.user,
         attendee_name=req.attendee_name, attendee_phone=req.attendee_phone,
         attendee_email=req.attendee_email, notes=req.notes,
-        workshop_title=workshop.title, option_name=option.name,
+        workshop_title=workshop.title, option_name=option.name, builds=seats,
         session_date=session.date, session_start=session.start_time, session_end=session.end_time,
     )
     # Placeholder commission; apply_splits() below writes the real per-seller numbers.
-    booking.price(option.price, req.participants, terms[0].commission_percent)
+    booking.price(option.price, req.participants, terms[0].commission_percent, quantity=seats)
 
     order = Order.objects.create(
         order_number=_unique_order_number(),
@@ -216,7 +242,7 @@ def _organiser_notification(booking, seller_id, payout):
         user_id=seller_id,
         title="New workshop booking",
         message=(
-            f"{booking.attendee_name} booked {booking.participants} seat(s) for "
+            f"{booking.attendee_name} booked {booking.builds} seat(s) for "
             f"{booking.workshop_title} on {booking.session_date:%d %b %Y}, "
             f"{booking.session_start:%I:%M %p}. Your share: ₹{payout}. Ref {booking.reference}."
         ),
@@ -231,7 +257,7 @@ def _overbooking_alerts(booking):
 
     seats_booked = (WorkshopBooking.objects
                     .filter(session_id=booking.session_id, status__in=PAID_BOOKING_STATUSES)
-                    .aggregate(total=Coalesce(Sum('participants'), 0))['total'])
+                    .aggregate(total=Coalesce(Sum('builds'), 0))['total'])
     capacity = WorkshopSession.objects.values_list('capacity', flat=True).get(pk=booking.session_id)
     over_by = seats_booked - capacity
     if over_by <= 0:
@@ -386,6 +412,8 @@ class WorkshopOrderHandler(OrderTypeHandler):
             'cover_image': workshop.cover_image,
             'option_name': booking.option_name,
             'participants': booking.participants,
+            'builds': booking.builds,
+            'shared': booking.builds < booking.participants,
             'session_date': booking.session_date.isoformat(),
             'session_start': booking.session_start.strftime('%H:%M'),
             'session_end': booking.session_end.strftime('%H:%M'),
@@ -412,7 +440,7 @@ _PAID = Q(status__in=PAID_BOOKING_STATUSES)
 def _booking_totals(bookings):
     return bookings.aggregate(
         bookings=Count('id'),
-        seats=Coalesce(Sum('participants'), 0),
+        seats=Coalesce(Sum('builds'), 0),
         gross=Coalesce(Sum('total_amount'), ZERO),
         commission=Coalesce(Sum('commission_amount'), ZERO),
         seller_payout=Coalesce(Sum('seller_payout'), ZERO),
@@ -520,7 +548,7 @@ def financials_overview(workshops, today=None):
     paid_filter = Q(bookings__status__in=PAID_BOOKING_STATUSES)
     rows = workshops.annotate(
         paid_bookings=Count('bookings', filter=paid_filter),
-        seats_sold=Coalesce(Sum('bookings__participants', filter=paid_filter), 0),
+        seats_sold=Coalesce(Sum('bookings__builds', filter=paid_filter), 0),
         gross=Coalesce(Sum('bookings__total_amount', filter=paid_filter), ZERO),
         commission=Coalesce(Sum('bookings__commission_amount', filter=paid_filter), ZERO),
         seller_payout=Coalesce(Sum('bookings__seller_payout', filter=paid_filter), ZERO),
@@ -545,7 +573,7 @@ def seller_overview(seller, today=None):
         WorkshopBookingSplit.objects.filter(paid, seller=seller)
         .values('booking__workshop')
         .annotate(
-            paid_bookings=Count('booking', distinct=True), seats_sold=Sum('booking__participants'),
+            paid_bookings=Count('booking', distinct=True), seats_sold=Sum('booking__builds'),
             gross=Sum('gross_amount'), commission=Sum('commission_amount'), payout=Sum('seller_payout'),
             earned=Coalesce(Sum('seller_payout', filter=Q(booking__session_date__lt=today)), ZERO),
         )

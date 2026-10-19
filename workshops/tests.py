@@ -772,7 +772,7 @@ class CoHostAdminEditTests(TestCase):
         notify.assert_called_once()
 
     def test_capacity_cannot_drop_below_seats_sold(self):
-        WorkshopBooking.objects.filter(pk=self.booking.pk).update(participants=3)
+        WorkshopBooking.objects.filter(pk=self.booking.pk).update(participants=3, builds=3)
         res = self.client.patch(self.url, self._session_payload(capacity=2), format="json")
         self.assertEqual(res.status_code, 400)
         self.assertIn("3 seats sold", str(res.data))
@@ -990,3 +990,138 @@ class GapFixTests(TestCase):
         self.assertIn("/workshops</loc>", xml)
         self.assertIn(f"/workshops/{self.workshop.slug}</loc>", xml)
         self.assertNotIn(draft.slug, xml)
+
+
+from .models import OptionPricing  # noqa: E402
+
+
+@override_settings(**TEST_SETTINGS)
+class GroupBookingTests(TestCase):
+    """One shared terrarium, several people: priced and seated per terrarium."""
+
+    def setUp(self):
+        self.seller = make_seller("org@test.com", "Moss Lab")
+        self.workshop, self.solo, self.session = make_workshop(self.seller, capacity=6)
+        self.workshop.max_seats_per_booking = 8
+        self.workshop.save()
+        self.shared = WorkshopOption.objects.create(
+            workshop=self.workshop, name="Family jar", price=Decimal("1999.00"),
+            pricing=OptionPricing.PER_BUILD, max_people_per_build=4)
+
+    def _book(self, option, participants, builds=None):
+        req = booking_request(self.workshop, option, self.session, participants=participants)
+        req.builds = builds
+        return create_pending_booking(req)
+
+    def test_group_of_three_pays_for_one_terrarium(self):
+        booking = self._book(self.shared, participants=3, builds=1)
+        self.assertEqual((booking.participants, booking.builds), (3, 1))
+        self.assertEqual(booking.total_amount, Decimal("1999.00"))
+        self.assertEqual(booking.order.total_amount, Decimal("1999.00"))
+        self.assertEqual(booking.commission_amount, Decimal("399.80"))  # 20% on the terrarium price
+
+    def test_builds_default_to_one_for_shared_options(self):
+        self.assertEqual(self._book(self.shared, participants=2).builds, 1)
+
+    def test_two_terrariums_for_a_larger_group(self):
+        booking = self._book(self.shared, participants=6, builds=2)
+        self.assertEqual(booking.total_amount, Decimal("3998.00"))
+
+    def test_too_many_people_for_the_terrariums(self):
+        with self.assertRaisesMessage(BookingError, "shared by up to 4 people"):
+            self._book(self.shared, participants=5, builds=1)
+
+    def test_every_terrarium_needs_a_person(self):
+        with self.assertRaisesMessage(BookingError, "at least one person"):
+            self._book(self.shared, participants=1, builds=2)
+
+    def test_a_shared_terrarium_takes_one_seat(self):
+        self._book(self.shared, participants=4, builds=1)
+        self._book(self.shared, participants=8, builds=2)
+        session = WorkshopSession.objects.with_seats_taken().get(pk=self.session.pk)
+        self.assertEqual(session.seats_taken, 3, "3 terrariums, 12 people")
+        self._book(self.shared, participants=6, builds=3)
+        with self.assertRaisesMessage(BookingError, "fully booked"):
+            self._book(self.shared, participants=2, builds=1)
+
+    def test_per_booking_limit_counts_terrariums(self):
+        self.workshop.max_seats_per_booking = 2
+        self.workshop.save()
+        self.assertEqual(self._book(self.shared, participants=8, builds=2).builds, 2)
+        with self.assertRaisesMessage(BookingError, "between 1 and 2 seats"):
+            self._book(self.shared, participants=6, builds=3)
+
+    def test_seats_sold_counts_terrariums(self):
+        from .services import financials_overview
+        booking = self._book(self.shared, participants=4, builds=1)
+        WorkshopBooking.objects.filter(pk=booking.pk).update(status="confirmed")
+        rows, _ = financials_overview(Workshop.objects.filter(pk=self.workshop.pk))
+        self.assertEqual(rows[0].seats_sold, 1)
+
+    def test_per_person_options_unchanged(self):
+        booking = self._book(self.solo, participants=2, builds=1)  # builds ignored for per-person
+        self.assertEqual((booking.builds, booking.total_amount), (2, Decimal("1798.00")))
+
+    def test_api_round_trip_and_public_fields(self):
+        client = APIClient()
+        with patch("workshops.views.start_gateway_payment", return_value=FAKE_GATEWAY):
+            res = client.post(f"/api/workshops/{self.workshop.slug}/book/", {
+                "session_id": self.session.id, "option_id": self.shared.id, "participants": 3, "builds": 1,
+                "attendee_name": "Asha", "attendee_phone": "9876543210", "attendee_email": "asha@example.com",
+            }, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertEqual((res.data["booking"]["participants"], res.data["booking"]["builds"]), (3, 1))
+        self.assertTrue(res.data["order"]["booking"]["shared"])
+        detail = client.get(f"/api/workshops/{self.workshop.slug}/").data
+        shared = next(o for o in detail["options"] if o["id"] == self.shared.id)
+        self.assertEqual((shared["pricing"], shared["max_people_per_build"]), ("per_build", 4))
+        card = client.get("/api/workshops/").data["results"][0]
+        self.assertTrue(card["has_group_option"])
+        self.assertEqual(card["price_from_pricing"], "per_person")  # ₹899 solo is the cheapest
+
+    def test_admin_shared_option_validation(self):
+        admin = User.objects.create_superuser(email="admin@junglyst.com", username="admin", password="x")
+        client = APIClient()
+        client.force_authenticate(admin)
+        url = f"/api/workshops/admin/workshops/{self.workshop.id}/"
+        bad = client.patch(url, {"options": [{"name": "Shared", "price": "999", "pricing": "per_build",
+                                              "max_people_per_build": 1}]}, format="json")
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("at least 2 people", str(bad.data))
+        ok = client.patch(url, {"options": [{"name": "Solo", "price": "899", "max_people_per_build": 5},
+                                             {"name": "Shared", "price": "1999", "pricing": "per_build",
+                                              "max_people_per_build": 3}]}, format="json")
+        self.assertEqual(ok.status_code, 200, ok.content)
+        self.assertEqual(self.workshop.options.get(name="Solo").max_people_per_build, 1, "per-person is one each")
+        self.assertEqual(self.workshop.options.get(name="Shared").max_people_per_build, 3)
+
+    def test_confirmation_email_describes_the_group(self):
+        from django.core import mail
+        from .tasks import send_workshop_booking_emails_task
+        booking = self._book(self.shared, participants=3, builds=1)
+        send_workshop_booking_emails_task(str(booking.id))
+        html = next(m for m in mail.outbox if "asha@example.com" in m.to).alternatives[0][0]
+        self.assertIn("3 sharing 1 terrarium", html)
+
+
+class ResyncBuildsMigrationTests(TestCase):
+    """0005 fixes per-person bookings saved by pre-0004 code (builds defaulted to 1)."""
+
+    def test_per_person_bookings_get_builds_equal_to_people(self):
+        from importlib import import_module
+        from django.apps import apps as django_apps
+        resync = import_module('workshops.migrations.0005_resync_builds_for_per_person').resync_builds
+        seller = make_seller("org@test.com", "Moss Lab")
+        workshop, solo, session = make_workshop(seller, capacity=10)
+        shared = WorkshopOption.objects.create(workshop=workshop, name="Family jar", price=Decimal("1999"),
+                                               pricing=OptionPricing.PER_BUILD, max_people_per_build=4)
+        legacy = create_pending_booking(booking_request(workshop, solo, session, participants=3))
+        group_req = booking_request(workshop, shared, session, participants=3)
+        group_req.builds = 1
+        group = create_pending_booking(group_req)
+        WorkshopBooking.objects.filter(pk=legacy.pk).update(builds=1)  # what old code + db_default left
+        resync(django_apps, None)
+        legacy.refresh_from_db()
+        group.refresh_from_db()
+        self.assertEqual(legacy.builds, 3)
+        self.assertEqual(group.builds, 1, "shared bookings keep their terrarium count")

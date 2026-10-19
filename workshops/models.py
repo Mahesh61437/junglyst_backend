@@ -205,19 +205,39 @@ class WorkshopOrganiser(models.Model):
         return f"{self.workshop.title} · {self.seller_id} ({self.share_percent}%)"
 
 
+class OptionPricing(models.TextChoices):
+    PER_PERSON = 'per_person', _('Per person')          # everyone builds their own
+    PER_BUILD = 'per_build', _('Per shared terrarium')  # a group builds one together
+
+
 class WorkshopOption(models.Model):
-    """A size / shape tier the attendee builds, e.g. "Round bowl · 3 inch"."""
+    """A size / shape tier the attendee builds, e.g. "Round bowl · 3 inch".
+
+    Group booking: a PER_BUILD option is priced per terrarium and shared by up
+    to `max_people_per_build` people. People still take seats; the price
+    follows the number of terrariums ("builds").
+    """
     workshop = models.ForeignKey(Workshop, on_delete=models.CASCADE, related_name='options')
     name = models.CharField(max_length=120)
     shape = models.CharField(max_length=60, blank=True, default='')
     size = models.CharField(max_length=60, blank=True, default='')
     description = models.CharField(max_length=300, blank=True, default='')
     price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('1'))])
+    pricing = models.CharField(max_length=12, choices=OptionPricing.choices, default=OptionPricing.PER_PERSON,
+                               db_default=OptionPricing.PER_PERSON)
+    max_people_per_build = models.PositiveSmallIntegerField(
+        default=1, db_default=1, validators=[MinValueValidator(1), MaxValueValidator(20)],
+        help_text='Shared options: how many people can build one terrarium together.',
+    )
     is_active = models.BooleanField(default=True)
     sort_order = models.PositiveSmallIntegerField(default=0)
 
     class Meta:
         ordering = ['sort_order', 'price']
+
+    @property
+    def is_shared(self):
+        return self.pricing == OptionPricing.PER_BUILD
 
     def __str__(self):
         return f"{self.workshop.title} — {self.name}"
@@ -239,12 +259,13 @@ def seat_holding_filter(prefix='', now=None):
 
 class WorkshopSessionQuerySet(models.QuerySet):
     def with_seats_taken(self, now=None):
+        # A seat is a workstation: one terrarium, however many people share it.
         return self.annotate(
             seats_taken=Coalesce(
-                Sum('bookings__participants', filter=seat_holding_filter('bookings__', now)), 0,
+                Sum('bookings__builds', filter=seat_holding_filter('bookings__', now)), 0,
             ),
             seats_booked=Coalesce(
-                Sum('bookings__participants', filter=Q(bookings__status__in=PAID_BOOKING_STATUSES)), 0,
+                Sum('bookings__builds', filter=Q(bookings__status__in=PAID_BOOKING_STATUSES)), 0,
             ),
         )
 
@@ -283,6 +304,9 @@ class WorkshopBooking(AbstractBooking):
     # Snapshots so the booking still reads correctly if the listing is edited.
     workshop_title = models.CharField(max_length=160)
     option_name = models.CharField(max_length=120)
+    # Terrariums being built. Per-person options: one each (= participants).
+    # Shared options: fewer, each built by a group. Price = unit_price × builds.
+    builds = models.PositiveSmallIntegerField(default=1, db_default=1)
     session_date = models.DateField()
     session_start = models.TimeField()
     session_end = models.TimeField()

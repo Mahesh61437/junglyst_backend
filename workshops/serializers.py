@@ -7,7 +7,7 @@ from rest_framework import serializers
 from core.models import User
 from orders.bookings import PAID_BOOKING_STATUSES
 from .models import (
-    RegistrationState, Workshop, WorkshopBooking, WorkshopOption, WorkshopOrganiser, WorkshopPayout, WorkshopSession,
+    OptionPricing, RegistrationState, Workshop, WorkshopBooking, WorkshopOption, WorkshopOrganiser, WorkshopPayout, WorkshopSession,
 )
 from .services import (
     organiser_contact, organiser_terms, paid_booking_count, recalculate_unsettled, unsettled_bookings,
@@ -40,7 +40,7 @@ def _clean_text_list(values, field_label, max_items=MAX_LIST_ITEMS):
 class PublicOptionSerializer(serializers.ModelSerializer):
     class Meta:
         model = WorkshopOption
-        fields = ('id', 'name', 'shape', 'size', 'description', 'price')
+        fields = ('id', 'name', 'shape', 'size', 'description', 'price', 'pricing', 'max_people_per_build')
 
 
 class PublicSessionSerializer(serializers.ModelSerializer):
@@ -88,6 +88,8 @@ class OrganiserMixin(serializers.Serializer):
 class WorkshopCardSerializer(OrganiserMixin, serializers.ModelSerializer):
     cover_image = serializers.CharField(read_only=True)
     price_from = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    price_from_pricing = serializers.CharField(read_only=True, allow_null=True)
+    has_group_option = serializers.BooleanField(read_only=True)
     next_session_date = serializers.DateField(read_only=True)
     seats_left = serializers.SerializerMethodField()
     upcoming_session_count = serializers.SerializerMethodField()
@@ -98,7 +100,8 @@ class WorkshopCardSerializer(OrganiserMixin, serializers.ModelSerializer):
         model = Workshop
         fields = (
             'id', 'slug', 'title', 'tagline', 'category', 'cover_image', 'city', 'venue_name',
-            'duration_minutes', 'skill_level', 'is_featured', 'price_from', 'next_session_date',
+            'duration_minutes', 'skill_level', 'is_featured', 'price_from', 'price_from_pricing',
+            'has_group_option', 'next_session_date',
             'seats_left', 'upcoming_session_count', 'registration_open', 'registration_state',
             'registration_opens_at', 'registration_closes_at', 'organiser', 'organisers',
         )
@@ -151,6 +154,8 @@ class BookingRequestSerializer(serializers.Serializer):
     session_id = serializers.IntegerField()
     option_id = serializers.IntegerField()
     participants = serializers.IntegerField(min_value=1, max_value=50)
+    # Shared (group) options only: how many terrariums the group builds.
+    builds = serializers.IntegerField(min_value=1, max_value=50, required=False)
     attendee_name = serializers.CharField(max_length=120, trim_whitespace=True)
     attendee_phone = serializers.RegexField(PHONE_PATTERN, error_messages={
         'invalid': 'Enter a valid 10-digit mobile number.',
@@ -174,7 +179,7 @@ class BookingSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'reference', 'order_id', 'status', 'status_label', 'workshop', 'workshop_title',
             'workshop_slug', 'option_name', 'session', 'session_date', 'session_start', 'session_end',
-            'participants', 'attendee_name', 'attendee_phone', 'attendee_email', 'notes',
+            'participants', 'builds', 'attendee_name', 'attendee_phone', 'attendee_email', 'notes',
             'unit_price', 'total_amount', 'venue', 'organiser_contact', 'confirmed_at', 'created_at',
         )
 
@@ -277,7 +282,16 @@ class AdminOptionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = WorkshopOption
-        fields = ('id', 'name', 'shape', 'size', 'description', 'price', 'is_active', 'sort_order')
+        fields = ('id', 'name', 'shape', 'size', 'description', 'price', 'pricing', 'max_people_per_build',
+                  'is_active', 'sort_order')
+
+    def validate(self, attrs):
+        if attrs.get('pricing') == OptionPricing.PER_BUILD:
+            if (attrs.get('max_people_per_build') or 1) < 2:
+                raise serializers.ValidationError("A shared terrarium needs room for at least 2 people.")
+        else:
+            attrs['max_people_per_build'] = 1  # per-person: one each
+        return attrs
 
 
 class AdminSessionSerializer(serializers.ModelSerializer):
