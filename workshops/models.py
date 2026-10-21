@@ -17,7 +17,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.text import slugify
@@ -58,6 +58,12 @@ class RegistrationState(models.TextChoices):
     NO_DATES = 'no_dates', _('No upcoming dates')
 
 
+class NoticeTone(models.TextChoices):
+    INFO = 'info', _('Info')
+    WARNING = 'warning', _('Important')
+    SUCCESS = 'success', _('Good news')
+
+
 class WorkshopStatus(models.TextChoices):
     DRAFT = 'draft', _('Draft')
     PUBLISHED = 'published', _('Published')
@@ -88,6 +94,9 @@ class Workshop(SoftDeleteModel):
     # Short "what you get" bullets, e.g. "3 inch round glass bowl", "Welcome drink".
     highlights = models.JSONField(default=list, blank=True)
     what_to_bring = models.JSONField(default=list, blank=True)
+    # Admin-defined extra sections, e.g. Terms & conditions, Notes, What you'll make:
+    # [{"title": "...", "body": "..."}], shown in this order as plain text.
+    custom_sections = models.JSONField(default=list, db_default=Value([], output_field=models.JSONField()), blank=True)
     # Image URLs from /api/core/upload/. The first one is the cover.
     images = models.JSONField(default=list, blank=True)
 
@@ -115,6 +124,10 @@ class Workshop(SoftDeleteModel):
         default=DEFAULT_MAX_SEATS_PER_BOOKING, validators=[MinValueValidator(1), MaxValueValidator(50)],
     )
     cancellation_policy = models.TextField(blank=True, default='')
+    # Highlighted banner on the workshop page, e.g. "Venue not finalised yet".
+    notice = models.CharField(max_length=300, blank=True, default='', db_default='')
+    notice_tone = models.CharField(max_length=10, choices=NoticeTone.choices, default=NoticeTone.INFO,
+                                   db_default=NoticeTone.INFO)
 
     # Who attendees call about the session. Shown only to people who booked
     # (ticket, My Orders, confirmation email), never on the public page.
@@ -214,14 +227,18 @@ class WorkshopOption(models.Model):
     """A size / shape tier the attendee builds, e.g. "Round bowl · 3 inch".
 
     Group booking: a PER_BUILD option is priced per terrarium and shared by up
-    to `max_people_per_build` people. People still take seats; the price
-    follows the number of terrariums ("builds").
+    to `max_people_per_build` people. A terrarium takes one seat and the
+    price follows the number of terrariums ("builds").
+
+    `images` shows this option's own build (e.g. the 6 inch bowl); the page
+    falls back to the workshop gallery when it is empty.
     """
     workshop = models.ForeignKey(Workshop, on_delete=models.CASCADE, related_name='options')
     name = models.CharField(max_length=120)
     shape = models.CharField(max_length=60, blank=True, default='')
     size = models.CharField(max_length=60, blank=True, default='')
     description = models.CharField(max_length=300, blank=True, default='')
+    images = models.JSONField(default=list, db_default=Value([], output_field=models.JSONField()), blank=True)
     price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal('1'))])
     pricing = models.CharField(max_length=12, choices=OptionPricing.choices, default=OptionPricing.PER_PERSON,
                                db_default=OptionPricing.PER_PERSON)
