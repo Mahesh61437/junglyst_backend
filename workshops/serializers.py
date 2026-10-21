@@ -16,6 +16,10 @@ from .services import (
 MAX_LIST_ITEMS = 20
 MAX_LIST_ITEM_LENGTH = 200
 MAX_IMAGES = 12
+MAX_OPTION_IMAGES = 6
+MAX_CUSTOM_SECTIONS = 10
+MAX_SECTION_TITLE_LENGTH = 120
+MAX_SECTION_BODY_LENGTH = 4000
 PHONE_PATTERN = re.compile(r'^\+?[0-9 ]{10,15}$')
 
 
@@ -35,12 +39,20 @@ def _clean_text_list(values, field_label, max_items=MAX_LIST_ITEMS):
     return cleaned
 
 
+def _clean_image_urls(values, field_label, max_items):
+    images = _clean_text_list(values, field_label, max_items=max_items)
+    url_field = serializers.URLField(max_length=1000)
+    for url in images:
+        url_field.run_validation(url)
+    return images
+
+
 # ── Public ───────────────────────────────────────────────────────────────────
 
 class PublicOptionSerializer(serializers.ModelSerializer):
     class Meta:
         model = WorkshopOption
-        fields = ('id', 'name', 'shape', 'size', 'description', 'price', 'pricing', 'max_people_per_build')
+        fields = ('id', 'name', 'shape', 'size', 'description', 'images', 'price', 'pricing', 'max_people_per_build')
 
 
 class PublicSessionSerializer(serializers.ModelSerializer):
@@ -130,7 +142,7 @@ class WorkshopDetailSerializer(OrganiserMixin, serializers.ModelSerializer):
         model = Workshop
         fields = (
             'id', 'slug', 'title', 'tagline', 'category', 'description', 'highlights', 'what_to_bring',
-            'images', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes', 'skill_level',
+            'custom_sections', 'notice', 'notice_tone', 'images', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes', 'skill_level',
             'min_age', 'max_seats_per_booking', 'cancellation_policy', 'registration_opens_at',
             'registration_closes_at', 'registration_open', 'registration_state', 'status', 'options',
             'sessions', 'organiser', 'organisers',
@@ -282,8 +294,11 @@ class AdminOptionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = WorkshopOption
-        fields = ('id', 'name', 'shape', 'size', 'description', 'price', 'pricing', 'max_people_per_build',
-                  'is_active', 'sort_order')
+        fields = ('id', 'name', 'shape', 'size', 'description', 'images', 'price', 'pricing',
+                  'max_people_per_build', 'is_active', 'sort_order')
+
+    def validate_images(self, value):
+        return _clean_image_urls(value, 'Option images', MAX_OPTION_IMAGES)
 
     def validate(self, attrs):
         if attrs.get('pricing') == OptionPricing.PER_BUILD:
@@ -347,7 +362,7 @@ class AdminWorkshopSerializer(serializers.ModelSerializer):
         model = Workshop
         fields = (
             'id', 'slug', 'title', 'tagline', 'category', 'description', 'highlights', 'what_to_bring',
-            'images', 'seller', 'organiser_name', 'status', 'is_featured', 'registration_opens_at',
+            'custom_sections', 'notice', 'notice_tone', 'images', 'seller', 'organiser_name', 'status', 'is_featured', 'registration_opens_at',
             'registration_closes_at', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes',
             'skill_level', 'min_age', 'max_seats_per_booking', 'cancellation_policy', 'commission_percent',
             'contact_name', 'contact_phone', 'organisers', 'options', 'sessions', 'session_inputs', 'recalculate_unsettled',
@@ -394,11 +409,33 @@ class AdminWorkshopSerializer(serializers.ModelSerializer):
         return _clean_text_list(value, 'What to bring')
 
     def validate_images(self, value):
-        images = _clean_text_list(value, 'Images', max_items=MAX_IMAGES)
-        url_field = serializers.URLField(max_length=1000)
-        for url in images:
-            url_field.run_validation(url)
-        return images
+        return _clean_image_urls(value, 'Images', MAX_IMAGES)
+
+    def validate_notice(self, value):
+        return value.strip()
+
+    def validate_custom_sections(self, value):
+        """Keep only {title, body} text; fully blank rows are dropped."""
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Sections must be a list.")
+        sections = []
+        for row in value:
+            if not isinstance(row, dict):
+                raise serializers.ValidationError("Each section needs a heading and a description.")
+            title = str(row.get('title') or '').strip()
+            body = str(row.get('body') or '').strip()
+            if not title and not body:
+                continue
+            if not title or not body:
+                raise serializers.ValidationError("Each section needs both a heading and a description.")
+            if len(title) > MAX_SECTION_TITLE_LENGTH:
+                raise serializers.ValidationError(f"Section headings must be under {MAX_SECTION_TITLE_LENGTH} characters.")
+            if len(body) > MAX_SECTION_BODY_LENGTH:
+                raise serializers.ValidationError(f"Section descriptions must be under {MAX_SECTION_BODY_LENGTH} characters.")
+            sections.append({'title': title, 'body': body})
+        if len(sections) > MAX_CUSTOM_SECTIONS:
+            raise serializers.ValidationError(f"Add at most {MAX_CUSTOM_SECTIONS} sections.")
+        return sections
 
     def validate(self, attrs):
         opens = attrs.get('registration_opens_at', getattr(self.instance, 'registration_opens_at', None))
