@@ -1095,6 +1095,24 @@ class GroupBookingTests(TestCase):
         self.assertEqual(self.workshop.options.get(name="Solo").max_people_per_build, 1, "per-person is one each")
         self.assertEqual(self.workshop.options.get(name="Shared").max_people_per_build, 3)
 
+    def test_option_photos_round_trip(self):
+        admin = User.objects.create_superuser(email="photos@junglyst.com", username="photos", password="x")
+        client = APIClient()
+        client.force_authenticate(admin)
+        url = f"/api/workshops/admin/workshops/{self.workshop.id}/"
+        bowl = {"id": self.shared.id, "name": "Bowl · 6 inch", "price": "1999", "pricing": "per_build",
+                "max_people_per_build": 4}
+        bad = client.patch(url, {"options": [{**bowl, "images": ["javascript:alert(1)"]}]}, format="json")
+        self.assertEqual(bad.status_code, 400)
+        too_many = client.patch(url, {"options": [{**bowl, "images": [f"https://cdn.test/{i}.jpg" for i in range(7)]}]},
+                                format="json")
+        self.assertEqual(too_many.status_code, 400)
+        ok = client.patch(url, {"options": [{**bowl, "images": [" https://cdn.test/bowl6.jpg ", ""]}]}, format="json")
+        self.assertEqual(ok.status_code, 200, ok.content)
+        detail = APIClient().get(f"/api/workshops/{self.workshop.slug}/").data
+        option = next(o for o in detail["options"] if o["id"] == self.shared.id)
+        self.assertEqual(option["images"], ["https://cdn.test/bowl6.jpg"])
+
     def test_confirmation_email_describes_the_group(self):
         from django.core import mail
         from .tasks import send_workshop_booking_emails_task
@@ -1125,3 +1143,65 @@ class ResyncBuildsMigrationTests(TestCase):
         group.refresh_from_db()
         self.assertEqual(legacy.builds, 3)
         self.assertEqual(group.builds, 1, "shared bookings keep their terrarium count")
+
+
+@override_settings(**TEST_SETTINGS)
+class CustomSectionTests(TestCase):
+    """Admin-defined heading + description blocks (terms, notes, what you'll make)."""
+
+    def setUp(self):
+        self.workshop, _, _ = make_workshop(make_seller("sections@test.com", "Moss Lab"))
+        admin = User.objects.create_superuser(email="sections-admin@junglyst.com", username="sections-admin", password="x")
+        self.client = APIClient()
+        self.client.force_authenticate(admin)
+        self.url = f"/api/workshops/admin/workshops/{self.workshop.id}/"
+
+    def _save(self, sections):
+        return self.client.patch(self.url, {"custom_sections": sections}, format="json")
+
+    def test_sections_are_cleaned_and_shown_in_order(self):
+        res = self._save([
+            {"title": " Terms & conditions ", "body": "No refunds after 48 hours.\nBring ID.", "extra": "ignored"},
+            {"title": "", "body": "  "},
+            {"title": "What you'll make", "body": "A closed terrarium."},
+        ])
+        self.assertEqual(res.status_code, 200, res.content)
+        public = APIClient().get(f"/api/workshops/{self.workshop.slug}/").data
+        self.assertEqual(public["custom_sections"], [
+            {"title": "Terms & conditions", "body": "No refunds after 48 hours.\nBring ID."},
+            {"title": "What you'll make", "body": "A closed terrarium."},
+        ])
+
+    def test_heading_and_description_are_both_required(self):
+        self.assertEqual(self._save([{"title": "Notes", "body": ""}]).status_code, 400)
+        self.assertEqual(self._save([{"title": "", "body": "Text"}]).status_code, 400)
+        self.assertEqual(self._save(["not a section"]).status_code, 400)
+
+    def test_limits(self):
+        self.assertEqual(self._save([{"title": "x" * 121, "body": "ok"}]).status_code, 400)
+        self.assertEqual(self._save([{"title": "ok", "body": "x" * 4001}]).status_code, 400)
+        self.assertEqual(self._save([{"title": f"S{i}", "body": "ok"} for i in range(11)]).status_code, 400)
+
+    def test_only_admins_can_edit(self):
+        res = APIClient().patch(self.url, {"custom_sections": [{"title": "Hack", "body": "x"}]}, format="json")
+        self.assertIn(res.status_code, (401, 403))
+
+
+class NoticeTests(CustomSectionTests):
+    """Highlighted banner, e.g. "Venue not finalised yet"."""
+
+    def test_notice_is_trimmed_and_public(self):
+        res = self.client.patch(self.url, {"notice": "  Venue not finalised yet. We'll email the location.  ",
+                                           "notice_tone": "warning"}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        public = APIClient().get(f"/api/workshops/{self.workshop.slug}/").data
+        self.assertEqual((public["notice"], public["notice_tone"]),
+                         ("Venue not finalised yet. We'll email the location.", "warning"))
+
+    def test_notice_validation(self):
+        self.assertEqual(self.client.patch(self.url, {"notice_tone": "shouting"}, format="json").status_code, 400)
+        self.assertEqual(self.client.patch(self.url, {"notice": "x" * 301}, format="json").status_code, 400)
+
+    def test_defaults_to_no_notice(self):
+        public = APIClient().get(f"/api/workshops/{self.workshop.slug}/").data
+        self.assertEqual((public["notice"], public["notice_tone"]), ("", "info"))
