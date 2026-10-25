@@ -20,6 +20,8 @@ MAX_OPTION_IMAGES = 6
 MAX_CUSTOM_SECTIONS = 10
 MAX_SECTION_TITLE_LENGTH = 120
 MAX_SECTION_BODY_LENGTH = 4000
+MAX_BUILD_STEPS = 12
+MAX_STEP_BODY_LENGTH = 1500
 PHONE_PATTERN = re.compile(r'^\+?[0-9 ]{10,15}$')
 
 
@@ -142,7 +144,7 @@ class WorkshopDetailSerializer(OrganiserMixin, serializers.ModelSerializer):
         model = Workshop
         fields = (
             'id', 'slug', 'title', 'tagline', 'category', 'description', 'highlights', 'what_to_bring',
-            'custom_sections', 'notice', 'notice_tone', 'images', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes', 'skill_level',
+            'custom_sections', 'build_steps', 'notice', 'notice_tone', 'images', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes', 'skill_level',
             'min_age', 'max_seats_per_booking', 'cancellation_policy', 'registration_opens_at',
             'registration_closes_at', 'registration_open', 'registration_state', 'status', 'options',
             'sessions', 'organiser', 'organisers',
@@ -362,7 +364,7 @@ class AdminWorkshopSerializer(serializers.ModelSerializer):
         model = Workshop
         fields = (
             'id', 'slug', 'title', 'tagline', 'category', 'description', 'highlights', 'what_to_bring',
-            'custom_sections', 'notice', 'notice_tone', 'images', 'seller', 'organiser_name', 'status', 'is_featured', 'registration_opens_at',
+            'custom_sections', 'build_steps', 'notice', 'notice_tone', 'images', 'seller', 'organiser_name', 'status', 'is_featured', 'registration_opens_at',
             'registration_closes_at', 'venue_name', 'address', 'city', 'map_url', 'duration_minutes',
             'skill_level', 'min_age', 'max_seats_per_booking', 'cancellation_policy', 'commission_percent',
             'contact_name', 'contact_phone', 'organisers', 'options', 'sessions', 'session_inputs', 'recalculate_unsettled',
@@ -410,6 +412,33 @@ class AdminWorkshopSerializer(serializers.ModelSerializer):
 
     def validate_images(self, value):
         return _clean_image_urls(value, 'Images', MAX_IMAGES)
+
+    def validate_build_steps(self, value):
+        """Keep only {title, body, image}; fully blank steps are dropped."""
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Steps must be a list.")
+        url_field = serializers.URLField(max_length=1000)
+        steps = []
+        for row in value:
+            if not isinstance(row, dict):
+                raise serializers.ValidationError("Each step needs a name and a description.")
+            title = str(row.get('title') or '').strip()
+            body = str(row.get('body') or '').strip()
+            image = str(row.get('image') or '').strip()
+            if not (title or body or image):
+                continue
+            if not title or not body:
+                raise serializers.ValidationError("Each step needs both a name and a description.")
+            if len(title) > MAX_SECTION_TITLE_LENGTH:
+                raise serializers.ValidationError(f"Step names must be under {MAX_SECTION_TITLE_LENGTH} characters.")
+            if len(body) > MAX_STEP_BODY_LENGTH:
+                raise serializers.ValidationError(f"Step descriptions must be under {MAX_STEP_BODY_LENGTH} characters.")
+            if image:
+                url_field.run_validation(image)
+            steps.append({'title': title, 'body': body, 'image': image})
+        if len(steps) > MAX_BUILD_STEPS:
+            raise serializers.ValidationError(f"Add at most {MAX_BUILD_STEPS} steps.")
+        return steps
 
     def validate_notice(self, value):
         return value.strip()

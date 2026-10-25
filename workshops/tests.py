@@ -1205,3 +1205,34 @@ class NoticeTests(CustomSectionTests):
     def test_defaults_to_no_notice(self):
         public = APIClient().get(f"/api/workshops/{self.workshop.slug}/").data
         self.assertEqual((public["notice"], public["notice_tone"]), ("", "info"))
+
+
+class BuildStepTests(CustomSectionTests):
+    """Step-by-step guide: name, description and an optional photo per step."""
+
+    def _steps(self, steps):
+        return self.client.patch(self.url, {"build_steps": steps}, format="json")
+
+    def test_steps_are_cleaned_and_public_in_order(self):
+        res = self._steps([
+            {"title": " Drainage layer ", "body": "Add pebbles.", "image": "https://cdn.test/s1.jpg", "x": 1},
+            {"title": "", "body": "", "image": ""},
+            {"title": "Moss", "body": "Press moss on top."},
+        ])
+        self.assertEqual(res.status_code, 200, res.content)
+        public = APIClient().get(f"/api/workshops/{self.workshop.slug}/").data
+        self.assertEqual(public["build_steps"], [
+            {"title": "Drainage layer", "body": "Add pebbles.", "image": "https://cdn.test/s1.jpg"},
+            {"title": "Moss", "body": "Press moss on top.", "image": ""},
+        ])
+
+    def test_step_validation(self):
+        self.assertEqual(self._steps([{"title": "Soil", "body": ""}]).status_code, 400)
+        self.assertEqual(self._steps([{"title": "", "body": "x", "image": "https://cdn.test/a.jpg"}]).status_code, 400)
+        self.assertEqual(self._steps([{"title": "Soil", "body": "x", "image": "javascript:alert(1)"}]).status_code, 400)
+        self.assertEqual(self._steps([{"title": "Soil", "body": "x" * 1501}]).status_code, 400)
+        self.assertEqual(self._steps([{"title": f"S{i}", "body": "x"} for i in range(13)]).status_code, 400)
+
+    def test_only_admins_can_edit_steps(self):
+        res = APIClient().patch(self.url, {"build_steps": [{"title": "a", "body": "b"}]}, format="json")
+        self.assertIn(res.status_code, (401, 403))
