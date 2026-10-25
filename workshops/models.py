@@ -97,6 +97,8 @@ class Workshop(SoftDeleteModel):
     # Admin-defined extra sections, e.g. Terms & conditions, Notes, What you'll make:
     # [{"title": "...", "body": "..."}], shown in this order as plain text.
     custom_sections = models.JSONField(default=list, db_default=Value([], output_field=models.JSONField()), blank=True)
+    # "How you'll build it": [{"title": "...", "body": "...", "image": "<url or ''>"}], in order.
+    build_steps = models.JSONField(default=list, db_default=Value([], output_field=models.JSONField()), blank=True)
     # Image URLs from /api/core/upload/. The first one is the cover.
     images = models.JSONField(default=list, blank=True)
 
