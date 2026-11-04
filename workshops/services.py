@@ -1,6 +1,5 @@
 """Booking creation, lifecycle and money maths for workshops."""
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -11,7 +10,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from notifications.models import AppNotification
-from orders.bookings import BookingStatus, PAID_BOOKING_STATUSES, PAISE, split_commission
+from orders.bookings import BookingStatus, PAID_BOOKING_STATUSES, PAISE, split_commission, unique_order_number
 from orders.models import Order, OrderStatus, OrderType
 from orders.order_types import OrderTypeHandler
 
@@ -26,17 +25,6 @@ ZERO = Decimal('0')
 
 class BookingError(Exception):
     """A booking request that can't be honoured. Message is safe for clients."""
-
-
-def _generate_order_number():
-    return f"JNG-{timezone.now().year}-{uuid.uuid4().hex[:5].upper()}"
-
-
-def _unique_order_number():
-    number = _generate_order_number()
-    while Order.all_objects.filter(order_number=number).exists():
-        number = _generate_order_number()
-    return number
 
 
 @dataclass
@@ -218,7 +206,7 @@ def create_pending_booking(req):
     booking.price(option.price, req.participants, terms[0].commission_percent, quantity=seats)
 
     order = Order.objects.create(
-        order_number=_unique_order_number(),
+        order_number=unique_order_number(),
         order_type=OrderType.WORKSHOP,
         user=req.user,
         guest_email=None if req.user else req.attendee_email,

@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from .models import Order
@@ -97,3 +98,11 @@ class AbstractBooking(models.Model):
         self.total_amount = self.unit_price * (participants if quantity is None else quantity)
         self.commission_percent = Decimal(commission_percent)
         self.commission_amount, self.seller_payout = split_commission(self.total_amount, self.commission_percent)
+
+
+def unique_order_number():
+    """A fresh JNG-<year>-<5 hex> number that no order (even a soft-deleted one) uses."""
+    while True:
+        number = f"JNG-{timezone.now().year}-{uuid.uuid4().hex[:5].upper()}"
+        if not Order.all_objects.filter(order_number=number).exists():
+            return number
