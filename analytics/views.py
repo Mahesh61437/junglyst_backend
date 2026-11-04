@@ -55,6 +55,12 @@ class SuperAdminDashboardView(generics.GenericAPIView):
         # Product figures only: the Orders tab below lists product sub-orders,
         # so the headline numbers must match it. Workshops get their own line.
         orders_in_range = self._apply_range(Order.objects.filter(order_type=OrderType.PRODUCT), rng, 'created_at')
+        # Custom (quote-based) orders: first payments and additional payments that completed.
+        custom_paid = self._apply_range(
+            Order.objects.filter(order_type=OrderType.SERVICE, payment_status=PaymentStatus.COMPLETED)
+            .exclude(status__in=[OrderStatus.CANCELLED, OrderStatus.RETURNED]),
+            rng, 'created_at',
+        ).aggregate(count=Count('id', filter=Q(service_quote__isnull=False)), revenue=Sum('total_amount'))
         workshop_paid = self._apply_range(
             Order.objects.filter(order_type=OrderType.WORKSHOP, workshop_booking__status__in=PAID_BOOKING_STATUSES),
             rng, 'created_at',
@@ -137,6 +143,7 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 'sub_order_id': so.id,
                 'order_number': so.sub_order_number,  # Use sub-order number
                 'master_order_number': so.order.order_number,
+                'order_type': so.order.order_type,
                 'total_amount': so.seller_total,
                 'status': so.status,
                 'status_label': status_labels.get(so.status, so.status),
@@ -177,6 +184,8 @@ class SuperAdminDashboardView(generics.GenericAPIView):
                 "unpaid_value": unpaid_value,
                 "workshop_bookings": workshop_paid['count'] or 0,
                 "workshop_revenue": workshop_paid['revenue'] or 0,
+                "custom_orders": custom_paid['count'] or 0,
+                "custom_order_revenue": custom_paid['revenue'] or 0,
             },
             "sellers": sellers_data,
             "status_choices": [{"value": v, "label": l} for v, l in SubOrderStatus.choices],
