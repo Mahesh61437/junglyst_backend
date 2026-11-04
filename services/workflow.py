@@ -125,7 +125,8 @@ def update_quote_details(quote, actor, details, actor_is_admin):
 
 @transaction.atomic
 def assign_seller(quote, admin, seller):
-    if quote.status not in OPEN_QUOTE_STATUSES or quote.order_id:
+    # Reassigning is fine until money is taken; the shipment is created for whoever is assigned at payment.
+    if quote.status not in OPEN_QUOTE_STATUSES or _has_paid_order(quote):
         raise QuoteError('A seller can no longer be assigned to this request.')
     previous = quote.assigned_seller_id
     quote.assigned_seller = seller
@@ -165,9 +166,10 @@ def send_pay_request(quote, admin):
 
 @transaction.atomic
 def decline_request(quote, admin, reason=''):
-    quote = QuoteRequest.objects.select_for_update().get(pk=quote.pk)
-    if quote.status not in OPEN_QUOTE_STATUSES or quote.order_id:
+    quote = QuoteRequest.objects.select_for_update(of=('self',)).select_related('order').get(pk=quote.pk)
+    if quote.status not in OPEN_QUOTE_STATUSES or _has_paid_order(quote):
         raise QuoteError('This request can no longer be declined.')
+    _void_open_orders(quote)  # a payment window the customer opened is closed (a late payment is flagged for refund)
     quote.status = QuoteStatus.DECLINED
     quote.admin_notes = f'{quote.admin_notes}\nDeclined: {reason}'.strip() if reason else quote.admin_notes
     quote.save(update_fields=['status', 'admin_notes', 'updated_at'])
@@ -407,7 +409,8 @@ def _create_seller_sub_order(quote, order):
         subtotal=quote.item_price, shipping_fee=quote.shipping_fee, seller_total=seller_payout,
         status='placed',
     )
-    order.items.filter(sub_order__isnull=True).update(sub_order=sub_order)
+    # The line item names the seller assigned *now*, which may differ from when the order was opened.
+    order.items.update(sub_order=sub_order, seller=quote.assigned_seller)
     return sub_order
 
 

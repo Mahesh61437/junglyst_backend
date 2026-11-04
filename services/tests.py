@@ -1627,3 +1627,64 @@ class ListQueryCountTests(ServiceTestCase):
         self.make_many(customer, 6)
         many = {name: self.queries_for(*args) for name, args in urls.items()}
         self.assertEqual(few, many, f'queries grew with the number of requests: {few} -> {many}')
+
+
+# ── Admin actions after the customer opened the payment window ───────────────
+
+@override_settings(**TEST_SETTINGS)
+class AfterPaymentWindowOpenedTests(ServiceTestCase):
+    def setUp(self):
+        super().setUp()
+        self.customer = make_user('asha@example.com')
+        self.admin_client = APIClient()
+        self.admin_client.force_authenticate(self.admin)
+        self.customer_client = APIClient()
+        self.customer_client.force_authenticate(self.customer)
+        self.other_seller = make_seller('second@junglyst.test', 'Second Studio')
+        self.quote = self.priced_request(user=self.customer)
+        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{self.quote.id}/send-pay-request/').status_code, 200)
+        self.quote.refresh_from_db()
+        cache.clear()
+        with patch('services.views.start_gateway_payment', return_value=FAKE_GATEWAY):
+            self.assertEqual(self.customer_client.post(
+                f'/api/services/my-requests/{self.quote.reference}/pay/', PAY_ADDRESS, format='json').status_code, 201)
+        self.quote.refresh_from_db()  # the customer opened the gateway but has not paid
+
+    def capture(self, order):
+        with self.captureOnCommitCallbacks(execute=True):
+            order.refresh_from_db()
+            order.is_paid = True
+            order.payment_status = PaymentStatus.COMPLETED
+            order.status = OrderStatus.CONFIRMED
+            order.save()
+
+    def test_admin_can_still_reassign_the_seller_before_anything_is_paid(self):
+        response = self.admin_client.post(
+            f'/api/services/admin/requests/{self.quote.id}/assign/', {'seller_id': str(self.other_seller.id)}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.quote.refresh_from_db()
+        self.assertEqual(self.quote.assigned_seller, self.other_seller)
+
+    def test_the_shipment_goes_to_the_seller_assigned_at_payment_time(self):
+        self.admin_client.post(
+            f'/api/services/admin/requests/{self.quote.id}/assign/', {'seller_id': str(self.other_seller.id)}, format='json')
+        self.capture(self.quote.order)
+        order = Order.objects.get(pk=self.quote.order_id)
+        sub_order = order.sub_orders.get()
+        self.assertEqual(sub_order.seller, self.other_seller)
+        self.assertEqual(order.items.get().seller, self.other_seller)
+
+    def test_admin_can_decline_a_quote_the_customer_never_paid(self):
+        response = self.admin_client.post(f'/api/services/admin/requests/{self.quote.id}/decline/', {'reason': 'Cannot make this'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.quote.refresh_from_db()
+        self.assertEqual(self.quote.status, QuoteStatus.DECLINED)
+
+    def test_nothing_can_be_reassigned_or_declined_once_paid(self):
+        self.capture(self.quote.order)
+        reassign = self.admin_client.post(
+            f'/api/services/admin/requests/{self.quote.id}/assign/', {'seller_id': str(self.other_seller.id)}, format='json')
+        self.assertEqual(reassign.status_code, 400)
+        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{self.quote.id}/decline/', {}, format='json').status_code, 400)
+        self.quote.refresh_from_db()
+        self.assertEqual((self.quote.status, self.quote.assigned_seller), (QuoteStatus.PAID, self.seller))
