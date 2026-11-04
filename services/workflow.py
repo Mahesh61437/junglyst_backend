@@ -258,12 +258,7 @@ def send_pay_by_reminders(now=None):
 
 @transaction.atomic
 def customer_cancel(quote, user, reason=''):
-    """A customer cancels their own request.
-
-    Before any payment it simply closes. After payment it becomes a *request* the admin decides on
-    (the admin refunds manually), so a paid order is never cancelled behind the seller's back.
-    Returns 'cancelled' or 'requested'.
-    """
+    """A customer cancels their own request before paying. Once paid, only the admin can cancel."""
     quote = (QuoteRequest.objects.select_for_update(of=('self',))
              .select_related('assigned_seller', 'user', 'order').get(pk=quote.pk))
     reason = ' '.join((reason or '').split())[:500]
@@ -278,34 +273,7 @@ def customer_cancel(quote, user, reason=''):
         if quote.assigned_seller_id:
             _notify([quote.assigned_seller], f'Request cancelled: {quote.reference}', 'The customer cancelled before paying.')
         return 'cancelled'
-    if quote.status == QuoteStatus.PAID:
-        if quote.cancel_requested_at:
-            raise QuoteError('You have already asked to cancel this order. We will get back to you soon.')
-        quote.cancel_requested_at = timezone.now()
-        quote.cancel_request_reason = reason
-        quote.save(update_fields=['cancel_requested_at', 'cancel_request_reason', 'updated_at'])
-        record_event(quote, user, 'cancellation_requested', {'reason': reason})
-        _notify(super_admins(), f'Cancellation requested: {quote.reference}',
-                f'{quote.contact_name} asked to cancel a paid order.' + (f' Reason: {reason}' if reason else ''))
-        transaction.on_commit(lambda: _queue_email('send_cancel_request_email_task', quote.id))
-        return 'requested'
-    raise QuoteError('This order can no longer be cancelled here. Please call us.')
-
-
-@transaction.atomic
-def dismiss_cancel_request(quote, admin):
-    """Admin keeps the order: the customer's cancellation request is closed."""
-    quote = QuoteRequest.objects.select_for_update(of=('self',)).select_related('user').get(pk=quote.pk)
-    if not quote.cancel_requested_at:
-        raise QuoteError('There is no cancellation request to dismiss.')
-    quote.cancel_requested_at = None
-    quote.cancel_request_reason = ''
-    quote.save(update_fields=['cancel_requested_at', 'cancel_request_reason', 'updated_at'])
-    record_event(quote, admin, 'cancellation_dismissed')
-    if quote.user_id:
-        _notify([quote.user], 'About your cancellation request',
-                f'We could not cancel {quote.reference}. Please call us if you would like to talk about it.')
-    return quote
+    raise QuoteError('A paid order cannot be cancelled here. Please call us and we will help.')
 
 
 # ── Cancellation (refund is done manually by the admin) ─────────────────────
@@ -339,8 +307,7 @@ def cancel_order(quote, admin, reason=''):
 
     quote.status = QuoteStatus.CANCELLED
     quote.cancel_reason = reason
-    quote.cancel_requested_at = None
-    quote.save(update_fields=['status', 'cancel_reason', 'cancel_requested_at', 'updated_at'])
+    quote.save(update_fields=['status', 'cancel_reason', 'updated_at'])
     quote.additional_charges.filter(status=ChargeStatus.REQUESTED).update(status=ChargeStatus.CANCELLED)
     if sub_orders:
         # Plain updates on purpose: no fulfilment or payment signals should react to a manual cancellation.

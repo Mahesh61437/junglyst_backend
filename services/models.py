@@ -202,9 +202,6 @@ class QuoteRequest(models.Model):
     pay_by = models.DateTimeField(null=True, blank=True, db_index=True)
     # Why the admin cancelled (shown to the customer). Refunds are made manually.
     cancel_reason = models.CharField(max_length=500, blank=True, default='')
-    # A customer who already paid asks the admin to cancel; the admin decides.
-    cancel_requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
-    cancel_request_reason = models.CharField(max_length=500, blank=True, default='')
     # Set once the "pay soon" reminder went out for the current pay-by date.
     pay_by_reminder_sent_at = models.DateTimeField(null=True, blank=True)
 

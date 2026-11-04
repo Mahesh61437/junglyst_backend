@@ -1407,39 +1407,6 @@ class Round9Tests(ServiceTestCase):
         self.assertEqual(open_order.status, OrderStatus.CANCELLED)
         self.assertTrue(AppNotification.objects.filter(user=self.admin, title=f'Customer cancelled: {quote.reference}').exists())
 
-    def test_paid_order_cancellation_is_a_request_the_admin_decides(self):
-        quote = self.paid_quote()
-        mine = self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data
-        self.assertTrue(mine['can_cancel'])
-        with self.captureOnCommitCallbacks(execute=True):
-            response = self.customer_client.post(self.cancel_url(quote), {'reason': 'Moving house'}, format='json')
-        self.assertEqual(response.data['outcome'], 'requested', response.data)
-        quote.refresh_from_db()
-        self.assertEqual(quote.status, QuoteStatus.PAID)  # nothing is cancelled yet
-        self.assertIsNotNone(quote.cancel_requested_at)
-        self.assertEqual(quote.order.sub_orders.get().status, 'placed')
-        self.assertFalse(self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data['can_cancel'])
-        self.assertEqual(self.customer_client.post(self.cancel_url(quote), {}, format='json').status_code, 400)  # only once
-        self.assertTrue(any('Cancellation requested' in m.subject and self.admin.email in m.to for m in mail.outbox))
-        summary = self.admin_client.get('/api/services/admin/summary/').data
-        self.assertEqual(summary['cancel_requests'], 1)
-        detail = self.admin_client.get(f'/api/services/admin/requests/{quote.id}/').data
-        self.assertEqual(detail['cancel_request_reason'], 'Moving house')
-
-    def test_admin_can_keep_the_order_or_cancel_it(self):
-        quote = self.paid_quote()
-        self.customer_client.post(self.cancel_url(quote), {'reason': 'x'}, format='json')
-        dismissed = self.admin_client.post(f'/api/services/admin/requests/{quote.id}/dismiss-cancel/')
-        self.assertEqual(dismissed.status_code, 200, dismissed.data)
-        quote.refresh_from_db()
-        self.assertIsNone(quote.cancel_requested_at)
-        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{quote.id}/dismiss-cancel/').status_code, 400)
-        self.customer_client.post(self.cancel_url(quote), {'reason': 'again'}, format='json')
-        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{quote.id}/cancel/', {'reason': 'ok'}, format='json').status_code, 200)
-        quote.refresh_from_db()
-        self.assertEqual(quote.status, QuoteStatus.CANCELLED)
-        self.assertIsNone(quote.cancel_requested_at)
-
     def test_cancel_permissions_and_closed_states(self):
         quote = self.sent_quote()
         stranger = make_user('stranger@example.com')
@@ -1447,23 +1414,23 @@ class Round9Tests(ServiceTestCase):
         client.force_authenticate(stranger)
         self.assertEqual(client.post(self.cancel_url(quote), {}, format='json').status_code, 404)
         self.assertEqual(APIClient().post(self.cancel_url(quote), {}, format='json').status_code, 401)
-        seller_client = APIClient()
-        seller_client.force_authenticate(self.seller)
-        self.assertEqual(seller_client.post(f'/api/services/admin/requests/{quote.id}/dismiss-cancel/').status_code, 403)
         QuoteRequest.objects.filter(pk=quote.pk).update(status=QuoteStatus.DELIVERED)
         self.assertEqual(self.customer_client.post(self.cancel_url(quote), {}, format='json').status_code, 400)
         self.assertFalse(self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data['can_cancel'])
 
-    def test_seller_never_sees_the_cancellation_request(self):
+    def test_a_paid_order_cannot_be_cancelled_by_the_customer(self):
         quote = self.paid_quote()
-        self.customer_client.post(self.cancel_url(quote), {'reason': 'private'}, format='json')
-        seller_client = APIClient()
-        seller_client.force_authenticate(self.seller)
-        detail = seller_client.get(f'/api/services/seller/requests/{quote.id}/').data
-        listing = seller_client.get('/api/services/seller/requests/').data['results'][0]
-        for hidden in ('cancel_requested_at', 'cancel_request_reason'):
-            self.assertNotIn(hidden, detail)
-            self.assertNotIn(hidden, listing)
+        mine = self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data
+        self.assertFalse(mine['can_cancel'])
+        response = self.customer_client.post(self.cancel_url(quote), {'reason': 'Moving house'}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('call us', response.data['error'])
+        quote.refresh_from_db()
+        self.assertEqual(quote.status, QuoteStatus.PAID)
+        self.assertEqual(quote.order.sub_orders.get().status, 'placed')
+        # the team can still cancel it (refund is manual)
+        admin_cancel = self.admin_client.post(f'/api/services/admin/requests/{quote.id}/cancel/', {'reason': 'Agreed by phone'}, format='json')
+        self.assertEqual(admin_cancel.status_code, 200)
 
     # ── reminders and the email countdown ──
     def test_reminder_goes_out_once_in_the_last_24_hours(self):

@@ -37,7 +37,6 @@ urlpatterns = [
     path('admin/requests/<uuid:pk>/decline/', views.AdminDeclineView.as_view(), name='service_admin_decline'),
     path('admin/requests/<uuid:pk>/renew/', views.AdminRenewView.as_view(), name='service_admin_renew'),
     path('admin/requests/<uuid:pk>/cancel/', views.AdminCancelView.as_view(), name='service_admin_cancel'),
-    path('admin/requests/<uuid:pk>/dismiss-cancel/', views.AdminDismissCancelView.as_view(), name='service_admin_dismiss_cancel'),
     path('admin/requests/<uuid:pk>/charges/<uuid:charge_id>/payout-done/', views.AdminExtraPayoutView.as_view(), name='service_admin_extra_payout'),
     path('admin/requests/<uuid:pk>/mark-delivered/', views.AdminMarkDeliveredView.as_view(), name='service_admin_mark_delivered'),
     path('admin/requests/<uuid:pk>/charges/', views.AdminChargeCreateView.as_view(), name='service_admin_charge_create'),

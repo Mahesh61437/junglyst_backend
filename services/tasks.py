@@ -164,28 +164,6 @@ def send_pay_by_reminder_email_task(quote_id):
     )
 
 
-@shared_task(name='services.tasks.send_cancel_request_email_task', max_retries=2, default_retry_delay=60)
-def send_cancel_request_email_task(quote_id):
-    from core.models import User
-    from .models import QuoteRequest
-
-    quote = QuoteRequest.objects.select_related('offering').get(id=quote_id)
-    frontend = getattr(settings, 'FRONTEND_URL', '').rstrip('/')
-    admins = list(User.objects.filter(is_superuser=True, is_active=True).values_list('email', flat=True))
-    _send(
-        f'Cancellation requested: {quote.reference}',
-        f"""<html><body style="font-family: Arial, sans-serif; color: #1b2d2a;">
-            <h2>A customer asked to cancel a paid order</h2>
-            <p><strong>{escape(quote.reference)}</strong> · {escape(quote.offering.name)}</p>
-            <p>{escape(quote.contact_name)} · {escape(quote.contact_phone)} · {escape(quote.contact_email)}</p>
-            <p><strong>Reason:</strong> {escape(quote.cancel_request_reason) or 'Not given'}</p>
-            <p>Open it in the <a href="{frontend}/super-admin/services">custom orders queue</a> to cancel it (refund
-               manually) or keep the order.</p>
-        </body></html>""",
-        admins,
-    )
-
-
 @shared_task(name='services.tasks.pay_by_reminders_task')
 def pay_by_reminders_task():
     from .workflow import send_pay_by_reminders

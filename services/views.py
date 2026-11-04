@@ -22,7 +22,7 @@ from .serializers import (
 )
 from .workflow import (
     QuoteError, QuoteExpired, assign_seller, cancel_additional_charge, cancel_order, customer_cancel,
-    decline_request, dismiss_cancel_request, expire_overdue_pay_requests, mark_delivered, notify_new_request,
+    decline_request, expire_overdue_pay_requests, mark_delivered, notify_new_request,
     record_extra_payout, renew_pay_request,
     prepare_charge_order, prepare_order_for_payment, request_additional_charge, send_pay_request,
     update_quote_details,
@@ -176,7 +176,7 @@ class QuotePayView(APIView):
 
 
 class MyQuoteCancelView(APIView):
-    """POST /api/services/my-requests/<reference>/cancel/ — cancel before paying, or ask to after."""
+    """POST /api/services/my-requests/<reference>/cancel/ — the customer cancels before paying."""
     permission_classes = (permissions.IsAuthenticated,)
     throttle_classes = (ScopedRateThrottle,)
     throttle_scope = 'service_cancel'
@@ -362,7 +362,6 @@ class AdminSummaryView(APIView):
             new_requests=Count('id', filter=Q(status=QuoteStatus.SUBMITTED)),
             in_review=Count('id', filter=Q(status=QuoteStatus.IN_REVIEW)),
             awaiting_payment=Count('id', filter=Q(status=QuoteStatus.AWAITING_PAYMENT)),
-            cancel_requests=Count('id', filter=Q(status=QuoteStatus.PAID, cancel_requested_at__isnull=False)),
             **{f'section_{name}': Count('id', filter=Q(status__in=statuses)) for name, statuses in QUOTE_SECTIONS.items()},
         )
         return Response(counts)
@@ -501,11 +500,6 @@ class AdminCancelView(_AdminQuoteActionView):
         payload = DeclineSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
         cancel_order(quote, request.user, payload.validated_data['reason'])
-
-
-class AdminDismissCancelView(_AdminQuoteActionView):
-    def act(self, request, quote):
-        dismiss_cancel_request(quote, request.user)
 
 
 class AdminExtraPayoutView(APIView):
