@@ -391,7 +391,8 @@ class AdminQuoteListCreateView(generics.ListCreateAPIView):
     def get_queryset(self):
         params = self.request.query_params
         queryset = filter_section(
-            QuoteRequest.objects.select_related('offering__group', 'assigned_seller__seller_profile'),
+            QuoteRequest.objects.select_related('offering__group', 'assigned_seller__seller_profile')
+            .prefetch_related('additional_charges'),
             params.get('section'), default='active',
         )
         if params.get('status'):

@@ -1148,6 +1148,24 @@ class PayByAndCancelTests(ServiceTestCase):
         self.assertTrue(AppNotification.objects.filter(user=self.customer, title='Your custom order was cancelled').exists())
         self.assertTrue(AppNotification.objects.filter(user=self.seller, title__startswith='Custom order cancelled').exists())
 
+    def test_lists_show_the_final_amount_once_paid_including_paid_extras(self):
+        quote = self.sent_quote()
+        admin_list = lambda: next(r for r in self.admin_client.get('/api/services/admin/requests/').data['results'] if r['id'] == str(quote.id))
+        self.assertIsNone(admin_list()['final_amount'])  # unpaid: only the quote amount exists
+        self.pay(quote)
+        self.capture(quote)
+        self.assertEqual(str(admin_list()['final_amount']), '5200.00')
+        self.admin_client.post(f'/api/services/admin/requests/{quote.id}/charges/', {'description': 'Moss', 'amount': '300'}, format='json')
+        self.admin_client.post(f'/api/services/admin/requests/{quote.id}/charges/', {'description': 'Unpaid extra', 'amount': '999'}, format='json')
+        first = AdditionalCharge.objects.filter(quote_request=quote).earliest('created_at')
+        AdditionalCharge.objects.filter(pk=first.pk).update(status=ChargeStatus.PAID)
+        self.assertEqual(str(admin_list()['final_amount']), '5500.00')  # 5200 + the 300 that was paid, not the 999 asked
+        mine = self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data
+        self.assertEqual(str(mine['final_amount']), '5500.00')
+        seller_client = APIClient()
+        seller_client.force_authenticate(self.seller)
+        self.assertEqual(str(seller_client.get(f'/api/services/seller/requests/{quote.id}/').data['final_amount']), '5500.00')
+
     def test_paid_custom_order_shows_in_regular_admin_and_seller_order_lists(self):
         quote = self.sent_quote()
         self.pay(quote)

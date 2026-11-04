@@ -9,7 +9,7 @@ from shipping.regions import STATE_NAMES
 from . import validators
 from .permissions import assignable_sellers
 from .models import (
-    MONEY_MAX_DIGITS, UNPAID_STATUSES, AdditionalCharge, QuoteEvent, QuoteRequest, ServiceFormField, ServiceGroup, ServiceOffering,
+    MONEY_MAX_DIGITS, UNPAID_STATUSES, AdditionalCharge, ChargeStatus, QuoteEvent, QuoteStatus, QuoteRequest, ServiceFormField, ServiceGroup, ServiceOffering,
 )
 
 
@@ -108,6 +108,18 @@ class QuoteRequestCreateSerializer(serializers.Serializer):
         )
 
 
+def final_amount(quote):
+    """What the customer paid in total: the quote plus every extra payment that went through.
+
+    None until the first payment is made (before that, the quote amount is the only figure).
+    Uses the prefetched `additional_charges`, so lists stay free of per-row queries.
+    """
+    if quote.status not in (QuoteStatus.PAID, QuoteStatus.DELIVERED) or quote.total_amount is None:
+        return None
+    extras = sum((c.amount for c in quote.additional_charges.all() if c.status == ChargeStatus.PAID), Decimal('0'))
+    return quote.total_amount + extras
+
+
 def _answer_rows(quote):
     """Questions with the customer's answer, in form order, for display and email."""
     return [
@@ -174,6 +186,7 @@ class QuoteRequestSerializer(serializers.ModelSerializer):
     order_number = serializers.SerializerMethodField()
     additional_charges = AdditionalChargeSerializer(many=True, read_only=True)
     can_cancel = serializers.SerializerMethodField()
+    final_amount = serializers.SerializerMethodField()
     delivery_states = serializers.ListField(source='offering.delivery_states', child=serializers.CharField(), read_only=True)
     delivery_state_names = serializers.ListField(source='offering.delivery_state_names', child=serializers.CharField(), read_only=True)
 
@@ -182,7 +195,7 @@ class QuoteRequestSerializer(serializers.ModelSerializer):
         fields = ('id', 'reference', 'offering_name', 'group_name', 'status', 'status_label', 'state',
                   'budget_min', 'budget_max', 'answer_rows', 'reference_images', 'customer_notes',
                   'quote', 'order_number', 'additional_charges', 'delivery_states', 'delivery_state_names',
-                  'pay_by', 'paid_at', 'cancel_reason', 'can_cancel', 'created_at')
+                  'pay_by', 'paid_at', 'cancel_reason', 'can_cancel', 'final_amount', 'created_at')
 
     def get_state(self, quote):
         return STATE_NAMES.get(quote.state_code, quote.state_code)
@@ -192,6 +205,9 @@ class QuoteRequestSerializer(serializers.ModelSerializer):
 
     def get_order_number(self, quote):
         return quote.order.order_number if quote.order_id else None
+
+    def get_final_amount(self, quote):
+        return final_amount(quote)
 
     def get_can_cancel(self, quote):
         """Only before payment; a paid order is cancelled by the team."""
@@ -278,15 +294,19 @@ class QuoteListSerializer(serializers.ModelSerializer):
     status_label = serializers.CharField(source='get_status_display', read_only=True)
     assigned_seller = SellerBriefSerializer(read_only=True)
     total_amount = serializers.DecimalField(max_digits=MONEY_MAX_DIGITS, decimal_places=2, read_only=True)
+    final_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = QuoteRequest
         fields = ('id', 'reference', 'offering_name', 'group_name', 'status', 'status_label', 'contact_name',
                   'contact_phone', 'state', 'budget_min', 'budget_max', 'assigned_seller', 'total_amount',
-                  'created_at')
+                  'final_amount', 'created_at')
 
     def get_state(self, quote):
         return STATE_NAMES.get(quote.state_code, quote.state_code)
+
+    def get_final_amount(self, quote):
+        return final_amount(quote)
 
 
 class QuoteStaffDetailSerializer(QuoteListSerializer):
