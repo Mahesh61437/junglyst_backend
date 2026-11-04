@@ -130,12 +130,17 @@ def customer_quotes(user):
     ).select_related('offering__group', 'order').prefetch_related('additional_charges')
 
 
+MY_REQUESTS_LIMIT = 100
+
+
 class MyQuoteListView(generics.ListAPIView):
+    """A customer's own requests, newest first. Not paginated: My Orders shows them all in one block."""
     permission_classes = (permissions.IsAuthenticated,)
     serializer_class = QuoteRequestSerializer
+    pagination_class = None
 
     def get_queryset(self):
-        return customer_quotes(self.request.user)
+        return customer_quotes(self.request.user)[:MY_REQUESTS_LIMIT]
 
 
 class MyQuoteDetailView(generics.RetrieveAPIView):

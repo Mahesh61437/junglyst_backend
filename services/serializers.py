@@ -9,7 +9,7 @@ from shipping.regions import STATE_NAMES
 from . import validators
 from .permissions import assignable_sellers
 from .models import (
-    MONEY_MAX_DIGITS, UNPAID_STATUSES, AdditionalCharge, QuoteStatus, QuoteEvent, QuoteRequest, ServiceFormField, ServiceGroup, ServiceOffering,
+    MONEY_MAX_DIGITS, UNPAID_STATUSES, AdditionalCharge, QuoteEvent, QuoteRequest, ServiceFormField, ServiceGroup, ServiceOffering,
 )
 
 

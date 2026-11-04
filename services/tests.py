@@ -144,11 +144,21 @@ class ValidatorTests(TestCase):
             with self.assertRaises(serializers.ValidationError):
                 validators.validate_budget(low, high)
 
-    def test_reference_images_must_be_https_and_capped(self):
-        validators.validate_reference_images(['https://example.com/a.jpg'])
-        for bad in (['http://example.com/a.jpg'], ['javascript:alert(1)'], ['https://x.com/a.jpg'] * 6, 'nope'):
-            with self.assertRaises(serializers.ValidationError):
+    @override_settings(FIREBASE_STORAGE_BUCKET='junglyst_test')
+    def test_reference_images_must_come_from_our_bucket(self):
+        good = 'https://storage.googleapis.com/junglyst_test/dev/assets/service-reference/a.png'
+        self.assertEqual(validators.validate_reference_images([good]), [good])
+        for bad in (['http://example.com/a.jpg'], ['javascript:alert(1)'], [good] * 6, 'nope',
+                    ['https://evil.example.com/pixel.png'],                                   # someone else's server
+                    ['https://storage.googleapis.com/other_bucket/a.png'],                      # someone else's bucket
+                    ['https://storage.googleapis.com/junglyst_test.evil.com/a.png']):           # look-alike host trick
+            with self.assertRaises(serializers.ValidationError, msg=str(bad)):
                 validators.validate_reference_images(bad)
+
+    @override_settings(FIREBASE_STORAGE_BUCKET='')
+    def test_without_a_configured_bucket_no_link_is_accepted(self):
+        with self.assertRaises(serializers.ValidationError):
+            validators.validate_reference_images(['https://storage.googleapis.com/anything/a.png'])
 
     def test_inclusions_are_cleaned_and_validated(self):
         cleaned = validators.validate_inclusions([{'label': ' Glass  jar ', 'amount': '1200'}, {'label': 'Moss'}])
@@ -260,6 +270,16 @@ class QuoteRequestTests(ServiceTestCase):
         statuses = [self.client.post(REQUEST_URL, valid_request_payload(), format='json').status_code for _ in range(limit + 1)]
         self.assertEqual(statuses[:limit], [201] * limit)
         self.assertEqual(statuses[limit], 429)
+
+    @override_settings(FIREBASE_STORAGE_BUCKET='junglyst_test')
+    def test_request_accepts_our_photos_and_rejects_outside_links(self):
+        ours = 'https://storage.googleapis.com/junglyst_test/dev/assets/service-reference/a.png'
+        quote = self.make_request(reference_images=[ours])
+        self.assertEqual(quote.reference_images, [ours])
+        cache.clear()
+        outside = self.client.post(REQUEST_URL, valid_request_payload(reference_images=['https://tracker.example.com/p.png']), format='json')
+        self.assertEqual(outside.status_code, 400)
+        self.assertIn('reference_images', outside.data)
 
     def test_honeypot_blocks_bots(self):
         response = self.client.post(REQUEST_URL, valid_request_payload(website='http://spam.example'), format='json')
@@ -497,6 +517,18 @@ class PermissionTests(ServiceTestCase):
         client.force_authenticate(stranger)
         self.assertEqual(client.get(f'/api/services/my-requests/{quote.reference}/').status_code, 404)
         self.assertEqual(client.post(f'/api/services/my-requests/{quote.reference}/pay/', {}, format='json').status_code, 404)
+
+    def test_customer_list_returns_every_request_not_just_the_first_page(self):
+        customer = make_user('many@example.com')
+        for _ in range(23):
+            self.make_request(contact_email='many@example.com')
+        QuoteRequest.objects.filter(contact_email='many@example.com').update(user=customer)
+        client = APIClient()
+        client.force_authenticate(customer)
+        listing = client.get('/api/services/my-requests/')
+        self.assertEqual(listing.status_code, 200)
+        self.assertIsInstance(listing.data, list)
+        self.assertEqual(len(listing.data), 23)
 
     def test_customer_does_not_see_quote_figures_before_pay_request(self):
         customer = make_user('asha@example.com')
@@ -1555,3 +1587,43 @@ class Round9Tests(ServiceTestCase):
         seller_client = APIClient()
         seller_client.force_authenticate(self.seller)
         self.assertEqual(seller_client.post(f'/api/services/admin/requests/{quote.id}/charges/{charge.id}/payout-done/').status_code, 403)
+
+
+@override_settings(**TEST_SETTINGS)
+class ListQueryCountTests(ServiceTestCase):
+    """Lists must cost the same number of queries however many requests they hold (no N+1)."""
+
+    def make_many(self, customer, count):
+        for _ in range(count):
+            quote = self.priced_request(user=customer)
+            quote.status = QuoteStatus.PAID
+            quote.save()
+            AdditionalCharge.objects.create(
+                quote_request=quote, description='Extra', amount=Decimal('100'), commission_percent=Decimal('15'),
+                seller_payout=Decimal('85'),
+            )
+
+    def queries_for(self, client, url):
+        with CaptureQueriesContext(connection) as queries:
+            self.assertEqual(client.get(url).status_code, 200)
+        return len(queries)
+
+    def test_customer_seller_and_admin_lists_do_not_grow_with_rows(self):
+        customer = make_user('asha@example.com')
+        customer_client = APIClient()
+        customer_client.force_authenticate(customer)
+        seller_client = APIClient()
+        seller_client.force_authenticate(self.seller)
+        admin_client = APIClient()
+        admin_client.force_authenticate(self.admin)
+        urls = {
+            'customer': (customer_client, '/api/services/my-requests/'),
+            'seller': (seller_client, '/api/services/seller/requests/'),
+            'admin': (admin_client, '/api/services/admin/requests/'),
+            'groups': (self.client, '/api/services/groups/'),
+        }
+        self.make_many(customer, 2)
+        few = {name: self.queries_for(*args) for name, args in urls.items()}
+        self.make_many(customer, 6)
+        many = {name: self.queries_for(*args) for name, args in urls.items()}
+        self.assertEqual(few, many, f'queries grew with the number of requests: {few} -> {many}')

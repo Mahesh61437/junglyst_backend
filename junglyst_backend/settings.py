@@ -332,7 +332,7 @@ REST_FRAMEWORK = {
         'workshop_booking': '10/minute',  # each attempt creates an order + gateway order
         'workshop_lookup': '30/minute',   # guest booking lookup by order number + email
         'service_quote': '30/hour',       # public quote-request form (spam guard; honeypot catches most bots)
-        'service_upload': '40/hour',      # reference photo uploads for the quote form
+        'service_upload': '25/hour',      # reference photo uploads (guests allowed, so keep storage abuse small)
         'service_cancel': '20/hour',      # customer cancel / cancellation-request button
         'service_pay': '20/hour',         # each attempt can create a gateway order
     },

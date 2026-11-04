@@ -4,6 +4,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlparse
 
+from django.conf import settings
 from rest_framework import serializers
 
 from sellers.models import REGION_SHIPS_FIELDS
@@ -104,13 +105,29 @@ def validate_dimension(value, field_name):
     return value
 
 
+def _own_storage_prefixes():
+    """URL prefixes of our own Firebase bucket, the only place reference photos may live."""
+    bucket = getattr(settings, 'FIREBASE_STORAGE_BUCKET', '')
+    if not bucket:
+        return ()
+    return (f'https://storage.googleapis.com/{bucket}/', f'https://firebasestorage.googleapis.com/v0/b/{bucket}/')
+
+
 def validate_reference_images(urls):
+    """Photo links must come from our own storage (the uploader's output).
+
+    An arbitrary link would make the admin's browser fetch an outside website when the
+    request is opened (tracking, unwanted content), so anything else is rejected.
+    """
     if not isinstance(urls, list) or len(urls) > MAX_REFERENCE_IMAGES:
         raise serializers.ValidationError(f'You can add up to {MAX_REFERENCE_IMAGES} reference images.')
+    prefixes = _own_storage_prefixes()
     for url in urls:
         parsed = urlparse(url) if isinstance(url, str) else None
         if not parsed or parsed.scheme != 'https' or not parsed.netloc or len(url) > 500:
             raise serializers.ValidationError('Reference images must be valid https links.')
+        if not prefixes or not url.startswith(prefixes):
+            raise serializers.ValidationError('Please upload photos with the photo picker instead of pasting links.')
     return urls
 
 
