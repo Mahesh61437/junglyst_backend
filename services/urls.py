@@ -14,6 +14,7 @@ urlpatterns = [
     path('my-requests/', views.MyQuoteListView.as_view(), name='service_my_requests'),
     path('my-requests/<str:reference>/', views.MyQuoteDetailView.as_view(), name='service_my_request_detail'),
     path('my-requests/<str:reference>/pay/', views.QuotePayView.as_view(), name='service_quote_pay'),
+    path('my-requests/<str:reference>/cancel/', views.MyQuoteCancelView.as_view(), name='service_my_request_cancel'),
     path('my-requests/<str:reference>/charges/<uuid:charge_id>/pay/', views.QuoteChargePayView.as_view(), name='service_charge_pay'),
 
     # Assigned seller
@@ -36,6 +37,8 @@ urlpatterns = [
     path('admin/requests/<uuid:pk>/decline/', views.AdminDeclineView.as_view(), name='service_admin_decline'),
     path('admin/requests/<uuid:pk>/renew/', views.AdminRenewView.as_view(), name='service_admin_renew'),
     path('admin/requests/<uuid:pk>/cancel/', views.AdminCancelView.as_view(), name='service_admin_cancel'),
+    path('admin/requests/<uuid:pk>/dismiss-cancel/', views.AdminDismissCancelView.as_view(), name='service_admin_dismiss_cancel'),
+    path('admin/requests/<uuid:pk>/charges/<uuid:charge_id>/payout-done/', views.AdminExtraPayoutView.as_view(), name='service_admin_extra_payout'),
     path('admin/requests/<uuid:pk>/mark-delivered/', views.AdminMarkDeliveredView.as_view(), name='service_admin_mark_delivered'),
     path('admin/requests/<uuid:pk>/charges/', views.AdminChargeCreateView.as_view(), name='service_admin_charge_create'),
     path('admin/requests/<uuid:pk>/charges/<uuid:charge_id>/cancel/', views.AdminChargeCancelView.as_view(), name='service_admin_charge_cancel'),

@@ -27,10 +27,10 @@ from sellers.models import SellerExcludedState, SellerProfile
 
 from . import validators
 from .models import (
-    AdditionalCharge, ChargeStatus, FormFieldType, QuoteEvent, QuoteRequest, QuoteStatus, ServiceFormField,
-    ServiceGroup, ServiceOffering,
+    AdditionalCharge, ChargeStatus, FormFieldType, PayoutStatus, QuoteEvent, QuoteRequest, QuoteStatus,
+    ServiceFormField, ServiceGroup, ServiceOffering,
 )
-from .workflow import ServiceOrderHandler, expire_overdue_pay_requests
+from .workflow import ServiceOrderHandler, expire_overdue_pay_requests, send_pay_by_reminders
 
 User = get_user_model()
 
@@ -1347,3 +1347,244 @@ class PaymentAttemptTests(ServiceTestCase):
         sub_order = self.quote.order.sub_orders.get()
         self.assertNotEqual(charge.status, ChargeStatus.PAID)
         self.assertEqual(sub_order.seller_total, Decimal('4450.00'))  # seller not credited
+
+
+# ── Customer cancellation, reminders, repricing, extra payouts ───────────────
+
+@override_settings(**TEST_SETTINGS)
+class Round9Tests(ServiceTestCase):
+    def setUp(self):
+        super().setUp()
+        self.customer = make_user('asha@example.com')
+        self.admin_client = APIClient()
+        self.admin_client.force_authenticate(self.admin)
+        self.customer_client = APIClient()
+        self.customer_client.force_authenticate(self.customer)
+
+    def sent_quote(self):
+        quote = self.priced_request(user=self.customer)
+        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{quote.id}/send-pay-request/').status_code, 200)
+        quote.refresh_from_db()
+        return quote
+
+    def pay(self, quote):
+        cache.clear()
+        with patch('services.views.start_gateway_payment', return_value=FAKE_GATEWAY):
+            return self.customer_client.post(f'/api/services/my-requests/{quote.reference}/pay/', PAY_ADDRESS, format='json')
+
+    def capture(self, order):
+        with self.captureOnCommitCallbacks(execute=True):
+            order.refresh_from_db()
+            order.is_paid = True
+            order.payment_status = PaymentStatus.COMPLETED
+            order.status = OrderStatus.CONFIRMED
+            order.save()
+
+    def paid_quote(self):
+        quote = self.sent_quote()
+        self.pay(quote)
+        quote.refresh_from_db()
+        self.capture(quote.order)
+        quote.refresh_from_db()
+        return quote
+
+    def cancel_url(self, quote):
+        return f'/api/services/my-requests/{quote.reference}/cancel/'
+
+    # ── customer cancel ──
+    def test_customer_cancels_an_unpaid_quote_immediately(self):
+        quote = self.sent_quote()
+        self.pay(quote)  # opened the payment window
+        quote.refresh_from_db()
+        open_order = quote.order
+        response = self.customer_client.post(self.cancel_url(quote), {'reason': 'Changed my mind'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['outcome'], 'cancelled')
+        quote.refresh_from_db()
+        open_order.refresh_from_db()
+        self.assertEqual((quote.status, quote.cancel_reason), (QuoteStatus.CANCELLED, 'Changed my mind'))
+        self.assertIsNone(response.data['request']['paid_at'])  # never paid: no refund wording in the UI
+        self.assertEqual(open_order.status, OrderStatus.CANCELLED)
+        self.assertTrue(AppNotification.objects.filter(user=self.admin, title=f'Customer cancelled: {quote.reference}').exists())
+
+    def test_paid_order_cancellation_is_a_request_the_admin_decides(self):
+        quote = self.paid_quote()
+        mine = self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data
+        self.assertTrue(mine['can_cancel'])
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.customer_client.post(self.cancel_url(quote), {'reason': 'Moving house'}, format='json')
+        self.assertEqual(response.data['outcome'], 'requested', response.data)
+        quote.refresh_from_db()
+        self.assertEqual(quote.status, QuoteStatus.PAID)  # nothing is cancelled yet
+        self.assertIsNotNone(quote.cancel_requested_at)
+        self.assertEqual(quote.order.sub_orders.get().status, 'placed')
+        self.assertFalse(self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data['can_cancel'])
+        self.assertEqual(self.customer_client.post(self.cancel_url(quote), {}, format='json').status_code, 400)  # only once
+        self.assertTrue(any('Cancellation requested' in m.subject and self.admin.email in m.to for m in mail.outbox))
+        summary = self.admin_client.get('/api/services/admin/summary/').data
+        self.assertEqual(summary['cancel_requests'], 1)
+        detail = self.admin_client.get(f'/api/services/admin/requests/{quote.id}/').data
+        self.assertEqual(detail['cancel_request_reason'], 'Moving house')
+
+    def test_admin_can_keep_the_order_or_cancel_it(self):
+        quote = self.paid_quote()
+        self.customer_client.post(self.cancel_url(quote), {'reason': 'x'}, format='json')
+        dismissed = self.admin_client.post(f'/api/services/admin/requests/{quote.id}/dismiss-cancel/')
+        self.assertEqual(dismissed.status_code, 200, dismissed.data)
+        quote.refresh_from_db()
+        self.assertIsNone(quote.cancel_requested_at)
+        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{quote.id}/dismiss-cancel/').status_code, 400)
+        self.customer_client.post(self.cancel_url(quote), {'reason': 'again'}, format='json')
+        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{quote.id}/cancel/', {'reason': 'ok'}, format='json').status_code, 200)
+        quote.refresh_from_db()
+        self.assertEqual(quote.status, QuoteStatus.CANCELLED)
+        self.assertIsNone(quote.cancel_requested_at)
+
+    def test_cancel_permissions_and_closed_states(self):
+        quote = self.sent_quote()
+        stranger = make_user('stranger@example.com')
+        client = APIClient()
+        client.force_authenticate(stranger)
+        self.assertEqual(client.post(self.cancel_url(quote), {}, format='json').status_code, 404)
+        self.assertEqual(APIClient().post(self.cancel_url(quote), {}, format='json').status_code, 401)
+        seller_client = APIClient()
+        seller_client.force_authenticate(self.seller)
+        self.assertEqual(seller_client.post(f'/api/services/admin/requests/{quote.id}/dismiss-cancel/').status_code, 403)
+        QuoteRequest.objects.filter(pk=quote.pk).update(status=QuoteStatus.DELIVERED)
+        self.assertEqual(self.customer_client.post(self.cancel_url(quote), {}, format='json').status_code, 400)
+        self.assertFalse(self.customer_client.get(f'/api/services/my-requests/{quote.reference}/').data['can_cancel'])
+
+    def test_seller_never_sees_the_cancellation_request(self):
+        quote = self.paid_quote()
+        self.customer_client.post(self.cancel_url(quote), {'reason': 'private'}, format='json')
+        seller_client = APIClient()
+        seller_client.force_authenticate(self.seller)
+        detail = seller_client.get(f'/api/services/seller/requests/{quote.id}/').data
+        listing = seller_client.get('/api/services/seller/requests/').data['results'][0]
+        for hidden in ('cancel_requested_at', 'cancel_request_reason'):
+            self.assertNotIn(hidden, detail)
+            self.assertNotIn(hidden, listing)
+
+    # ── reminders and the email countdown ──
+    def test_reminder_goes_out_once_in_the_last_24_hours(self):
+        quote = self.sent_quote()
+        self.assertEqual(send_pay_by_reminders(), 0)  # 3 days left: too early
+        QuoteRequest.objects.filter(pk=quote.pk).update(pay_by=timezone.now() + timedelta(hours=20, minutes=5))
+        mail.outbox.clear()
+        self.assertEqual(send_pay_by_reminders(), 1)
+        self.assertEqual(send_pay_by_reminders(), 0)  # never twice for the same date
+        self.assertTrue(AppNotification.objects.filter(user=self.customer, title='Your quote expires soon').exists())
+        reminder = [m for m in mail.outbox if 'expires in' in m.subject]
+        self.assertEqual(len(reminder), 1)
+        self.assertIn('20 hours', reminder[0].subject)
+        self.assertIn('Please pay within 20 hours', reminder[0].body)
+
+    def test_reminder_skips_paid_expired_and_renewed_quotes_get_a_new_one(self):
+        quote = self.sent_quote()
+        QuoteRequest.objects.filter(pk=quote.pk).update(pay_by=timezone.now() + timedelta(hours=5))
+        send_pay_by_reminders()
+        QuoteRequest.objects.filter(pk=quote.pk).update(status=QuoteStatus.EXPIRED, pay_by=timezone.now() - timedelta(hours=1))
+        self.assertEqual(send_pay_by_reminders(), 0)
+        self.admin_client.post(f'/api/services/admin/requests/{quote.id}/renew/')
+        quote.refresh_from_db()
+        self.assertIsNone(quote.pay_by_reminder_sent_at)
+        QuoteRequest.objects.filter(pk=quote.pk).update(pay_by=timezone.now() + timedelta(hours=3))
+        self.assertEqual(send_pay_by_reminders(), 1)
+
+    def test_pay_request_email_shows_the_countdown(self):
+        quote = self.priced_request(user=self.customer)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.admin_client.post(f'/api/services/admin/requests/{quote.id}/send-pay-request/')
+        body = [m for m in mail.outbox if 'ready to pay' in m.subject][0].body
+        self.assertIn('Please pay within 3 days', body)
+
+    # ── price change after the payment window opened ──
+    def test_admin_can_reprice_after_the_customer_opened_the_payment_window(self):
+        quote = self.sent_quote()
+        self.pay(quote)
+        quote.refresh_from_db()
+        stale = quote.order
+        QuoteRequest.objects.filter(pk=quote.pk).update(pay_by=timezone.now() + timedelta(hours=2))
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.admin_client.patch(f'/api/services/admin/requests/{quote.id}/', {'item_price': '4500'}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        quote.refresh_from_db()
+        stale.refresh_from_db()
+        self.assertEqual(quote.total_amount, Decimal('4700.00'))
+        self.assertIsNone(quote.order)
+        self.assertEqual(stale.status, OrderStatus.CANCELLED)
+        self.assertGreater(quote.pay_by, timezone.now() + timedelta(days=2))
+        self.assertTrue(AppNotification.objects.filter(user=self.customer, title='Your quote was updated').exists())
+        # paying again uses the new amount
+        self.assertEqual(self.pay(quote).status_code, 201)
+        quote.refresh_from_db()
+        self.assertEqual(quote.order.total_amount, Decimal('4700.00'))
+
+    def test_payment_for_the_old_price_is_refunded_not_accepted(self):
+        quote = self.sent_quote()
+        self.pay(quote)
+        quote.refresh_from_db()
+        stale = quote.order
+        self.admin_client.patch(f'/api/services/admin/requests/{quote.id}/', {'item_price': '4500'}, format='json')
+        self.capture(stale)  # the customer's old payment completes anyway
+        quote.refresh_from_db()
+        self.assertEqual(quote.status, QuoteStatus.AWAITING_PAYMENT)
+        self.assertFalse(stale.sub_orders.exists())
+        self.assertTrue(AppNotification.objects.filter(user=self.admin, title=f'Refund needed: {quote.reference}').exists())
+
+    def test_a_paid_quote_cannot_be_repriced_and_shipping_only_changes_also_apply(self):
+        quote = self.paid_quote()
+        locked = self.admin_client.patch(f'/api/services/admin/requests/{quote.id}/', {'item_price': '1'}, format='json')
+        self.assertEqual(locked.status_code, 400)
+        fresh = self.sent_quote()
+        changed = self.admin_client.patch(f'/api/services/admin/requests/{fresh.id}/', {'shipping_fee': '350'}, format='json')
+        self.assertEqual(changed.status_code, 200)
+        fresh.refresh_from_db()
+        self.assertEqual(fresh.total_amount, Decimal('5350.00'))
+
+    def test_notes_only_edit_does_not_reset_the_deadline(self):
+        quote = self.sent_quote()
+        before = quote.pay_by
+        self.admin_client.patch(f'/api/services/admin/requests/{quote.id}/', {'quote_notes': 'Packed with care'}, format='json')
+        quote.refresh_from_db()
+        self.assertEqual(quote.pay_by, before)
+
+    # ── extra payment after the seller payout ──
+    def test_extra_payment_after_payout_is_tracked_until_the_admin_records_it(self):
+        quote = self.paid_quote()
+        sub_order = quote.order.sub_orders.get()
+        settlement = SellerSettlement.objects.create(sub_order=sub_order, seller=self.seller, amount=sub_order.seller_total)
+        settlement.mark_settled(self.admin)
+        self.admin_client.post(f'/api/services/admin/requests/{quote.id}/charges/', {'description': 'Bigger glass', 'amount': '1000'}, format='json')
+        charge = AdditionalCharge.objects.get(quote_request=quote)
+        cache.clear()
+        with patch('services.views.start_gateway_payment', return_value=FAKE_GATEWAY):
+            self.customer_client.post(f'/api/services/my-requests/{quote.reference}/charges/{charge.id}/pay/')
+        charge.refresh_from_db()
+        self.capture(charge.order)
+        charge.refresh_from_db()
+        self.assertEqual(charge.payout_status, PayoutStatus.MANUAL_DUE)
+        detail = self.admin_client.get(f'/api/services/admin/requests/{quote.id}/').data
+        row = detail['additional_charges'][0]
+        self.assertEqual((row['payout_status'], row['seller_payout']), ('manual_due', '850.00'))
+        done = self.admin_client.post(f'/api/services/admin/requests/{quote.id}/charges/{charge.id}/payout-done/')
+        self.assertEqual(done.status_code, 200, done.data)
+        charge.refresh_from_db()
+        self.assertEqual(charge.payout_status, PayoutStatus.MANUAL_DONE)
+        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{quote.id}/charges/{charge.id}/payout-done/').status_code, 400)
+
+    def test_extra_payment_before_payout_is_credited_and_needs_nothing_manual(self):
+        quote = self.paid_quote()
+        self.admin_client.post(f'/api/services/admin/requests/{quote.id}/charges/', {'description': 'Moss', 'amount': '200'}, format='json')
+        charge = AdditionalCharge.objects.get(quote_request=quote)
+        cache.clear()
+        with patch('services.views.start_gateway_payment', return_value=FAKE_GATEWAY):
+            self.customer_client.post(f'/api/services/my-requests/{quote.reference}/charges/{charge.id}/pay/')
+        charge.refresh_from_db()
+        self.capture(charge.order)
+        charge.refresh_from_db()
+        self.assertEqual(charge.payout_status, PayoutStatus.CREDITED)
+        self.assertEqual(self.admin_client.post(f'/api/services/admin/requests/{quote.id}/charges/{charge.id}/payout-done/').status_code, 400)
+        seller_client = APIClient()
+        seller_client.force_authenticate(self.seller)
+        self.assertEqual(seller_client.post(f'/api/services/admin/requests/{quote.id}/charges/{charge.id}/payout-done/').status_code, 403)

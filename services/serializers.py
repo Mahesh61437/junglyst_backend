@@ -9,7 +9,7 @@ from shipping.regions import STATE_NAMES
 from . import validators
 from .permissions import assignable_sellers
 from .models import (
-    MONEY_MAX_DIGITS, AdditionalCharge, QuoteEvent, QuoteRequest, ServiceFormField, ServiceGroup, ServiceOffering,
+    MONEY_MAX_DIGITS, UNPAID_STATUSES, AdditionalCharge, QuoteStatus, QuoteEvent, QuoteRequest, ServiceFormField, ServiceGroup, ServiceOffering,
 )
 
 
@@ -141,6 +141,14 @@ class AdditionalChargeSerializer(serializers.ModelSerializer):
         fields = ('id', 'description', 'amount', 'status', 'status_label', 'created_at', 'paid_at')
 
 
+class AdditionalChargeStaffSerializer(AdditionalChargeSerializer):
+    """What staff see: also the seller's share and whether it still has to be paid separately."""
+    payout_status_label = serializers.CharField(source='get_payout_status_display', read_only=True)
+
+    class Meta(AdditionalChargeSerializer.Meta):
+        fields = AdditionalChargeSerializer.Meta.fields + ('seller_payout', 'payout_status', 'payout_status_label')
+
+
 class AdditionalChargeCreateSerializer(serializers.Serializer):
     description = serializers.CharField(max_length=200)
     amount = _money_field()
@@ -165,6 +173,7 @@ class QuoteRequestSerializer(serializers.ModelSerializer):
     quote = serializers.SerializerMethodField()
     order_number = serializers.SerializerMethodField()
     additional_charges = AdditionalChargeSerializer(many=True, read_only=True)
+    can_cancel = serializers.SerializerMethodField()
     delivery_states = serializers.ListField(source='offering.delivery_states', child=serializers.CharField(), read_only=True)
     delivery_state_names = serializers.ListField(source='offering.delivery_state_names', child=serializers.CharField(), read_only=True)
 
@@ -173,7 +182,7 @@ class QuoteRequestSerializer(serializers.ModelSerializer):
         fields = ('id', 'reference', 'offering_name', 'group_name', 'status', 'status_label', 'state',
                   'budget_min', 'budget_max', 'answer_rows', 'reference_images', 'customer_notes',
                   'quote', 'order_number', 'additional_charges', 'delivery_states', 'delivery_state_names',
-                  'pay_by', 'cancel_reason', 'created_at')
+                  'pay_by', 'paid_at', 'cancel_reason', 'cancel_requested_at', 'can_cancel', 'created_at')
 
     def get_state(self, quote):
         return STATE_NAMES.get(quote.state_code, quote.state_code)
@@ -183,6 +192,12 @@ class QuoteRequestSerializer(serializers.ModelSerializer):
 
     def get_order_number(self, quote):
         return quote.order.order_number if quote.order_id else None
+
+    def get_can_cancel(self, quote):
+        """Unpaid requests can be cancelled outright; a paid one can be asked about, once."""
+        if quote.status == QuoteStatus.PAID:
+            return quote.cancel_requested_at is None
+        return quote.status in UNPAID_STATUSES
 
     def get_quote(self, quote):
         if quote.quote_sent_at is None:
@@ -270,7 +285,7 @@ class QuoteListSerializer(serializers.ModelSerializer):
         model = QuoteRequest
         fields = ('id', 'reference', 'offering_name', 'group_name', 'status', 'status_label', 'contact_name',
                   'contact_phone', 'state', 'budget_min', 'budget_max', 'assigned_seller', 'total_amount',
-                  'created_at')
+                  'cancel_requested_at', 'created_at')
 
     def get_state(self, quote):
         return STATE_NAMES.get(quote.state_code, quote.state_code)
@@ -282,12 +297,13 @@ class QuoteStaffDetailSerializer(QuoteListSerializer):
     quote = serializers.SerializerMethodField()
     order_number = serializers.SerializerMethodField()
     events = QuoteEventSerializer(many=True, read_only=True)
-    additional_charges = AdditionalChargeSerializer(many=True, read_only=True)
+    additional_charges = AdditionalChargeStaffSerializer(many=True, read_only=True)
 
     class Meta(QuoteListSerializer.Meta):
         fields = QuoteListSerializer.Meta.fields + (
             'contact_email', 'answer_rows', 'reference_images', 'customer_notes', 'quote', 'admin_notes',
-            'quote_sent_at', 'pay_by', 'cancel_reason', 'paid_at', 'order_number', 'events', 'additional_charges',
+            'quote_sent_at', 'pay_by', 'cancel_reason', 'cancel_request_reason', 'paid_at', 'order_number', 'events',
+            'additional_charges',
         )
 
     def get_answer_rows(self, quote):
@@ -302,7 +318,7 @@ class QuoteStaffDetailSerializer(QuoteListSerializer):
 
 # Sellers quote and ship; customer contact stays with Junglyst (delivery details reach the
 # seller through the normal fulfilment flow once the order is paid).
-SELLER_HIDDEN_FIELDS = ('admin_notes', 'events', 'contact_phone', 'contact_email')
+SELLER_HIDDEN_FIELDS = ('admin_notes', 'events', 'contact_phone', 'contact_email', 'cancel_requested_at', 'cancel_request_reason')
 
 
 class SellerQuoteListSerializer(QuoteListSerializer):
@@ -326,6 +342,10 @@ class AssignSellerSerializer(serializers.Serializer):
             raise serializers.ValidationError('Choose a verified, active seller.')
         self.seller = seller
         return value
+
+
+class CancelSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=500, required=False, allow_blank=True, default='')
 
 
 class DeclineSerializer(serializers.Serializer):

@@ -14,8 +14,8 @@ from orders.order_types import OrderTypeHandler
 from payments.models import Payment
 
 from .models import (
-    EDITABLE_QUOTE_STATUSES, OPEN_QUOTE_STATUSES, PAY_REQUEST_VALID_DAYS, AdditionalCharge, ChargeStatus, QuoteEvent,
-    QuotePaymentAttempt, QuoteRequest, QuoteStatus,
+    EDITABLE_QUOTE_STATUSES, OPEN_QUOTE_STATUSES, PAY_BY_REMINDER_HOURS, PAY_REQUEST_VALID_DAYS, AdditionalCharge,
+    ChargeStatus, PayoutStatus, QuoteEvent, QuotePaymentAttempt, QuoteRequest, QuoteStatus, UNPAID_STATUSES,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,9 +56,36 @@ def _jsonable(value):
 
 # ── Quote figures ────────────────────────────────────────────────────────────
 
+def _has_paid_order(quote):
+    return bool(quote.order_id and quote.order.is_paid)
+
+
+def _void_open_orders(quote):
+    """Cancel every unpaid payment-attempt Order of a request (no signals; nothing was captured).
+
+    A payment that still completes on one of them later is caught by the handler and flagged
+    for a manual refund, so closing the order here never loses money silently.
+    """
+    open_order_ids = list(
+        quote.payment_attempts.filter(order__is_paid=False).exclude(order__status=OrderStatus.CANCELLED)
+        .values_list('order_id', flat=True)
+    )
+    if open_order_ids:
+        Order.objects.filter(pk__in=open_order_ids).update(status=OrderStatus.CANCELLED, updated_at=timezone.now())
+
+
+PRICE_FIELDS = ('item_price', 'shipping_fee')
+
+
 def update_quote_details(quote, actor, details, actor_is_admin):
-    """Apply validated quote figures. Sellers may edit only before the pay request is sent."""
-    editable = quote.status in EDITABLE_QUOTE_STATUSES or (actor_is_admin and quote.status == QuoteStatus.AWAITING_PAYMENT and quote.order_id is None)
+    """Apply validated quote figures.
+
+    Sellers may edit only before the pay request is sent. The admin may also correct a sent quote
+    until it is paid: if the price changes, any open payment window is closed, the customer is told
+    and given a fresh pay-by date.
+    """
+    reprice_sent_quote = actor_is_admin and quote.status == QuoteStatus.AWAITING_PAYMENT and not _has_paid_order(quote)
+    editable = quote.status in EDITABLE_QUOTE_STATUSES or reprice_sent_quote
     if not editable:
         raise QuoteError('This quote can no longer be edited.')
     changes = {}
@@ -75,8 +102,21 @@ def update_quote_details(quote, actor, details, actor_is_admin):
     if quote.status == QuoteStatus.SUBMITTED:
         quote.status = QuoteStatus.IN_REVIEW
         update_fields.append('status')
+    price_changed = any(field in changes for field in PRICE_FIELDS)
+    if reprice_sent_quote and price_changed:
+        _void_open_orders(quote)
+        quote.order = None
+        quote.pay_by = new_pay_by()
+        quote.pay_by_reminder_sent_at = None
+        update_fields += ['order', 'pay_by', 'pay_by_reminder_sent_at']
     quote.save(update_fields=update_fields + ['updated_at'])
     record_event(quote, actor, 'quote_edited', changes)
+    if reprice_sent_quote and price_changed:
+        if quote.user_id:
+            _notify([quote.user], 'Your quote was updated',
+                    f'The price for {quote.reference} is now ₹{quote.total_amount}. '
+                    f'Pay from My Orders within {PAY_REQUEST_VALID_DAYS} days.')
+        transaction.on_commit(lambda: _queue_email('send_pay_request_email_task', quote.id))
     if not actor_is_admin:
         _notify(super_admins(), f'Quote updated by seller: {quote.reference}',
                 f'{actor.email} changed the quote for {quote.reference}. Review it before sending the pay request.')
@@ -111,8 +151,9 @@ def send_pay_request(quote, admin):
     quote.status = QuoteStatus.AWAITING_PAYMENT
     quote.quote_sent_at = timezone.now()
     quote.pay_by = new_pay_by()
+    quote.pay_by_reminder_sent_at = None
     quote.commission_percent = quote.offering.commission_percent
-    quote.save(update_fields=['status', 'quote_sent_at', 'pay_by', 'commission_percent', 'updated_at'])
+    quote.save(update_fields=['status', 'quote_sent_at', 'pay_by', 'pay_by_reminder_sent_at', 'commission_percent', 'updated_at'])
     record_event(quote, admin, 'pay_request_sent', {'total_amount': str(quote.total_amount), 'pay_by': quote.pay_by.isoformat()})
     if quote.user_id:
         _notify([quote.user], 'Your quote is ready',
@@ -180,12 +221,90 @@ def renew_pay_request(quote, admin):
         raise QuoteError('Only an unpaid quote can be renewed.')
     quote.status = QuoteStatus.AWAITING_PAYMENT
     quote.pay_by = new_pay_by()
-    quote.save(update_fields=['status', 'pay_by', 'updated_at'])
+    quote.pay_by_reminder_sent_at = None
+    quote.save(update_fields=['status', 'pay_by', 'pay_by_reminder_sent_at', 'updated_at'])
     record_event(quote, admin, 'pay_request_renewed', {'pay_by': quote.pay_by.isoformat()})
     if quote.user_id:
         _notify([quote.user], 'Your quote is open again',
                 f'You can pay for {quote.reference} until {timezone.localtime(quote.pay_by):%d %b, %I:%M %p}.')
     transaction.on_commit(lambda: _queue_email('send_pay_request_email_task', quote.id))
+    return quote
+
+
+def send_pay_by_reminders(now=None):
+    """Remind customers whose pay-by date is within PAY_BY_REMINDER_HOURS. One reminder per pay-by date."""
+    now = now or timezone.now()
+    due = (QuoteRequest.objects.filter(status=QuoteStatus.AWAITING_PAYMENT, pay_by__gt=now,
+                                       pay_by__lte=now + timedelta(hours=PAY_BY_REMINDER_HOURS),
+                                       pay_by_reminder_sent_at__isnull=True)
+           .exclude(order__is_paid=True).select_related('user'))
+    sent = 0
+    for quote in due:
+        # Conditional update: two workers never send the same reminder twice.
+        if not QuoteRequest.objects.filter(pk=quote.pk, pay_by_reminder_sent_at__isnull=True).update(
+                pay_by_reminder_sent_at=now):
+            continue
+        sent += 1
+        record_event(quote, None, 'pay_by_reminder', {'pay_by': quote.pay_by.isoformat()})
+        if quote.user_id:
+            _notify([quote.user], 'Your quote expires soon',
+                    f'Pay for {quote.reference} by {timezone.localtime(quote.pay_by):%d %b, %I:%M %p} to keep this quote.')
+        _queue_email('send_pay_by_reminder_email_task', quote.id)
+    return sent
+
+
+# ── Customer cancellation ────────────────────────────────────────────────────
+
+
+@transaction.atomic
+def customer_cancel(quote, user, reason=''):
+    """A customer cancels their own request.
+
+    Before any payment it simply closes. After payment it becomes a *request* the admin decides on
+    (the admin refunds manually), so a paid order is never cancelled behind the seller's back.
+    Returns 'cancelled' or 'requested'.
+    """
+    quote = (QuoteRequest.objects.select_for_update(of=('self',))
+             .select_related('assigned_seller', 'user', 'order').get(pk=quote.pk))
+    reason = ' '.join((reason or '').split())[:500]
+    if quote.status in UNPAID_STATUSES:
+        _void_open_orders(quote)
+        quote.status = QuoteStatus.CANCELLED
+        quote.cancel_reason = reason or 'Cancelled by the customer'
+        quote.save(update_fields=['status', 'cancel_reason', 'updated_at'])
+        record_event(quote, user, 'cancelled_by_customer', {'reason': reason})
+        _notify(super_admins(), f'Customer cancelled: {quote.reference}',
+                f'{quote.contact_name} cancelled the request before paying.' + (f' Reason: {reason}' if reason else ''))
+        if quote.assigned_seller_id:
+            _notify([quote.assigned_seller], f'Request cancelled: {quote.reference}', 'The customer cancelled before paying.')
+        return 'cancelled'
+    if quote.status == QuoteStatus.PAID:
+        if quote.cancel_requested_at:
+            raise QuoteError('You have already asked to cancel this order. We will get back to you soon.')
+        quote.cancel_requested_at = timezone.now()
+        quote.cancel_request_reason = reason
+        quote.save(update_fields=['cancel_requested_at', 'cancel_request_reason', 'updated_at'])
+        record_event(quote, user, 'cancellation_requested', {'reason': reason})
+        _notify(super_admins(), f'Cancellation requested: {quote.reference}',
+                f'{quote.contact_name} asked to cancel a paid order.' + (f' Reason: {reason}' if reason else ''))
+        transaction.on_commit(lambda: _queue_email('send_cancel_request_email_task', quote.id))
+        return 'requested'
+    raise QuoteError('This order can no longer be cancelled here. Please call us.')
+
+
+@transaction.atomic
+def dismiss_cancel_request(quote, admin):
+    """Admin keeps the order: the customer's cancellation request is closed."""
+    quote = QuoteRequest.objects.select_for_update(of=('self',)).select_related('user').get(pk=quote.pk)
+    if not quote.cancel_requested_at:
+        raise QuoteError('There is no cancellation request to dismiss.')
+    quote.cancel_requested_at = None
+    quote.cancel_request_reason = ''
+    quote.save(update_fields=['cancel_requested_at', 'cancel_request_reason', 'updated_at'])
+    record_event(quote, admin, 'cancellation_dismissed')
+    if quote.user_id:
+        _notify([quote.user], 'About your cancellation request',
+                f'We could not cancel {quote.reference}. Please call us if you would like to talk about it.')
     return quote
 
 
@@ -220,7 +339,8 @@ def cancel_order(quote, admin, reason=''):
 
     quote.status = QuoteStatus.CANCELLED
     quote.cancel_reason = reason
-    quote.save(update_fields=['status', 'cancel_reason', 'updated_at'])
+    quote.cancel_requested_at = None
+    quote.save(update_fields=['status', 'cancel_reason', 'cancel_requested_at', 'updated_at'])
     quote.additional_charges.filter(status=ChargeStatus.REQUESTED).update(status=ChargeStatus.CANCELLED)
     if sub_orders:
         # Plain updates on purpose: no fulfilment or payment signals should react to a manual cancellation.
@@ -396,23 +516,41 @@ def prepare_charge_order(charge_id, user):
 
 
 def _credit_seller_for_charge(charge):
-    """Add the seller's share to the original sub-order, and to its settlement when one exists."""
+    """Add the seller's share to the original sub-order, and to its settlement when one exists.
+
+    Returns the PayoutStatus: MANUAL_DUE when the settlement was already paid out, so the admin
+    sees "pay the seller separately" on the request until it is recorded.
+    """
     quote = charge.quote_request
     sub_order = quote.order.sub_orders.first() if quote.order_id else None
     if sub_order is None:
-        return
+        return PayoutStatus.CREDITED
     sub_order.seller_total += charge.seller_payout
     sub_order.subtotal += charge.amount
     sub_order.save(update_fields=['seller_total', 'subtotal', 'updated_at'])
     settlement = getattr(sub_order, 'settlement', None)
     if settlement is None:
-        return
+        return PayoutStatus.CREDITED
     if settlement.is_settled:
         _notify(super_admins(), f'Pay the seller extra: {quote.reference}',
                 f'₹{charge.seller_payout} for "{charge.description}" arrived after the settlement was paid. Transfer it separately.')
-    else:
-        settlement.amount += charge.seller_payout
-        settlement.save(update_fields=['amount'])
+        return PayoutStatus.MANUAL_DUE
+    settlement.amount += charge.seller_payout
+    settlement.save(update_fields=['amount'])
+    return PayoutStatus.CREDITED
+
+
+@transaction.atomic
+def record_extra_payout(charge, admin):
+    """The admin paid the seller the extra amount by hand; record it so it stops being flagged."""
+    charge = AdditionalCharge.objects.select_for_update(of=('self',)).select_related('quote_request').get(pk=charge.pk)
+    if charge.payout_status != PayoutStatus.MANUAL_DUE:
+        raise QuoteError('This extra payment has no separate seller payout waiting.')
+    charge.payout_status = PayoutStatus.MANUAL_DONE
+    charge.save(update_fields=['payout_status'])
+    record_event(charge.quote_request, admin, 'extra_payout_recorded',
+                 {'description': charge.description, 'amount': str(charge.seller_payout)})
+    return charge
 
 
 def _handle_charge_paid(charge, order):
@@ -427,8 +565,8 @@ def _handle_charge_paid(charge, order):
     charge.status = ChargeStatus.PAID
     charge.paid_at = timezone.now()
     charge.order = order
-    charge.save(update_fields=['status', 'paid_at', 'order'])
-    _credit_seller_for_charge(charge)
+    charge.payout_status = _credit_seller_for_charge(charge)
+    charge.save(update_fields=['status', 'paid_at', 'order', 'payout_status'])
     record_event(quote, None, 'additional_paid', {'description': charge.description, 'amount': str(charge.amount)})
     _notify([quote.assigned_seller], f'Additional payment received: {quote.reference}', f'₹{charge.amount} for "{charge.description}".')
     _notify(super_admins(), f'Additional payment received: {quote.reference}',
@@ -528,6 +666,11 @@ class ServiceOrderHandler(OrderTypeHandler):
         if quote.status in (QuoteStatus.CANCELLED, QuoteStatus.DECLINED):
             Order.objects.filter(pk=order.pk).update(status=OrderStatus.CANCELLED, updated_at=timezone.now())
             _refund_alert(quote, order, 'a payment after the request was closed')
+            return
+        if order.total_amount != quote.total_amount:
+            # The price changed after this payment window opened: money for the old amount arrived.
+            Order.objects.filter(pk=order.pk).update(status=OrderStatus.CANCELLED, updated_at=timezone.now())
+            _refund_alert(quote, order, 'a payment for an older price')
             return
         # AWAITING_PAYMENT, or EXPIRED when the customer started paying before the deadline.
         quote.status = QuoteStatus.PAID

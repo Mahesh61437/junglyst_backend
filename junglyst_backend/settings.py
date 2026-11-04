@@ -333,6 +333,7 @@ REST_FRAMEWORK = {
         'workshop_lookup': '30/minute',   # guest booking lookup by order number + email
         'service_quote': '30/hour',       # public quote-request form (spam guard; honeypot catches most bots)
         'service_upload': '40/hour',      # reference photo uploads for the quote form
+        'service_cancel': '20/hour',      # customer cancel / cancellation-request button
         'service_pay': '20/hour',         # each attempt can create a gateway order
     },
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
@@ -436,6 +437,10 @@ CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
 # Periodic Tasks
 CELERY_BEAT_SCHEDULE = {
+    'remind-custom-order-pay-by': {
+        'task': 'services.tasks.pay_by_reminders_task',
+        'schedule': 3600.0,  # hourly: quotes ending within 24 hours get one reminder
+    },
     'expire-custom-order-pay-requests': {
         'task': 'services.tasks.expire_pay_requests_task',
         'schedule': 3600.0,  # hourly: unpaid quotes past their 3-day pay-by date expire

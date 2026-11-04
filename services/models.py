@@ -133,12 +133,16 @@ class QuoteStatus(models.TextChoices):
 
 # Days the customer has to pay once the pay request is sent.
 PAY_REQUEST_VALID_DAYS = 3
+# The customer is reminded this many hours before the pay-by deadline.
+PAY_BY_REMINDER_HOURS = 24
 # Most reference photos a customer can attach to a request.
 MAX_REFERENCE_IMAGES = 5
 
 # Statuses in which the quote figures can still change.
 EDITABLE_QUOTE_STATUSES = (QuoteStatus.SUBMITTED, QuoteStatus.IN_REVIEW)
 OPEN_QUOTE_STATUSES = (QuoteStatus.SUBMITTED, QuoteStatus.IN_REVIEW, QuoteStatus.AWAITING_PAYMENT)
+# Requests where the customer has not paid yet (so they can cancel outright).
+UNPAID_STATUSES = OPEN_QUOTE_STATUSES + (QuoteStatus.EXPIRED,)
 
 # How the request lists are split: work in progress, done, and closed without an order.
 QUOTE_SECTIONS = {
@@ -198,6 +202,11 @@ class QuoteRequest(models.Model):
     pay_by = models.DateTimeField(null=True, blank=True, db_index=True)
     # Why the admin cancelled (shown to the customer). Refunds are made manually.
     cancel_reason = models.CharField(max_length=500, blank=True, default='')
+    # A customer who already paid asks the admin to cancel; the admin decides.
+    cancel_requested_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    cancel_request_reason = models.CharField(max_length=500, blank=True, default='')
+    # Set once the "pay soon" reminder went out for the current pay-by date.
+    pay_by_reminder_sent_at = models.DateTimeField(null=True, blank=True)
 
     order = models.OneToOneField(
         'orders.Order', on_delete=models.SET_NULL, null=True, blank=True, related_name='service_quote',
@@ -248,6 +257,12 @@ class ChargeStatus(models.TextChoices):
     CANCELLED = 'cancelled', _('Cancelled')
 
 
+class PayoutStatus(models.TextChoices):
+    CREDITED = 'credited', _('Added to the seller payout')
+    MANUAL_DUE = 'manual_due', _('Seller must be paid separately')
+    MANUAL_DONE = 'manual_done', _('Paid to the seller separately')
+
+
 class AdditionalCharge(models.Model):
     """Extra money asked after the first payment (an upgrade, extra plants, a bigger container...).
 
@@ -267,6 +282,9 @@ class AdditionalCharge(models.Model):
     )
     commission_percent = models.DecimalField(max_digits=5, decimal_places=2)
     seller_payout = models.DecimalField(max_digits=MONEY_MAX_DIGITS, decimal_places=2)
+    # When the seller's settlement was already paid out before this extra payment came in,
+    # the admin pays the extra amount separately and records it here.
+    payout_status = models.CharField(max_length=20, choices=PayoutStatus.choices, default=PayoutStatus.CREDITED)
     paid_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
